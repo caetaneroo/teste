@@ -1,0 +1,202 @@
+import asyncio
+import time
+import logging
+from typing import Dict, Any
+
+# Logger específico do módulo
+logger = logging.getLogger(__name__)
+
+class RateLimiter:
+    """
+    Rate limiter com logging detalhado para monitoramento
+    """
+    
+    def __init__(self, max_tokens_per_minute: int = 180000):
+        self.max_tpm = max_tokens_per_minute
+        self.tokens_used_this_minute = 0
+        self.minute_start = time.time()
+        self._lock = asyncio.Lock()
+        
+        # Estatísticas para logging
+        self.total_waits = 0
+        self.total_wait_time = 0.0
+        self.total_tokens_processed = 0
+        
+        # Log de inicialização
+        logger.info(
+            "RateLimiter inicializado",
+            extra={
+                'max_tpm': max_tokens_per_minute,
+                'component': 'rate_limiter',
+                'action': 'initialize'
+            }
+        )
+    
+    async def wait_for_tokens(self, required_tokens: int) -> None:
+        """
+        Aguarda até ter tokens disponíveis com logging detalhado
+        """
+        async with self._lock:
+            current_time = time.time()
+            time_in_minute = current_time - self.minute_start
+            
+            # Log de solicitação de tokens
+            logger.debug(
+                "Solicitação de tokens",
+                extra={
+                    'required_tokens': required_tokens,
+                    'tokens_used': self.tokens_used_this_minute,
+                    'tokens_available': self.max_tpm - self.tokens_used_this_minute,
+                    'time_in_minute': round(time_in_minute, 2),
+                    'action': 'token_request'
+                }
+            )
+            
+            # Reset contador a cada minuto
+            if time_in_minute >= 60:
+                if self.tokens_used_this_minute > 0:
+                    logger.info(
+                        "Reset de contador de tokens",
+                        extra={
+                            'tokens_used_last_minute': self.tokens_used_this_minute,
+                            'utilization_percent': round((self.tokens_used_this_minute / self.max_tpm) * 100, 2),
+                            'action': 'minute_reset'
+                        }
+                    )
+                
+                self.tokens_used_this_minute = 0
+                self.minute_start = current_time
+                time_in_minute = 0
+            
+            # Verificar se precisa aguardar
+            if self.tokens_used_this_minute + required_tokens > self.max_tpm:
+                wait_time = 60 - time_in_minute
+                
+                if wait_time > 0:
+                    self.total_waits += 1
+                    self.total_wait_time += wait_time
+                    
+                    # Log de espera por rate limit
+                    logger.warning(
+                        "Rate limit atingido - aguardando reset",
+                        extra={
+                            'wait_time': round(wait_time, 2),
+                            'tokens_used': self.tokens_used_this_minute,
+                            'tokens_required': required_tokens,
+                            'tokens_limit': self.max_tpm,
+                            'tokens_overflow': (self.tokens_used_this_minute + required_tokens) - self.max_tpm,
+                            'total_waits': self.total_waits,
+                            'action': 'rate_limit_wait'
+                        }
+                    )
+                    
+                    await asyncio.sleep(wait_time)
+                    
+                    # Log de retomada após espera
+                    logger.info(
+                        "Rate limit reset - retomando processamento",
+                        extra={
+                            'waited_time': round(wait_time, 2),
+                            'action': 'rate_limit_resume'
+                        }
+                    )
+                
+                # Reset após espera
+                self.tokens_used_this_minute = 0
+                self.minute_start = time.time()
+    
+    def record_tokens(self, tokens_used: int) -> None:
+        """
+        Registra tokens utilizados com logging
+        """
+        self.tokens_used_this_minute += tokens_used
+        self.total_tokens_processed += tokens_used
+        
+        # Log detalhado apenas para volumes altos ou marcos
+        if (self.total_tokens_processed % 10000 == 0 or 
+            self.tokens_used_this_minute > self.max_tpm * 0.8):
+            
+            utilization = (self.tokens_used_this_minute / self.max_tpm) * 100
+            
+            logger.debug(
+                "Tokens registrados",
+                extra={
+                    'tokens_added': tokens_used,
+                    'tokens_used_minute': self.tokens_used_this_minute,
+                    'tokens_remaining_minute': self.max_tpm - self.tokens_used_this_minute,
+                    'utilization_percent': round(utilization, 2),
+                    'total_tokens_processed': self.total_tokens_processed,
+                    'action': 'tokens_recorded'
+                }
+            )
+            
+            # Warning se utilização alta
+            if utilization > 90:
+                logger.warning(
+                    "Alta utilização de tokens detectada",
+                    extra={
+                        'utilization_percent': round(utilization, 2),
+                        'tokens_remaining': self.max_tpm - self.tokens_used_this_minute,
+                        'action': 'high_utilization_warning'
+                    }
+                )
+    
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Retorna status atual com logging
+        """
+        current_time = time.time()
+        time_in_minute = current_time - self.minute_start
+        tokens_remaining = max(0, self.max_tpm - self.tokens_used_this_minute)
+        utilization = (self.tokens_used_this_minute / self.max_tpm) * 100
+        
+        status = {
+            'tokens_used': self.tokens_used_this_minute,
+            'tokens_limit': self.max_tpm,
+            'tokens_remaining': tokens_remaining,
+            'utilization_percent': round(utilization, 2),
+            'time_in_minute': round(time_in_minute, 2),
+            'total_waits': self.total_waits,
+            'total_wait_time': round(self.total_wait_time, 2),
+            'total_tokens_processed': self.total_tokens_processed
+        }
+        
+        # Log de status quando solicitado
+        logger.debug(
+            "Status do rate limiter consultado",
+            extra={
+                **status,
+                'action': 'status_check'
+            }
+        )
+        
+        return status
+    
+    def log_performance_summary(self) -> None:
+        """
+        Log de resumo de performance para análise
+        """
+        if self.total_tokens_processed > 0:
+            avg_wait_time = self.total_wait_time / self.total_waits if self.total_waits > 0 else 0
+            
+            logger.info(
+                "Resumo de performance do RateLimiter",
+                extra={
+                    'total_tokens_processed': self.total_tokens_processed,
+                    'total_waits': self.total_waits,
+                    'total_wait_time': round(self.total_wait_time, 2),
+                    'average_wait_time': round(avg_wait_time, 2),
+                    'max_tpm': self.max_tpm,
+                    'efficiency_percent': round(100 - (self.total_wait_time / 60 * 100), 2) if self.total_wait_time < 60 else 0,
+                    'action': 'performance_summary'
+                }
+            )
+    
+    def __del__(self):
+        """
+        Log final quando objeto é destruído
+        """
+        try:
+            self.log_performance_summary()
+        except:
+            pass  # Evitar erros durante destruição
