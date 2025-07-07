@@ -7,7 +7,7 @@ import re
 from typing import List, Dict, Any, Optional, Union
 from openai import AsyncOpenAI, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from .rate_limiter import RateLimiter
+from .rate_limiter import AdaptiveRateLimiter
 from .stats_manager import StatsManager
 
 # Logger específico do módulo
@@ -15,15 +15,23 @@ logger = logging.getLogger(__name__)
 
 class AIProcessor:
     """
-    Processador de IA com rate limiting automático, processamento assíncrono,
+    Processador de IA com rate limiting adaptativo, processamento assíncrono otimizado,
     suporte a JSON Schema estruturado e estimativa precisa de tokens
+    
+    Características:
+    - Rate limiting adaptativo que aprende com tokens reais
+    - Estimativa precisa usando tiktoken (oficial OpenAI)
+    - Processamento assíncrono com controle de concorrência
+    - Métricas detalhadas incluindo cached tokens
+    - Suporte a IDs customizados para rastreamento
+    - Logging estruturado para análise
     """
     
     def __init__(self, config: Dict[str, Any]):
         self.api_key = config.get('openai_api_key')
         self.model = config.get('model', 'gpt-3.5-turbo')
         self.temperature = config.get('temperature', 0.1)
-        self.max_tokens = config.get('max_tokens', 150)
+        self.max_tokens = config.get('max_tokens', None)  # None = sem limite
         
         # Configurar cliente assíncrono
         if not self.api_key:
@@ -31,9 +39,10 @@ class AIProcessor:
         
         self.client = AsyncOpenAI(api_key=self.api_key)
         
-        # Rate limiter
-        self.rate_limiter = RateLimiter(
-            max_tokens_per_minute=config.get('max_tpm', 180000)
+        # Rate limiter adaptativo
+        self.rate_limiter = AdaptiveRateLimiter(
+            max_tokens_per_minute=config.get('max_tpm', 180000),
+            learning_enabled=config.get('adaptive_learning', True)
         )
         
         # Controle de concorrência
@@ -46,12 +55,13 @@ class AIProcessor:
         # Contador de requisições para IDs únicos
         self._request_counter = 0
         
-        # Preços por modelo (por 1K tokens)
+        # Preços por modelo (por 1K tokens) - atualizar conforme necessário
         self.pricing = {
             'gpt-3.5-turbo': {'input': 0.0015, 'output': 0.002},
             'gpt-4': {'input': 0.03, 'output': 0.06},
             'gpt-4-turbo': {'input': 0.01, 'output': 0.03},
-            'gpt-4o': {'input': 0.005, 'output': 0.015}
+            'gpt-4o': {'input': 0.005, 'output': 0.015},
+            'gpt-4o-mini': {'input': 0.00015, 'output': 0.0006}
         }
         
         # Verificar se tiktoken está disponível
@@ -67,6 +77,7 @@ class AIProcessor:
                 'temperature': self.temperature,
                 'max_tokens': self.max_tokens,
                 'tiktoken_available': self._tiktoken_available,
+                'adaptive_learning': config.get('adaptive_learning', True),
                 'action': 'initialize'
             }
         )
@@ -77,7 +88,7 @@ class AIProcessor:
             import tiktoken
             return True
         except ImportError:
-            logger.warning("tiktoken não encontrado. Usando estimativa fallback.")
+            logger.warning("tiktoken não encontrado. Usando estimativa fallback. Instale com: pip install tiktoken")
             return False
     
     def _generate_request_id(self) -> str:
@@ -88,13 +99,13 @@ class AIProcessor:
     
     def estimate_tokens(self, messages: List[Dict[str, str]], model: str = None) -> int:
         """
-        Estima tokens usando tiktoken (biblioteca oficial da OpenAI)
+        Estima tokens usando tiktoken (biblioteca oficial da OpenAI) ou fallback melhorado
         
         Melhorias:
-        - Usa tiktoken para precisão máxima
-        - Considera formatação exata das mensagens
-        - Suporte a todos os modelos OpenAI
-        - Fallback para estimativa manual se tiktoken não disponível
+        - Usa tiktoken para precisão máxima quando disponível
+        - Considera formatação exata das mensagens do chat
+        - Suporte a todos os modelos OpenAI atuais
+        - Fallback robusto sem tiktoken
         """
         if self._tiktoken_available:
             return self._estimate_tokens_tiktoken(messages, model)
@@ -113,13 +124,13 @@ class AIProcessor:
         try:
             encoding = tiktoken.encoding_for_model(model)
         except KeyError:
-            # Fallback para encoding padrão
+            # Fallback para encoding padrão baseado no modelo
             if "gpt-4o" in model:
                 encoding = tiktoken.get_encoding("o200k_base")
             else:
                 encoding = tiktoken.get_encoding("cl100k_base")
         
-        # Configurações por modelo
+        # Configurações por modelo (baseado na documentação oficial OpenAI)
         if model in {
             "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613",
             "gpt-4-0314", "gpt-4-32k-0314", "gpt-4-0613", "gpt-4-32k-0613",
@@ -150,15 +161,21 @@ class AIProcessor:
         # Tokens para priming da resposta
         num_tokens += 3
         
-        # Adicionar tokens de resposta estimados
-        return num_tokens + self.max_tokens
+        # Adicionar tokens de resposta estimados se max_tokens definido
+        if self.max_tokens is not None:
+            num_tokens += self.max_tokens
+        else:
+            # Estimativa conservadora para rate limiting quando sem limite
+            num_tokens += 1000
+        
+        return num_tokens
     
     def _estimate_tokens_fallback(self, messages: List[Dict[str, str]]) -> int:
-        """Estimativa manual como fallback"""
+        """Estimativa manual melhorada como fallback"""
         total_text = " ".join([msg.get("content", "") for msg in messages if isinstance(msg.get("content"), str)])
         
         if not total_text:
-            return self.max_tokens
+            return self.max_tokens if self.max_tokens is not None else 1000
         
         # Método melhorado: 4 caracteres por token + contagem de palavras
         tokens_by_chars = max(1, len(total_text) // 4)
@@ -172,7 +189,11 @@ class AIProcessor:
         estimated_tokens += len(messages) * 3  # tokens por mensagem
         estimated_tokens += 3  # priming
         
-        return estimated_tokens + self.max_tokens
+        # Adicionar tokens de resposta
+        if self.max_tokens is not None:
+            return estimated_tokens + self.max_tokens
+        else:
+            return estimated_tokens + 1000  # Estimativa padrão
     
     def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
         """Calcula custo estimado baseado no modelo e tokens"""
@@ -215,6 +236,27 @@ class AIProcessor:
         # Default: 60 segundos se não conseguir extrair
         return 60.0
     
+    def _get_prompt_type(self, messages: List[Dict[str, str]]) -> str:
+        """Identifica tipo de prompt para aprendizado contextual"""
+        if not messages:
+            return "unknown"
+        
+        content = messages[0].get("content", "").lower()
+        
+        # Identificar padrões comuns
+        if "sentimento" in content or "sentiment" in content:
+            return "sentiment_analysis"
+        elif "classifique" in content or "classify" in content:
+            return "classification"
+        elif "resuma" in content or "summarize" in content:
+            return "summarization"
+        elif "analise" in content or "analyze" in content:
+            return "analysis"
+        elif "traduza" in content or "translate" in content:
+            return "translation"
+        else:
+            return "general"
+    
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=4, max=60),
@@ -224,16 +266,17 @@ class AIProcessor:
                            messages: List[Dict[str, str]], 
                            json_schema: Optional[Dict[str, Any]] = None,
                            request_id: str = None) -> Dict[str, Any]:
-        """Faz chamada à API com rate limiting, retry automático e estimativa precisa de tokens"""
+        """Faz chamada à API com rate limiting adaptativo e estimativa precisa de tokens"""
         
         if not request_id:
             request_id = self._generate_request_id()
         
-        # Estimar tokens necessários usando método melhorado
-        estimated_tokens = self.estimate_tokens(messages)
+        # Estimar tokens necessários
+        base_estimate = self.estimate_tokens(messages)
+        prompt_type = self._get_prompt_type(messages)
         
-        # Aguardar disponibilidade de tokens
-        await self.rate_limiter.wait_for_tokens(estimated_tokens)
+        # Aguardar com rate limiting adaptativo
+        adaptive_estimate = await self.rate_limiter.wait_for_tokens(base_estimate, prompt_type)
         
         # Registrar início de requisição concorrente
         self.stats_manager.record_concurrent_start()
@@ -246,9 +289,12 @@ class AIProcessor:
                 api_params = {
                     "model": self.model,
                     "messages": messages,
-                    "max_tokens": self.max_tokens,
                     "temperature": self.temperature
                 }
+                
+                # Só incluir max_tokens se estiver definido
+                if self.max_tokens is not None:
+                    api_params["max_tokens"] = self.max_tokens
                 
                 # Adicionar JSON schema se fornecido
                 if json_schema:
@@ -259,7 +305,9 @@ class AIProcessor:
                     "Iniciando chamada à API",
                     extra={
                         'request_id': request_id,
-                        'estimated_tokens': estimated_tokens,
+                        'base_estimate': base_estimate,
+                        'adaptive_estimate': adaptive_estimate,
+                        'prompt_type': prompt_type,
                         'has_json_schema': json_schema is not None,
                         'tiktoken_used': self._tiktoken_available,
                         'action': 'api_call_start'
@@ -271,7 +319,7 @@ class AIProcessor:
                 end_time = time.time()
                 api_response_time = end_time - start_time
                 
-                # Registrar tokens usados
+                # Extrair tokens usados
                 tokens_used = response.usage.total_tokens
                 input_tokens = response.usage.prompt_tokens
                 output_tokens = response.usage.completion_tokens
@@ -281,7 +329,11 @@ class AIProcessor:
                 if hasattr(response.usage, 'prompt_tokens_details'):
                     cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
                 
+                # Registrar tokens no rate limiter
                 self.rate_limiter.record_tokens(tokens_used)
+                
+                # Registrar para aprendizado adaptativo
+                self.rate_limiter.record_token_usage(base_estimate, tokens_used, prompt_type)
                 
                 # Calcular custo
                 cost = self.calculate_cost(input_tokens, output_tokens)
@@ -313,8 +365,8 @@ class AIProcessor:
                         )
                         parsed_content = content
                 
-                # Log de sucesso com comparação de estimativa
-                estimation_accuracy = abs(estimated_tokens - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
+                # Log de sucesso com métricas de precisão
+                estimation_accuracy = abs(adaptive_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
                 
                 logger.debug(
                     "Chamada à API bem-sucedida",
@@ -324,10 +376,12 @@ class AIProcessor:
                         'input_tokens': input_tokens,
                         'output_tokens': output_tokens,
                         'cached_tokens': cached_tokens,
-                        'estimated_tokens': estimated_tokens,
+                        'base_estimate': base_estimate,
+                        'adaptive_estimate': adaptive_estimate,
                         'estimation_accuracy': round(estimation_accuracy, 1),
                         'api_response_time': round(api_response_time, 3),
                         'cost': round(cost, 6),
+                        'prompt_type': prompt_type,
                         'action': 'api_call_success'
                     }
                 )
@@ -343,7 +397,8 @@ class AIProcessor:
                     'api_response_time': api_response_time,
                     'success': True,
                     'is_json': json_schema is not None,
-                    'attempts': 1
+                    'attempts': 1,
+                    'prompt_type': prompt_type
                 }
                 
             except RateLimitError as e:
@@ -403,7 +458,7 @@ class AIProcessor:
                            json_schema: Optional[Dict[str, Any]] = None,
                            custom_id: Optional[str] = None,
                            **kwargs) -> Dict[str, Any]:
-        """Processa um único texto com estimativa precisa de tokens"""
+        """Processa um único texto com todas as otimizações"""
         
         # Usar ID customizado ou gerar automaticamente
         request_id = custom_id if custom_id else self._generate_request_id()
@@ -516,7 +571,7 @@ class AIProcessor:
                           batch_id: Optional[str] = None,
                           custom_ids: Optional[List[str]] = None,
                           **kwargs) -> Dict[str, Any]:
-        """Processa múltiplos textos em paralelo com estimativa precisa de tokens"""
+        """Processa múltiplos textos em paralelo com todas as otimizações"""
         
         # Usar batch_id customizado ou gerar automaticamente
         batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
@@ -549,6 +604,7 @@ class AIProcessor:
                 'estimated_total_tokens': estimated_total_tokens,
                 'estimated_tokens_per_request': estimated_tokens_per_request,
                 'tiktoken_available': self._tiktoken_available,
+                'adaptive_learning': self.rate_limiter.learning_enabled,
                 'action': 'batch_process_start'
             }
         )
@@ -618,7 +674,9 @@ class AIProcessor:
         # Finalizar batch e obter stats específicas do batch
         batch_stats = self.stats_manager.end_batch(batch_id)
         
-        # Log final do lote
+        # Log final do lote com métricas de aprendizado
+        learning_stats = self.rate_limiter.get_learning_stats()
+        
         logger.info(
             "Processamento em lote concluído",
             extra={
@@ -631,6 +689,8 @@ class AIProcessor:
                 'batch_cost': round(batch_stats.total_cost, 4),
                 'batch_rate': round(batch_stats.avg_rate, 2),
                 'batch_rate_limit_waits': batch_stats.rate_limit_waits,
+                'learning_accuracy': learning_stats['accuracy_percentage'],
+                'tokens_saved': learning_stats['tokens_saved'],
                 'action': 'batch_process_complete'
             }
         )
@@ -641,10 +701,14 @@ class AIProcessor:
             'batch_id': batch_id
         }
     
-    # Métodos para acessar stats
+    # Métodos para acessar stats e controle
     def get_global_stats(self):
         """Retorna estatísticas globais acumuladas de todos os batches"""
         return self.stats_manager.get_global_stats()
+    
+    def get_learning_stats(self):
+        """Retorna estatísticas de aprendizado do rate limiter"""
+        return self.rate_limiter.get_learning_stats()
     
     def show_stats(self, stats_or_result, title="Stats"):
         """Mostra qualquer tipo de estatística de forma formatada"""
@@ -655,6 +719,22 @@ class AIProcessor:
         
         print(self.stats_manager.format_stats(stats, title))
     
+    def show_learning_stats(self):
+        """Mostra estatísticas de aprendizado do rate limiter"""
+        learning_stats = self.get_learning_stats()
+        
+        print("🧠 ESTATÍSTICAS DE APRENDIZADO:")
+        print(f"   📊 Precisão geral: {learning_stats['accuracy_percentage']}%")
+        print(f"   🎯 Fator de correção atual: {learning_stats['current_accuracy_factor']}")
+        print(f"   📈 Total de estimativas: {learning_stats['total_estimations']}")
+        print(f"   💰 Tokens economizados: {learning_stats['tokens_saved']:,}")
+        print(f"   🛡️ Rate limits prevenidos: {learning_stats['prevented_rate_limits']}")
+        
+        if learning_stats['context_patterns']:
+            print(f"   🎭 Padrões por contexto:")
+            for context, stats in learning_stats['context_patterns'].items():
+                print(f"      {context}: {stats['samples']} amostras, precisão {stats['avg_ratio']:.3f}")
+    
     def reset_stats(self) -> None:
         """Reseta estatísticas globais"""
         logger.info(
@@ -663,9 +743,19 @@ class AIProcessor:
         )
         self.stats_manager.reset_global()
     
+    def reset_learning(self) -> None:
+        """Reseta sistema de aprendizado do rate limiter"""
+        logger.info(
+            "Resetando aprendizado do rate limiter",
+            extra={'action': 'learning_reset'}
+        )
+        self.rate_limiter.reset_learning()
+    
     def log_final_summary(self) -> None:
         """Log de resumo final para análise"""
         global_stats = self.get_global_stats()
+        learning_stats = self.get_learning_stats()
+        
         if global_stats.total_requests > 0:
             logger.info(
                 "Resumo final do AIProcessor",
@@ -687,6 +777,9 @@ class AIProcessor:
                     'concurrent_peak': global_stats.concurrent_peak,
                     'efficiency_rate': round(global_stats.efficiency_rate, 1),
                     'cache_hit_rate': round(global_stats.cache_hit_rate, 1),
+                    'learning_accuracy': learning_stats['accuracy_percentage'],
+                    'tokens_saved_by_learning': learning_stats['tokens_saved'],
+                    'rate_limits_prevented': learning_stats['prevented_rate_limits'],
                     'model_used': self.model,
                     'tiktoken_available': self._tiktoken_available,
                     'action': 'final_summary'
