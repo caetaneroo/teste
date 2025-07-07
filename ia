@@ -19,12 +19,12 @@ class AIProcessor:
     suporte a JSON Schema estruturado e estimativa precisa de tokens
     
     Características:
-    - Rate limiting adaptativo que aprende com tokens reais
+    - Rate limiting adaptativo com calibração baseada em histórico
     - Estimativa precisa usando tiktoken (oficial OpenAI)
     - Processamento assíncrono com controle de concorrência
     - Métricas detalhadas incluindo cached tokens
     - Suporte a IDs customizados para rastreamento
-    - Logging estruturado para análise
+    - Logging estruturado com progresso otimizado para batches grandes
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -39,10 +39,10 @@ class AIProcessor:
         
         self.client = AsyncOpenAI(api_key=self.api_key)
         
-        # Rate limiter adaptativo
+        # Rate limiter adaptativo com calibração
         self.rate_limiter = AdaptiveRateLimiter(
             max_tokens_per_minute=config.get('max_tpm', 180000),
-            learning_enabled=config.get('adaptive_learning', True)
+            calibration_enabled=config.get('adaptive_calibration', True)
         )
         
         # Controle de concorrência
@@ -77,7 +77,7 @@ class AIProcessor:
                 'temperature': self.temperature,
                 'max_tokens': self.max_tokens,
                 'tiktoken_available': self._tiktoken_available,
-                'adaptive_learning': config.get('adaptive_learning', True),
+                'adaptive_calibration': config.get('adaptive_calibration', True),
                 'action': 'initialize'
             }
         )
@@ -100,12 +100,6 @@ class AIProcessor:
     def estimate_tokens(self, messages: List[Dict[str, str]], model: str = None) -> int:
         """
         Estima tokens usando tiktoken (biblioteca oficial da OpenAI) ou fallback melhorado
-        
-        Melhorias:
-        - Usa tiktoken para precisão máxima quando disponível
-        - Considera formatação exata das mensagens do chat
-        - Suporte a todos os modelos OpenAI atuais
-        - Fallback robusto sem tiktoken
         """
         if self._tiktoken_available:
             return self._estimate_tokens_tiktoken(messages, model)
@@ -115,6 +109,10 @@ class AIProcessor:
     def _estimate_tokens_tiktoken(self, messages: List[Dict[str, str]], model: str = None) -> int:
         """Estimativa precisa usando tiktoken"""
         import tiktoken
+        
+        # Validar entrada
+        if not messages or not isinstance(messages, list):
+            return self.max_tokens if self.max_tokens is not None else 1000
         
         # Usar modelo atual se não especificado
         if model is None:
@@ -151,6 +149,9 @@ class AIProcessor:
         # Calcular tokens das mensagens
         num_tokens = 0
         for message in messages:
+            if not isinstance(message, dict):
+                continue
+                
             num_tokens += tokens_per_message
             for key, value in message.items():
                 if isinstance(value, str):
@@ -206,7 +207,7 @@ class AIProcessor:
     
     def _prepare_json_schema(self, json_schema: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Prepara o JSON schema para a API OpenAI"""
-        if not json_schema:
+        if not json_schema or not isinstance(json_schema, dict):
             return None
         
         return {
@@ -236,26 +237,30 @@ class AIProcessor:
         # Default: 60 segundos se não conseguir extrair
         return 60.0
     
-    def _get_prompt_type(self, messages: List[Dict[str, str]]) -> str:
-        """Identifica tipo de prompt para aprendizado contextual"""
-        if not messages:
-            return "unknown"
+    def _get_error_location(self) -> Dict[str, Any]:
+        """Captura apenas a localização essencial do erro"""
+        import traceback
+        import sys
         
-        content = messages[0].get("content", "").lower()
+        exc_type, exc_value, exc_traceback = sys.exc_info()
         
-        # Identificar padrões comuns
-        if "sentimento" in content or "sentiment" in content:
-            return "sentiment_analysis"
-        elif "classifique" in content or "classify" in content:
-            return "classification"
-        elif "resuma" in content or "summarize" in content:
-            return "summarization"
-        elif "analise" in content or "analyze" in content:
-            return "analysis"
-        elif "traduza" in content or "translate" in content:
-            return "translation"
-        else:
-            return "general"
+        if exc_traceback:
+            # Pegar o último frame (onde o erro realmente ocorreu)
+            tb = exc_traceback
+            while tb.tb_next:
+                tb = tb.tb_next
+            
+            frame = tb.tb_frame
+            filename = frame.f_code.co_filename.split('/')[-1]
+            
+            return {
+                'file': filename,
+                'function': frame.f_code.co_name,
+                'line': tb.tb_lineno,
+                'error_context': f"{filename}:{frame.f_code.co_name}():{tb.tb_lineno}"
+            }
+        
+        return {'error_context': 'Localização não disponível'}
     
     @retry(
         stop=stop_after_attempt(5),
@@ -271,12 +276,21 @@ class AIProcessor:
         if not request_id:
             request_id = self._generate_request_id()
         
+        # Validar entrada
+        if not messages or not isinstance(messages, list):
+            return {
+                'content': None,
+                'tokens_used': 0,
+                'success': False,
+                'error': 'Messages inválidas',
+                'error_type': 'ValidationError'
+            }
+        
         # Estimar tokens necessários
         base_estimate = self.estimate_tokens(messages)
-        prompt_type = self._get_prompt_type(messages)
         
-        # Aguardar com rate limiting adaptativo
-        adaptive_estimate = await self.rate_limiter.wait_for_tokens(base_estimate, prompt_type)
+        # Aguardar com rate limiting adaptativo (calibrado)
+        calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
         
         # Registrar início de requisição concorrente
         self.stats_manager.record_concurrent_start()
@@ -296,9 +310,11 @@ class AIProcessor:
                 if self.max_tokens is not None:
                     api_params["max_tokens"] = self.max_tokens
                 
-                # Adicionar JSON schema se fornecido
-                if json_schema:
-                    api_params["response_format"] = self._prepare_json_schema(json_schema)
+                # Adicionar JSON schema se fornecido E for válido
+                if json_schema and isinstance(json_schema, dict):
+                    prepared_schema = self._prepare_json_schema(json_schema)
+                    if prepared_schema:
+                        api_params["response_format"] = prepared_schema
                 
                 # Log da tentativa de chamada
                 logger.debug(
@@ -306,8 +322,7 @@ class AIProcessor:
                     extra={
                         'request_id': request_id,
                         'base_estimate': base_estimate,
-                        'adaptive_estimate': adaptive_estimate,
-                        'prompt_type': prompt_type,
+                        'calibrated_estimate': calibrated_estimate,
                         'has_json_schema': json_schema is not None,
                         'tiktoken_used': self._tiktoken_available,
                         'action': 'api_call_start'
@@ -332,8 +347,8 @@ class AIProcessor:
                 # Registrar tokens no rate limiter
                 self.rate_limiter.record_tokens(tokens_used)
                 
-                # Registrar para aprendizado adaptativo
-                self.rate_limiter.record_token_usage(base_estimate, tokens_used, prompt_type)
+                # Registrar para calibração adaptativa
+                self.rate_limiter.record_token_usage(base_estimate, tokens_used)
                 
                 # Calcular custo
                 cost = self.calculate_cost(input_tokens, output_tokens)
@@ -343,7 +358,7 @@ class AIProcessor:
                 parsed_content = content
                 
                 # Se JSON schema foi usado, tentar parsear JSON
-                if json_schema and content:
+                if json_schema and isinstance(json_schema, dict) and content:
                     try:
                         parsed_content = json.loads(content)
                         logger.debug(
@@ -366,7 +381,7 @@ class AIProcessor:
                         parsed_content = content
                 
                 # Log de sucesso com métricas de precisão
-                estimation_accuracy = abs(adaptive_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
+                estimation_accuracy = abs(calibrated_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
                 
                 logger.debug(
                     "Chamada à API bem-sucedida",
@@ -377,11 +392,10 @@ class AIProcessor:
                         'output_tokens': output_tokens,
                         'cached_tokens': cached_tokens,
                         'base_estimate': base_estimate,
-                        'adaptive_estimate': adaptive_estimate,
+                        'calibrated_estimate': calibrated_estimate,
                         'estimation_accuracy': round(estimation_accuracy, 1),
                         'api_response_time': round(api_response_time, 3),
                         'cost': round(cost, 6),
-                        'prompt_type': prompt_type,
                         'action': 'api_call_success'
                     }
                 )
@@ -397,8 +411,7 @@ class AIProcessor:
                     'api_response_time': api_response_time,
                     'success': True,
                     'is_json': json_schema is not None,
-                    'attempts': 1,
-                    'prompt_type': prompt_type
+                    'attempts': 1
                 }
                 
             except RateLimitError as e:
@@ -421,12 +434,16 @@ class AIProcessor:
                 end_time = time.time()
                 api_response_time = end_time - start_time
                 
+                # Capturar localização essencial do erro
+                error_location = self._get_error_location()
+                
                 logger.error(
                     "Erro na chamada à API",
                     extra={
                         'request_id': request_id,
                         'error_type': type(e).__name__,
                         'error_message': str(e),
+                        'error_location': error_location['error_context'],
                         'api_response_time': round(api_response_time, 3),
                         'action': 'api_call_error'
                     }
@@ -489,41 +506,47 @@ class AIProcessor:
             end_time = time.time()
             processing_time = end_time - start_time
             
-            # Registrar no StatsManager com métricas detalhadas
+            # Garantir que result é sempre um dict
+            if not isinstance(result, dict):
+                result = {
+                    'content': None,
+                    'tokens_used': 0,
+                    'cost': 0.0,
+                    'success': False,
+                    'error': str(result) if result else 'Erro desconhecido',
+                    'error_type': 'UnknownError'
+                }
+            
+            # Registrar no StatsManager com verificações seguras
             self.stats_manager.record_request(
-                success=result['success'],
+                success=result.get('success', False),
                 tokens_input=result.get('input_tokens', 0),
                 tokens_output=result.get('output_tokens', 0),
                 tokens_cached=result.get('cached_tokens', 0),
                 cost=result.get('cost', 0.0),
                 api_response_time=result.get('api_response_time', 0.0),
                 error_type=result.get('error_type'),
-                retry_count=result.get('attempts', 1) - 1
+                retry_count=max(0, result.get('attempts', 1) - 1)
             )
             
-            if result['success']:
-                # Log de sucesso
+            # Log simples sem duplicar detalhes
+            if result.get('success'):
                 logger.info(
                     "Processamento individual concluído",
                     extra={
                         'request_id': request_id,
                         'processing_time': round(processing_time, 3),
-                        'tokens_used': result['tokens_used'],
-                        'cost': round(result['cost'], 6),
-                        'response_preview': str(result['content'])[:200] + "..." if len(str(result['content'])) > 200 else str(result['content']),
                         'action': 'single_process_success'
                     }
                 )
             else:
-                # Log de erro
-                logger.error(
-                    "Falha no processamento individual",
+                # Log simples de falha, detalhes já foram logados no _make_api_call
+                logger.warning(
+                    "Processamento individual falhou",
                     extra={
                         'request_id': request_id,
                         'processing_time': round(processing_time, 3),
-                        'error_type': result.get('error_type'),
-                        'error_message': result.get('error'),
-                        'action': 'single_process_error'
+                        'action': 'single_process_failed'
                     }
                 )
             
@@ -564,6 +587,42 @@ class AIProcessor:
                 'request_id': request_id
             }
     
+    def _calculate_progress_intervals(self, total: int) -> List[int]:
+        """
+        Calcula intervalos inteligentes para log de progresso baseado no tamanho do batch
+        """
+        if total <= 10:
+            # Batches pequenos: log cada item
+            return list(range(1, total + 1))
+        elif total <= 50:
+            # Batches médios: log a cada 5 ou marcos importantes
+            intervals = [1, 5, 10, 25]
+            intervals.extend(range(10, total + 1, 10))
+            intervals.append(total)
+        elif total <= 200:
+            # Batches grandes: log a cada 10 ou marcos importantes
+            intervals = [1, 5, 10, 25, 50]
+            intervals.extend(range(25, total + 1, 25))
+            intervals.append(total)
+        elif total <= 1000:
+            # Batches muito grandes: log a cada 50 ou marcos importantes
+            intervals = [1, 10, 25, 50, 100, 250]
+            intervals.extend(range(100, total + 1, 100))
+            intervals.append(total)
+        else:
+            # Batches enormes: log a cada 100 ou marcos importantes
+            intervals = [1, 10, 25, 50, 100, 250, 500]
+            intervals.extend(range(250, total + 1, 250))
+            intervals.append(total)
+        
+        # Remover duplicatas e ordenar
+        intervals = sorted(list(set(intervals)))
+        
+        # Garantir que não exceda o total
+        intervals = [i for i in intervals if i <= total]
+        
+        return intervals
+    
     async def process_batch(self, 
                           texts: List[str], 
                           prompt_template: str,
@@ -571,7 +630,7 @@ class AIProcessor:
                           batch_id: Optional[str] = None,
                           custom_ids: Optional[List[str]] = None,
                           **kwargs) -> Dict[str, Any]:
-        """Processa múltiplos textos em paralelo com todas as otimizações"""
+        """Processa múltiplos textos em paralelo com progresso otimizado para batches grandes"""
         
         # Usar batch_id customizado ou gerar automaticamente
         batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
@@ -592,19 +651,21 @@ class AIProcessor:
             estimated_tokens_per_request = 0
             estimated_total_tokens = 0
         
+        # Calcular intervalos de progresso inteligentes
+        progress_intervals = self._calculate_progress_intervals(len(texts))
+        
         # Log do início do lote
         logger.info(
             "Iniciando processamento em lote",
             extra={
                 'batch_id': batch_id,
-                'custom_batch_id_provided': batch_id != f"batch_{int(time.time())}",
                 'total_texts': len(texts),
                 'has_custom_ids': custom_ids is not None,
                 'has_json_schema': json_schema is not None,
                 'estimated_total_tokens': estimated_total_tokens,
                 'estimated_tokens_per_request': estimated_tokens_per_request,
                 'tiktoken_available': self._tiktoken_available,
-                'adaptive_learning': self.rate_limiter.learning_enabled,
+                'progress_intervals_count': len(progress_intervals),
                 'action': 'batch_process_start'
             }
         )
@@ -618,9 +679,10 @@ class AIProcessor:
             task = self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
             tasks.append(task)
         
-        # Executar com monitoramento de progresso
+        # Executar com monitoramento de progresso otimizado
         results = []
         completed = 0
+        start_time = time.time()
         
         for coro in asyncio.as_completed(tasks):
             try:
@@ -628,24 +690,51 @@ class AIProcessor:
                 results.append(result)
                 completed += 1
                 
-                # Log de progresso a cada 10 ou marcos importantes
-                if (completed % 10 == 0 or 
-                    completed == len(texts) or 
-                    completed in [1, 5, 25, 50, 100, 250, 500]):
-                    
-                    elapsed = time.time() - self.stats_manager._batch_snapshots[batch_id]['start_time']
+                # Log de progresso baseado nos intervalos calculados
+                if completed in progress_intervals:
+                    elapsed = time.time() - start_time
                     rate = completed / elapsed if elapsed > 0 else 0
                     eta = (len(texts) - completed) / rate if rate > 0 else 0
                     
-                    logger.info(
-                        "Progresso do lote",
+                    # Calcular estatísticas parciais para progresso
+                    successful_so_far = sum(1 for r in results if r.get('success', False))
+                    failed_so_far = completed - successful_so_far
+                    tokens_so_far = sum(r.get('tokens_used', 0) for r in results)
+                    cost_so_far = sum(r.get('cost', 0) for r in results)
+                    
+                    # Determinar nível de log baseado no progresso
+                    progress_percent = (completed / len(texts)) * 100
+                    
+                    if progress_percent >= 100:
+                        log_level = "info"
+                    elif completed in [1, 5, 10] or progress_percent in [25, 50, 75]:
+                        log_level = "info"
+                    else:
+                        log_level = "debug"
+                    
+                    # Preparar mensagem de progresso
+                    if len(texts) <= 50:
+                        # Batches pequenos: mais detalhes
+                        progress_msg = f"Progresso: {completed}/{len(texts)} ({progress_percent:.1f}%) | Taxa: {rate:.1f} req/s"
+                    else:
+                        # Batches grandes: informação essencial
+                        progress_msg = f"Processando: {completed:,}/{len(texts):,} ({progress_percent:.1f}%) | ✅{successful_so_far} ❌{failed_so_far} | ETA: {eta/60:.1f}min"
+                    
+                    # Log com nível apropriado
+                    getattr(logger, log_level)(
+                        progress_msg,
                         extra={
                             'batch_id': batch_id,
                             'completed': completed,
                             'total': len(texts),
-                            'progress_percent': round((completed / len(texts)) * 100, 1),
+                            'progress_percent': round(progress_percent, 1),
                             'processing_rate': round(rate, 2),
                             'eta_seconds': round(eta, 1),
+                            'eta_minutes': round(eta / 60, 1),
+                            'successful_so_far': successful_so_far,
+                            'failed_so_far': failed_so_far,
+                            'tokens_used_so_far': tokens_so_far,
+                            'cost_so_far': round(cost_so_far, 4),
                             'action': 'batch_progress'
                         }
                     )
@@ -674,8 +763,8 @@ class AIProcessor:
         # Finalizar batch e obter stats específicas do batch
         batch_stats = self.stats_manager.end_batch(batch_id)
         
-        # Log final do lote com métricas de aprendizado
-        learning_stats = self.rate_limiter.get_learning_stats()
+        # Log final do lote com métricas de calibração
+        calibration_stats = self.rate_limiter.get_calibration_stats()
         
         logger.info(
             "Processamento em lote concluído",
@@ -689,8 +778,8 @@ class AIProcessor:
                 'batch_cost': round(batch_stats.total_cost, 4),
                 'batch_rate': round(batch_stats.avg_rate, 2),
                 'batch_rate_limit_waits': batch_stats.rate_limit_waits,
-                'learning_accuracy': learning_stats['accuracy_percentage'],
-                'tokens_saved': learning_stats['tokens_saved'],
+                'calibration_accuracy': calibration_stats['accuracy_percentage'],
+                'calibration_factor': calibration_stats['current_calibration_factor'],
                 'action': 'batch_process_complete'
             }
         )
@@ -701,14 +790,14 @@ class AIProcessor:
             'batch_id': batch_id
         }
     
-    # Métodos para acessar stats e controle
+    # Métodos para acessar stats e controle de calibração
     def get_global_stats(self):
         """Retorna estatísticas globais acumuladas de todos os batches"""
         return self.stats_manager.get_global_stats()
     
-    def get_learning_stats(self):
-        """Retorna estatísticas de aprendizado do rate limiter"""
-        return self.rate_limiter.get_learning_stats()
+    def get_calibration_stats(self):
+        """Retorna estatísticas de calibração do rate limiter"""
+        return self.rate_limiter.get_calibration_stats()
     
     def show_stats(self, stats_or_result, title="Stats"):
         """Mostra qualquer tipo de estatística de forma formatada"""
@@ -719,21 +808,20 @@ class AIProcessor:
         
         print(self.stats_manager.format_stats(stats, title))
     
-    def show_learning_stats(self):
-        """Mostra estatísticas de aprendizado do rate limiter"""
-        learning_stats = self.get_learning_stats()
+    def show_calibration_stats(self):
+        """Mostra estatísticas de calibração do rate limiter"""
+        calibration_stats = self.get_calibration_stats()
         
-        print("🧠 ESTATÍSTICAS DE APRENDIZADO:")
-        print(f"   📊 Precisão geral: {learning_stats['accuracy_percentage']}%")
-        print(f"   🎯 Fator de correção atual: {learning_stats['current_accuracy_factor']}")
-        print(f"   📈 Total de estimativas: {learning_stats['total_estimations']}")
-        print(f"   💰 Tokens economizados: {learning_stats['tokens_saved']:,}")
-        print(f"   🛡️ Rate limits prevenidos: {learning_stats['prevented_rate_limits']}")
+        print("🎯 ESTATÍSTICAS DE CALIBRAÇÃO:")
+        print(f"   📊 Precisão geral: {calibration_stats['accuracy_percentage']}%")
+        print(f"   🔧 Fator de calibração atual: {calibration_stats['current_calibration_factor']}")
+        print(f"   📈 Total de calibrações: {calibration_stats['total_calibrations']}")
+        print(f"   🛡️ Rate limits prevenidos: {calibration_stats['prevented_rate_limits']}")
+        print(f"   ⏱️ Tempo médio de espera: {calibration_stats['efficiency_metrics']['avg_wait_time']}s")
+        print(f"   📊 Frequência de esperas: {calibration_stats['efficiency_metrics']['wait_frequency']:.3f}")
         
-        if learning_stats['context_patterns']:
-            print(f"   🎭 Padrões por contexto:")
-            for context, stats in learning_stats['context_patterns'].items():
-                print(f"      {context}: {stats['samples']} amostras, precisão {stats['avg_ratio']:.3f}")
+        if calibration_stats['total_calibrations'] > 0:
+            print(f"   📈 Histórico: {calibration_stats['history_size']} amostras")
     
     def reset_stats(self) -> None:
         """Reseta estatísticas globais"""
@@ -743,18 +831,47 @@ class AIProcessor:
         )
         self.stats_manager.reset_global()
     
-    def reset_learning(self) -> None:
-        """Reseta sistema de aprendizado do rate limiter"""
+    def reset_calibration(self) -> None:
+        """Reseta sistema de calibração do rate limiter"""
         logger.info(
-            "Resetando aprendizado do rate limiter",
-            extra={'action': 'learning_reset'}
+            "Resetando calibração do rate limiter",
+            extra={'action': 'calibration_reset'}
         )
-        self.rate_limiter.reset_learning()
+        self.rate_limiter.reset_calibration()
+    
+    def disable_calibration(self) -> None:
+        """Desabilita o sistema de calibração"""
+        logger.info("Desabilitando calibração adaptativa")
+        self.rate_limiter.disable_calibration()
+
+    def enable_calibration(self) -> None:
+        """Habilita o sistema de calibração"""
+        logger.info("Habilitando calibração adaptativa")
+        self.rate_limiter.enable_calibration()
+
+    def is_calibration_enabled(self) -> bool:
+        """Verifica se a calibração está habilitada"""
+        return self.rate_limiter.calibration_enabled
+    
+    def get_rate_limiter_status(self) -> Dict[str, Any]:
+        """Retorna status completo do rate limiter"""
+        return self.rate_limiter.get_status()
+
+    def show_rate_limiter_status(self):
+        """Mostra status atual do rate limiter"""
+        status = self.get_rate_limiter_status()
+        
+        print("⚡ STATUS DO RATE LIMITER:")
+        print(f"   🔢 Tokens usados: {status['tokens_used']:,}/{status['tokens_limit']:,}")
+        print(f"   📊 Utilização: {status['utilization_percent']:.1f}%")
+        print(f"   ⏱️ Tempo no minuto: {status['time_in_minute']:.1f}s")
+        print(f"   🛡️ Rate limits prevenidos: {status['prevented_rate_limits']}")
+        print(f"   🎯 Fator de calibração: {status['calibration_factor']}")
     
     def log_final_summary(self) -> None:
         """Log de resumo final para análise"""
         global_stats = self.get_global_stats()
-        learning_stats = self.get_learning_stats()
+        calibration_stats = self.get_calibration_stats()
         
         if global_stats.total_requests > 0:
             logger.info(
@@ -777,9 +894,13 @@ class AIProcessor:
                     'concurrent_peak': global_stats.concurrent_peak,
                     'efficiency_rate': round(global_stats.efficiency_rate, 1),
                     'cache_hit_rate': round(global_stats.cache_hit_rate, 1),
-                    'learning_accuracy': learning_stats['accuracy_percentage'],
-                    'tokens_saved_by_learning': learning_stats['tokens_saved'],
-                    'rate_limits_prevented': learning_stats['prevented_rate_limits'],
+                    
+                    # CALIBRATION STATS ADICIONADAS:
+                    'calibration_accuracy': calibration_stats['accuracy_percentage'],
+                    'calibration_factor': calibration_stats['current_calibration_factor'],
+                    'rate_limits_prevented': calibration_stats['prevented_rate_limits'],
+                    'calibration_samples': calibration_stats['total_calibrations'],
+                    
                     'model_used': self.model,
                     'tiktoken_available': self._tiktoken_available,
                     'action': 'final_summary'
