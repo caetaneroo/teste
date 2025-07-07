@@ -2,7 +2,7 @@
 import asyncio
 import time
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from collections import deque
 from dataclasses import dataclass
 
@@ -11,22 +11,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TokenUsageRecord:
-    """Registro de uso de tokens para aprendizado"""
+    """Registro de uso de tokens para aprendizado - versão simplificada"""
     estimated_tokens: int
     actual_tokens: int
     timestamp: float
     accuracy_ratio: float
-    prompt_type: Optional[str] = None
 
 class AdaptiveRateLimiter:
     """
-    Rate limiter adaptativo que aprende com tokens reais para maximizar eficiência
+    Rate limiter adaptativo simplificado que aprende com tokens reais
     
     Características:
     - Aprende com cada requisição para melhorar estimativas
     - Auto-calibração baseada em histórico real
     - Prevenção proativa de rate limits
-    - Logging detalhado para monitoramento
+    - Versão simplificada sem prompt_type
     """
     
     def __init__(self, max_tokens_per_minute: int = 180000, learning_enabled: bool = True):
@@ -35,15 +34,12 @@ class AdaptiveRateLimiter:
         self.minute_start = time.time()
         self._lock = asyncio.Lock()
         
-        # Sistema de aprendizado adaptativo
+        # Sistema de aprendizado adaptativo simplificado
         self.learning_enabled = learning_enabled
         self.usage_history = deque(maxlen=1000)  # Últimas 1000 requisições
         self.estimation_accuracy = 1.0  # Fator de correção inicial
         self.min_accuracy = 0.3  # Limite mínimo (30% da estimativa original)
         self.max_accuracy = 3.0  # Limite máximo (300% da estimativa original)
-        
-        # Aprendizado por contexto (opcional)
-        self.context_patterns = {}  # Padrões por tipo de prompt
         
         # Métricas de performance
         self.total_estimations = 0
@@ -55,7 +51,6 @@ class AdaptiveRateLimiter:
         
         # Estatísticas de eficiência
         self.prevented_rate_limits = 0
-        self.tokens_saved = 0
         
         logger.info(
             "AdaptiveRateLimiter inicializado",
@@ -67,10 +62,9 @@ class AdaptiveRateLimiter:
             }
         )
     
-    def record_token_usage(self, estimated_tokens: int, actual_tokens: int, 
-                          prompt_type: Optional[str] = None) -> None:
+    def record_token_usage(self, estimated_tokens: int, actual_tokens: int) -> None:
         """
-        Registra uso real vs estimado para aprendizado contínuo
+        Registra uso real vs estimado para aprendizado contínuo - versão simplificada
         """
         if not self.learning_enabled or actual_tokens <= 0 or estimated_tokens <= 0:
             return
@@ -82,28 +76,16 @@ class AdaptiveRateLimiter:
             estimated_tokens=estimated_tokens,
             actual_tokens=actual_tokens,
             timestamp=time.time(),
-            accuracy_ratio=accuracy_ratio,
-            prompt_type=prompt_type
+            accuracy_ratio=accuracy_ratio
         )
         
         # Adicionar ao histórico geral
         self.usage_history.append(usage_record)
         
-        # Adicionar ao histórico por contexto se especificado
-        if prompt_type:
-            if prompt_type not in self.context_patterns:
-                self.context_patterns[prompt_type] = deque(maxlen=100)
-            self.context_patterns[prompt_type].append(usage_record)
-        
         # Atualizar métricas
         self.total_estimations += 1
         if 0.8 <= accuracy_ratio <= 1.2:  # Considerar "preciso" se dentro de 20%
             self.accurate_estimations += 1
-        
-        # Calcular economia/desperdício
-        token_diff = estimated_tokens - actual_tokens
-        if token_diff > 0:
-            self.tokens_saved += token_diff
         
         # Log ocasional de aprendizado
         if self.total_estimations % 100 == 0:
@@ -114,7 +96,6 @@ class AdaptiveRateLimiter:
                     'total_estimations': self.total_estimations,
                     'accuracy_percentage': round(accuracy_percentage, 1),
                     'current_factor': round(self.estimation_accuracy, 3),
-                    'tokens_saved': self.tokens_saved,
                     'action': 'learning_progress'
                 }
             )
@@ -165,7 +146,6 @@ class AdaptiveRateLimiter:
                     'samples_used': recent_count,
                     'avg_ratio': round(avg_accuracy, 3),
                     'overall_accuracy': round(accuracy_percentage, 1),
-                    'tokens_saved': self.tokens_saved,
                     'action': 'recalibration'
                 }
             )
@@ -173,52 +153,23 @@ class AdaptiveRateLimiter:
         self.estimation_accuracy = new_accuracy
         self.last_calibration = time.time()
     
-    def get_adaptive_estimate(self, base_estimate: int, prompt_type: Optional[str] = None) -> int:
+    def get_adaptive_estimate(self, base_estimate: int) -> int:
         """
-        Aplica fator adaptativo à estimativa base
+        Aplica fator adaptativo à estimativa base - versão simplificada
         """
         if not self.learning_enabled:
             return base_estimate
         
-        # Usar padrão específico do contexto se disponível e confiável
-        if (prompt_type and 
-            prompt_type in self.context_patterns and 
-            len(self.context_patterns[prompt_type]) >= 10):
-            
-            context_records = list(self.context_patterns[prompt_type])[-50:]  # Últimas 50
-            context_ratios = [record.accuracy_ratio for record in context_records]
-            context_factor = sum(context_ratios) / len(context_ratios)
-            
-            # Usar fator contextual se estiver dentro de limites razoáveis
-            if self.min_accuracy <= context_factor <= self.max_accuracy:
-                adaptive_estimate = int(base_estimate * context_factor)
-                
-                logger.debug(
-                    "Usando estimativa contextual",
-                    extra={
-                        'prompt_type': prompt_type,
-                        'base_estimate': base_estimate,
-                        'context_factor': round(context_factor, 3),
-                        'adaptive_estimate': adaptive_estimate,
-                        'samples': len(context_records),
-                        'action': 'contextual_estimate'
-                    }
-                )
-                
-                return adaptive_estimate
-        
-        # Fallback para fator geral
         adaptive_estimate = int(base_estimate * self.estimation_accuracy)
         
         return adaptive_estimate
     
-    async def wait_for_tokens(self, estimated_tokens: int, 
-                            prompt_type: Optional[str] = None) -> int:
+    async def wait_for_tokens(self, estimated_tokens: int) -> int:
         """
-        Aguarda tokens disponíveis usando estimativa adaptativa
+        Aguarda tokens disponíveis usando estimativa adaptativa - versão simplificada
         """
         # Aplicar fator adaptativo
-        adaptive_tokens = self.get_adaptive_estimate(estimated_tokens, prompt_type)
+        adaptive_tokens = self.get_adaptive_estimate(estimated_tokens)
         
         async with self._lock:
             current_time = time.time()
@@ -256,7 +207,6 @@ class AdaptiveRateLimiter:
                             'adaptive_tokens': adaptive_tokens,
                             'original_estimate': estimated_tokens,
                             'accuracy_factor': round(self.estimation_accuracy, 3),
-                            'prompt_type': prompt_type,
                             'total_waits': self.total_waits,
                             'action': 'adaptive_wait'
                         }
@@ -311,28 +261,14 @@ class AdaptiveRateLimiter:
             'estimation_accuracy': round(self.estimation_accuracy, 3),
             'learning_accuracy': round(accuracy_percentage, 1),
             'total_estimations': self.total_estimations,
-            'tokens_saved': self.tokens_saved,
-            'prevented_rate_limits': self.prevented_rate_limits,
-            'context_patterns_count': len(self.context_patterns)
+            'prevented_rate_limits': self.prevented_rate_limits
         }
     
     def get_learning_stats(self) -> Dict[str, Any]:
         """
-        Retorna estatísticas detalhadas de aprendizado
+        Retorna estatísticas detalhadas de aprendizado - versão simplificada
         """
         accuracy_percentage = (self.accurate_estimations / self.total_estimations * 100) if self.total_estimations > 0 else 0
-        
-        # Estatísticas por contexto
-        context_stats = {}
-        for prompt_type, records in self.context_patterns.items():
-            if len(records) >= 5:
-                ratios = [r.accuracy_ratio for r in records]
-                context_stats[prompt_type] = {
-                    'samples': len(records),
-                    'avg_ratio': round(sum(ratios) / len(ratios), 3),
-                    'min_ratio': round(min(ratios), 3),
-                    'max_ratio': round(max(ratios), 3)
-                }
         
         return {
             'learning_enabled': self.learning_enabled,
@@ -342,9 +278,7 @@ class AdaptiveRateLimiter:
             'current_accuracy_factor': round(self.estimation_accuracy, 3),
             'history_size': len(self.usage_history),
             'last_calibration': self.last_calibration,
-            'tokens_saved': self.tokens_saved,
             'prevented_rate_limits': self.prevented_rate_limits,
-            'context_patterns': context_stats,
             'efficiency_metrics': {
                 'avg_wait_time': round(self.total_wait_time / self.total_waits, 2) if self.total_waits > 0 else 0,
                 'wait_frequency': round(self.total_waits / self.total_estimations, 3) if self.total_estimations > 0 else 0
@@ -358,12 +292,10 @@ class AdaptiveRateLimiter:
         logger.info("Resetando sistema de aprendizado do RateLimiter")
         
         self.usage_history.clear()
-        self.context_patterns.clear()
         self.estimation_accuracy = 1.0
         self.total_estimations = 0
         self.accurate_estimations = 0
         self.last_calibration = time.time()
-        self.tokens_saved = 0
         self.prevented_rate_limits = 0
     
     def disable_learning(self) -> None:
