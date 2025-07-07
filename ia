@@ -1,567 +1,117 @@
-import asyncio
+# core/stats_manager.py
 import time
-import json
-import logging
-from typing import List, Dict, Any, Optional, Union
-from openai import AsyncOpenAI, RateLimitError
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from dataclasses import dataclass, field
-from rate_limiter import RateLimiter
-
-# Logger específico do módulo
-logger = logging.getLogger(__name__)
+from typing import Dict, Any, Optional, List
 
 @dataclass
-class ProcessingStats:
-    """Estatísticas de processamento"""
+class Stats:
+    """Classe única para qualquer tipo de estatística"""
     total_requests: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
     total_tokens_input: int = 0
     total_tokens_output: int = 0
     total_cost: float = 0.0
-    processing_time: float = 0.0
-    average_response_time: float = 0.0
     rate_limit_waits: int = 0
-    retry_attempts: int = 0
-    errors: List[str] = field(default_factory=list)
+    processing_time: float = 0.0
+    start_time: float = field(default_factory=time.time)
+    
+    @property
+    def total_tokens(self) -> int:
+        return self.total_tokens_input + self.total_tokens_output
+    
+    @property
+    def success_rate(self) -> float:
+        return (self.successful_requests / self.total_requests * 100) if self.total_requests > 0 else 0
+    
+    @property
+    def avg_rate(self) -> float:
+        return (self.successful_requests / self.processing_time) if self.processing_time > 0 else 0
 
-class AIProcessor:
-    """
-    Processador de IA com rate limiting automático, processamento assíncrono
-    e suporte a JSON Schema estruturado
-    """
+class StatsManager:
+    """Gerenciador único que serve batch e global"""
     
-    def __init__(self, config: Dict[str, Any]):
-        self.api_key = config.get('openai_api_key')
-        self.model = config.get('model', 'gpt-3.5-turbo')
-        self.temperature = config.get('temperature', 0.1)
-        self.max_tokens = config.get('max_tokens', 150)
-        
-        # Configurar cliente assíncrono
-        if not self.api_key:
-            raise ValueError("openai_api_key é obrigatório na configuração")
-        
-        self.client = AsyncOpenAI(api_key=self.api_key)
-        
-        # Rate limiter
-        self.rate_limiter = RateLimiter(
-            max_tokens_per_minute=config.get('max_tpm', 180000)
-        )
-        
-        # Controle de concorrência
-        max_concurrent = config.get('max_concurrent', 15)
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        
-        # Estatísticas
-        self.stats = ProcessingStats()
-        
-        # Contador de requisições para IDs únicos
-        self._request_counter = 0
-        
-        # Preços por modelo (por 1K tokens) - atualizar conforme necessário
-        self.pricing = {
-            'gpt-3.5-turbo': {'input': 0.0015, 'output': 0.002},
-            'gpt-4': {'input': 0.03, 'output': 0.06},
-            'gpt-4-turbo': {'input': 0.01, 'output': 0.03},
-            'gpt-4o': {'input': 0.005, 'output': 0.015}
-        }
-        
-        # Log de inicialização
-        logger.info(
-            "AIProcessor inicializado",
-            extra={
-                'model': self.model,
-                'max_tpm': config.get('max_tpm', 180000),
-                'max_concurrent': max_concurrent,
-                'temperature': self.temperature,
-                'max_tokens': self.max_tokens,
-                'action': 'initialize'
-            }
-        )
+    def __init__(self):
+        self.global_stats = Stats()
+        self._batch_snapshots = {}
     
-    def _generate_request_id(self) -> str:
-        """Gera ID único para cada requisição"""
-        self._request_counter += 1
-        timestamp = int(time.time() * 1000)
-        return f"req_{timestamp}_{self._request_counter}"
-    
-    def estimate_tokens(self, text: str) -> int:
-        """
-        Estima número de tokens de um texto (aproximação)
-        """
-        # Aproximação: 1 token ≈ 0.75 palavras
-        words = len(text.split())
-        estimated_tokens = int(words / 0.75)
-        return estimated_tokens + self.max_tokens  # Incluir tokens de resposta
-    
-    def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
-        """
-        Calcula custo estimado baseado no modelo e tokens
-        """
-        pricing = self.pricing.get(self.model, self.pricing['gpt-3.5-turbo'])
-        
-        input_cost = (input_tokens / 1000) * pricing['input']
-        output_cost = (output_tokens / 1000) * pricing['output']
-        
-        return input_cost + output_cost
-    
-    def _prepare_json_schema(self, json_schema: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """
-        Prepara o JSON schema para a API OpenAI
-        """
-        if not json_schema:
-            return None
-        
-        return {
-            "type": "json_schema",
-            "json_schema": {
-                "name": json_schema.get("name", "response_schema"),
-                "description": json_schema.get("description", "Schema for structured response"),
-                "schema": json_schema.get("schema", json_schema),
-                "strict": json_schema.get("strict", True)
-            }
-        }
-    
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=4, max=60),
-        retry=retry_if_exception_type(RateLimitError)
-    )
-    async def _make_api_call(self, 
-                           messages: List[Dict[str, str]], 
-                           json_schema: Optional[Dict[str, Any]] = None,
-                           request_id: str = None) -> Dict[str, Any]:
-        """
-        Faz chamada à API com rate limiting e retry automático
-        """
-        # Estimar tokens necessários
-        total_text = " ".join([msg["content"] for msg in messages])
-        estimated_tokens = self.estimate_tokens(total_text)
-        
-        # Aguardar disponibilidade de tokens
-        await self.rate_limiter.wait_for_tokens(estimated_tokens)
-        
-        async with self.semaphore:
-            start_time = time.time()
-            
-            try:
-                # Preparar parâmetros da API
-                api_params = {
-                    "model": self.model,
-                    "messages": messages,
-                    "max_tokens": self.max_tokens,
-                    "temperature": self.temperature
-                }
-                
-                # Adicionar JSON schema se fornecido
-                if json_schema:
-                    api_params["response_format"] = self._prepare_json_schema(json_schema)
-                
-                # Log da tentativa de chamada
-                logger.debug(
-                    "Iniciando chamada à API",
-                    extra={
-                        'request_id': request_id,
-                        'estimated_tokens': estimated_tokens,
-                        'has_json_schema': json_schema is not None,
-                        'action': 'api_call_start'
-                    }
-                )
-                
-                response = await self.client.chat.completions.create(**api_params)
-                
-                end_time = time.time()
-                api_response_time = end_time - start_time
-                
-                # Registrar tokens usados
-                tokens_used = response.usage.total_tokens
-                input_tokens = response.usage.prompt_tokens
-                output_tokens = response.usage.completion_tokens
-                
-                self.rate_limiter.record_tokens(tokens_used)
-                
-                # Calcular custo
-                cost = self.calculate_cost(input_tokens, output_tokens)
-                
-                # Processar resposta
-                content = response.choices[0].message.content
-                parsed_content = content
-                
-                # Se JSON schema foi usado, tentar parsear JSON
-                if json_schema and content:
-                    try:
-                        parsed_content = json.loads(content)
-                        logger.debug(
-                            "JSON Schema parseado com sucesso",
-                            extra={
-                                'request_id': request_id,
-                                'action': 'json_parse_success'
-                            }
-                        )
-                    except json.JSONDecodeError as e:
-                        logger.warning(
-                            "Erro ao parsear JSON Schema",
-                            extra={
-                                'request_id': request_id,
-                                'error': str(e),
-                                'raw_content': content[:200],
-                                'action': 'json_parse_error'
-                            }
-                        )
-                        parsed_content = content
-                
-                # Log de sucesso
-                logger.debug(
-                    "Chamada à API bem-sucedida",
-                    extra={
-                        'request_id': request_id,
-                        'tokens_used': tokens_used,
-                        'input_tokens': input_tokens,
-                        'output_tokens': output_tokens,
-                        'api_response_time': round(api_response_time, 3),
-                        'cost': round(cost, 6),
-                        'action': 'api_call_success'
-                    }
-                )
-                
-                return {
-                    'content': parsed_content,
-                    'raw_content': content,
-                    'tokens_used': tokens_used,
-                    'input_tokens': input_tokens,
-                    'output_tokens': output_tokens,
-                    'cost': cost,
-                    'api_response_time': api_response_time,
-                    'success': True,
-                    'is_json': json_schema is not None,
-                    'attempts': 1
-                }
-                
-            except RateLimitError as e:
-                self.stats.rate_limit_waits += 1
-                logger.warning(
-                    "Rate limit atingido - retry automático",
-                    extra={
-                        'request_id': request_id,
-                        'error': str(e),
-                        'action': 'rate_limit_retry'
-                    }
-                )
-                raise  # Tenacity vai fazer retry
-            
-            except Exception as e:
-                end_time = time.time()
-                api_response_time = end_time - start_time
-                
-                logger.error(
-                    "Erro na chamada à API",
-                    extra={
-                        'request_id': request_id,
-                        'error_type': type(e).__name__,
-                        'error_message': str(e),
-                        'api_response_time': round(api_response_time, 3),
-                        'action': 'api_call_error'
-                    }
-                )
-                
-                return {
-                    'content': None,
-                    'raw_content': None,
-                    'tokens_used': 0,
-                    'input_tokens': 0,
-                    'output_tokens': 0,
-                    'cost': 0.0,
-                    'api_response_time': api_response_time,
-                    'success': False,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'is_json': False,
-                    'attempts': 1
-                }
-    
-    async def process_single(self, 
-                           text: str, 
-                           prompt_template: str,
-                           json_schema: Optional[Dict[str, Any]] = None,
-                           **kwargs) -> Dict[str, Any]:
-        """
-        Processa um único texto com logging detalhado
-        """
-        request_id = self._generate_request_id()
-        
-        # Log do início da requisição
-        logger.info(
-            "Iniciando processamento individual",
-            extra={
-                'request_id': request_id,
-                'text_length': len(text),
-                'text_preview': text[:100] + "..." if len(text) > 100 else text,
-                'has_json_schema': json_schema is not None,
-                'action': 'single_process_start'
-            }
-        )
-        
-        start_time = time.time()
-        
-        try:
-            # Preparar mensagens
-            formatted_prompt = prompt_template.format(text=text, **kwargs)
-            messages = [{"role": "user", "content": formatted_prompt}]
-            
-            # Fazer chamada à API
-            result = await self._make_api_call(messages, json_schema, request_id)
-            
-            end_time = time.time()
-            processing_time = end_time - start_time
-            
-            # Atualizar estatísticas
-            self.stats.total_requests += 1
-            if result['success']:
-                self.stats.successful_requests += 1
-                self.stats.total_tokens_input += result['input_tokens']
-                self.stats.total_tokens_output += result['output_tokens']
-                self.stats.total_cost += result['cost']
-                
-                # Log de sucesso
-                logger.info(
-                    "Processamento individual concluído",
-                    extra={
-                        'request_id': request_id,
-                        'processing_time': round(processing_time, 3),
-                        'tokens_used': result['tokens_used'],
-                        'cost': round(result['cost'], 6),
-                        'response_preview': str(result['content'])[:200] + "..." if len(str(result['content'])) > 200 else str(result['content']),
-                        'action': 'single_process_success'
-                    }
-                )
-            else:
-                self.stats.failed_requests += 1
-                self.stats.errors.append(result.get('error', 'Unknown error'))
-                
-                # Log de erro
-                logger.error(
-                    "Falha no processamento individual",
-                    extra={
-                        'request_id': request_id,
-                        'processing_time': round(processing_time, 3),
-                        'error_type': result.get('error_type'),
-                        'error_message': result.get('error'),
-                        'action': 'single_process_error'
-                    }
-                )
-            
-            result['processing_time'] = processing_time
-            result['request_id'] = request_id
-            
-            return result
-            
-        except Exception as e:
-            end_time = time.time()
-            processing_time = end_time - start_time
-            
-            self.stats.total_requests += 1
-            self.stats.failed_requests += 1
-            self.stats.errors.append(str(e))
-            
-            logger.error(
-                "Exceção no processamento individual",
-                extra={
-                    'request_id': request_id,
-                    'processing_time': round(processing_time, 3),
-                    'exception_type': type(e).__name__,
-                    'exception_message': str(e),
-                    'action': 'single_process_exception'
-                }
+    def start_batch(self, batch_id: str) -> None:
+        """Inicia tracking de um batch"""
+        self._batch_snapshots[batch_id] = {
+            'start_time': time.time(),
+            'start_stats': Stats(
+                total_requests=self.global_stats.total_requests,
+                successful_requests=self.global_stats.successful_requests,
+                failed_requests=self.global_stats.failed_requests,
+                total_tokens_input=self.global_stats.total_tokens_input,
+                total_tokens_output=self.global_stats.total_tokens_output,
+                total_cost=self.global_stats.total_cost,
+                rate_limit_waits=self.global_stats.rate_limit_waits
             )
-            
-            return {
-                'content': None,
-                'tokens_used': 0,
-                'cost': 0.0,
-                'processing_time': processing_time,
-                'success': False,
-                'error': str(e),
-                'request_id': request_id
-            }
+        }
     
-    async def process_batch(self, 
-                          texts: List[str], 
-                          prompt_template: str,
-                          json_schema: Optional[Dict[str, Any]] = None,
-                          **kwargs) -> List[Dict[str, Any]]:
-        """
-        Processa múltiplos textos em paralelo com monitoramento detalhado
-        """
-        batch_id = f"batch_{int(time.time())}"
+    def end_batch(self, batch_id: str) -> Stats:
+        """Finaliza batch e retorna stats apenas desse batch"""
+        if batch_id not in self._batch_snapshots:
+            raise ValueError(f"Batch {batch_id} não foi iniciado")
         
-        # Log do início do lote
-        logger.info(
-            "Iniciando processamento em lote",
-            extra={
-                'batch_id': batch_id,
-                'total_texts': len(texts),
-                'has_json_schema': json_schema is not None,
-                'estimated_total_tokens': sum(self.estimate_tokens(text) for text in texts[:10]) * len(texts) // 10,  # Estimativa baseada em amostra
-                'action': 'batch_process_start'
-            }
-        )
-        
-        start_time = time.time()
-        self.stats.processing_time = start_time  # Para cálculos de progresso
-        
-        # Criar tasks para processamento paralelo
-        tasks = [
-            self.process_single(text, prompt_template, json_schema, **kwargs) 
-            for text in texts
-        ]
-        
-        # Executar com monitoramento de progresso
-        results = []
-        completed = 0
-        
-        async for coro in asyncio.as_completed(tasks):
-            try:
-                result = await coro
-                results.append(result)
-                completed += 1
-                
-                # Log de progresso a cada 10 ou marcos importantes
-                if (completed % 10 == 0 or 
-                    completed == len(texts) or 
-                    completed in [1, 5, 25, 50, 100, 250, 500]):
-                    
-                    elapsed = time.time() - start_time
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    eta = (len(texts) - completed) / rate if rate > 0 else 0
-                    
-                    # Calcular estatísticas parciais
-                    successful_so_far = sum(1 for r in results if r.get('success', False))
-                    tokens_so_far = sum(r.get('tokens_used', 0) for r in results)
-                    cost_so_far = sum(r.get('cost', 0) for r in results)
-                    
-                    logger.info(
-                        "Progresso do lote",
-                        extra={
-                            'batch_id': batch_id,
-                            'completed': completed,
-                            'total': len(texts),
-                            'progress_percent': round((completed / len(texts)) * 100, 1),
-                            'processing_rate': round(rate, 2),
-                            'eta_seconds': round(eta, 1),
-                            'successful_so_far': successful_so_far,
-                            'tokens_used_so_far': tokens_so_far,
-                            'cost_so_far': round(cost_so_far, 4),
-                            'action': 'batch_progress'
-                        }
-                    )
-                    
-            except Exception as e:
-                logger.error(
-                    "Erro em task do lote",
-                    extra={
-                        'batch_id': batch_id,
-                        'completed': completed,
-                        'error': str(e),
-                        'action': 'batch_task_error'
-                    }
-                )
-                # Adicionar resultado de erro
-                results.append({
-                    'content': None,
-                    'tokens_used': 0,
-                    'cost': 0.0,
-                    'success': False,
-                    'error': str(e)
-                })
-                completed += 1
-        
-        # Finalizar estatísticas
+        snapshot = self._batch_snapshots[batch_id]
+        start_stats = snapshot['start_stats']
         end_time = time.time()
-        total_processing_time = end_time - start_time
-        self.stats.processing_time = total_processing_time
         
-        if self.stats.successful_requests > 0:
-            self.stats.average_response_time = total_processing_time / self.stats.successful_requests
-        
-        # Log final do lote
-        logger.info(
-            "Processamento em lote concluído",
-            extra={
-                'batch_id': batch_id,
-                'total_time': round(total_processing_time, 2),
-                'total_requests': self.stats.total_requests,
-                'successful_requests': self.stats.successful_requests,
-                'failed_requests': self.stats.failed_requests,
-                'total_tokens': self.stats.total_tokens_input + self.stats.total_tokens_output,
-                'total_cost': round(self.stats.total_cost, 4),
-                'average_rate': round(self.stats.successful_requests / total_processing_time, 2),
-                'rate_limit_waits': self.stats.rate_limit_waits,
-                'action': 'batch_process_complete'
-            }
+        # Calcular diferença = stats apenas deste batch
+        batch_stats = Stats(
+            total_requests=self.global_stats.total_requests - start_stats.total_requests,
+            successful_requests=self.global_stats.successful_requests - start_stats.successful_requests,
+            failed_requests=self.global_stats.failed_requests - start_stats.failed_requests,
+            total_tokens_input=self.global_stats.total_tokens_input - start_stats.total_tokens_input,
+            total_tokens_output=self.global_stats.total_tokens_output - start_stats.total_tokens_output,
+            total_cost=self.global_stats.total_cost - start_stats.total_cost,
+            rate_limit_waits=self.global_stats.rate_limit_waits - start_stats.rate_limit_waits,
+            processing_time=end_time - snapshot['start_time'],
+            start_time=snapshot['start_time']
         )
         
-        # Ordenar resultados na ordem original (asyncio.as_completed não mantém ordem)
-        task_to_index = {id(task): i for i, task in enumerate(tasks)}
-        ordered_results = [None] * len(texts)
+        # Limpar snapshot
+        del self._batch_snapshots[batch_id]
         
-        for i, result in enumerate(results):
-            # Como perdemos a ordem com as_completed, vamos assumir que results está na ordem correta
-            # Em uma implementação mais robusta, você poderia adicionar índices aos resultados
-            if i < len(ordered_results):
-                ordered_results[i] = result
+        return batch_stats
+    
+    def record_request(self, success: bool, tokens_input: int = 0, 
+                      tokens_output: int = 0, cost: float = 0.0) -> None:
+        """Registra uma requisição nas stats globais"""
+        self.global_stats.total_requests += 1
         
-        return results  # Retornar na ordem de conclusão por simplicidade
+        if success:
+            self.global_stats.successful_requests += 1
+        else:
+            self.global_stats.failed_requests += 1
+        
+        self.global_stats.total_tokens_input += tokens_input
+        self.global_stats.total_tokens_output += tokens_output
+        self.global_stats.total_cost += cost
     
-    def get_stats(self) -> ProcessingStats:
-        """
-        Retorna estatísticas detalhadas de processamento
-        """
-        return self.stats
+    def record_rate_limit(self) -> None:
+        """Registra uma espera por rate limit"""
+        self.global_stats.rate_limit_waits += 1
     
-    def reset_stats(self) -> None:
-        """
-        Reseta estatísticas para nova sessão
-        """
-        logger.info(
-            "Resetando estatísticas do AIProcessor",
-            extra={'action': 'stats_reset'}
-        )
-        self.stats = ProcessingStats()
+    def get_global_stats(self) -> Stats:
+        """Retorna stats globais"""
+        self.global_stats.processing_time = time.time() - self.global_stats.start_time
+        return self.global_stats
     
-    def log_final_summary(self) -> None:
-        """
-        Log de resumo final para análise
-        """
-        if self.stats.total_requests > 0:
-            success_rate = (self.stats.successful_requests / self.stats.total_requests) * 100
-            
-            logger.info(
-                "Resumo final do AIProcessor",
-                extra={
-                    'total_requests': self.stats.total_requests,
-                    'successful_requests': self.stats.successful_requests,
-                    'failed_requests': self.stats.failed_requests,
-                    'success_rate_percent': round(success_rate, 2),
-                    'total_tokens_input': self.stats.total_tokens_input,
-                    'total_tokens_output': self.stats.total_tokens_output,
-                    'total_tokens': self.stats.total_tokens_input + self.stats.total_tokens_output,
-                    'total_cost': round(self.stats.total_cost, 4),
-                    'average_cost_per_request': round(self.stats.total_cost / self.stats.successful_requests, 6) if self.stats.successful_requests > 0 else 0,
-                    'processing_time': round(self.stats.processing_time, 2),
-                    'average_response_time': round(self.stats.average_response_time, 3),
-                    'rate_limit_waits': self.stats.rate_limit_waits,
-                    'retry_attempts': self.stats.retry_attempts,
-                    'model_used': self.model,
-                    'action': 'final_summary'
-                }
-            )
+    def format_stats(self, stats: Stats, title: str = "Stats") -> str:
+        """Formata qualquer stats de forma consistente"""
+        return f"""📊 {title.upper()}:
+   ✅ Sucessos: {stats.successful_requests}
+   ❌ Falhas: {stats.failed_requests}
+   🔢 Tokens: {stats.total_tokens:,}
+   💰 Custo: ${stats.total_cost:.4f}
+   ⏱️ Tempo: {stats.processing_time:.2f}s
+   📈 Taxa: {stats.avg_rate:.2f} req/s
+   📊 Sucesso: {stats.success_rate:.1f}%{f'
+   ⏳ Rate limits: {stats.rate_limit_waits}' if stats.rate_limit_waits > 0 else ''}"""
     
-    def __del__(self):
-        """
-        Log final quando objeto é destruído
-        """
-        try:
-            self.log_final_summary()
-        except:
-            pass  # Evitar erros durante destruição
+    def reset_global(self) -> None:
+        """Reset stats globais"""
+        self.global_stats = Stats()
