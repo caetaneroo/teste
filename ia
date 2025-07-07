@@ -1,283 +1,701 @@
-# core/stats_manager.py
+# core/ai_processor.py
+import asyncio
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, List
+import json
+import logging
+import re
+from typing import List, Dict, Any, Optional, Union
+from openai import AsyncOpenAI, RateLimitError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from .rate_limiter import RateLimiter
+from .stats_manager import StatsManager
 
-@dataclass
-class Stats:
-    """Classe única para qualquer tipo de estatística"""
-    total_requests: int = 0
-    successful_requests: int = 0
-    failed_requests: int = 0
-    total_tokens_input: int = 0
-    total_tokens_output: int = 0
-    total_cost: float = 0.0
-    rate_limit_waits: int = 0
-    processing_time: float = 0.0
-    start_time: float = field(default_factory=time.time)
-    
-    # MÉTRICAS DE PERFORMANCE
-    total_api_response_time: float = 0.0  # Tempo total de resposta da API
-    min_response_time: float = float('inf')  # Menor tempo de resposta
-    max_response_time: float = 0.0  # Maior tempo de resposta
-    total_wait_time: float = 0.0  # Tempo total aguardando rate limits
-    retry_attempts: int = 0  # Total de tentativas de retry
-    concurrent_peak: int = 0  # Pico de requisições simultâneas
-    errors_by_type: Dict[str, int] = field(default_factory=dict)  # Erros por tipo
-    
-    @property
-    def total_tokens(self) -> int:
-        """Total de tokens (input + output)"""
-        return self.total_tokens_input + self.total_tokens_output
-    
-    @property
-    def success_rate(self) -> float:
-        """Taxa de sucesso em percentual"""
-        return (self.successful_requests / self.total_requests * 100) if self.total_requests > 0 else 0
-    
-    @property
-    def avg_rate(self) -> float:
-        """Taxa média de requisições por segundo"""
-        return (self.successful_requests / self.processing_time) if self.processing_time > 0 else 0
-    
-    @property
-    def avg_response_time(self) -> float:
-        """Tempo médio de resposta da API"""
-        return (self.total_api_response_time / self.successful_requests) if self.successful_requests > 0 else 0
-    
-    @property
-    def efficiency_rate(self) -> float:
-        """% do tempo gasto processando vs aguardando rate limits"""
-        total_time = self.processing_time
-        if total_time <= 0:
-            return 0
-        processing_time = total_time - self.total_wait_time
-        return (processing_time / total_time * 100) if total_time > 0 else 0
-    
-    @property
-    def retry_rate(self) -> float:
-        """Taxa de retry por requisição"""
-        return (self.retry_attempts / self.total_requests) if self.total_requests > 0 else 0
-    
-    @property
-    def cost_per_token(self) -> float:
-        """Custo médio por token"""
-        return (self.total_cost / self.total_tokens) if self.total_tokens > 0 else 0
+# Logger específico do módulo
+logger = logging.getLogger(__name__)
 
-class StatsManager:
-    """Gerenciador único que serve batch e global - elimina repetição"""
+class AIProcessor:
+    """
+    Processador de IA com rate limiting automático, processamento assíncrono,
+    suporte a JSON Schema estruturado e estimativa precisa de tokens
+    """
     
-    def __init__(self):
-        self.global_stats = Stats()
-        self._batch_snapshots = {}
-        self._current_concurrent = 0  # Tracking de concorrência atual
+    def __init__(self, config: Dict[str, Any]):
+        self.api_key = config.get('openai_api_key')
+        self.model = config.get('model', 'gpt-3.5-turbo')
+        self.temperature = config.get('temperature', 0.1)
+        self.max_tokens = config.get('max_tokens', 150)
+        
+        # Configurar cliente assíncrono
+        if not self.api_key:
+            raise ValueError("openai_api_key é obrigatório na configuração")
+        
+        self.client = AsyncOpenAI(api_key=self.api_key)
+        
+        # Rate limiter
+        self.rate_limiter = RateLimiter(
+            max_tokens_per_minute=config.get('max_tpm', 180000)
+        )
+        
+        # Controle de concorrência
+        max_concurrent = config.get('max_concurrent', 15)
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Stats manager
+        self.stats_manager = StatsManager()
+        
+        # Contador de requisições para IDs únicos
+        self._request_counter = 0
+        
+        # Preços por modelo (por 1K tokens)
+        self.pricing = {
+            'gpt-3.5-turbo': {'input': 0.0015, 'output': 0.002},
+            'gpt-4': {'input': 0.03, 'output': 0.06},
+            'gpt-4-turbo': {'input': 0.01, 'output': 0.03},
+            'gpt-4o': {'input': 0.005, 'output': 0.015}
+        }
+        
+        # Verificar se tiktoken está disponível
+        self._tiktoken_available = self._check_tiktoken()
+        
+        # Log de inicialização
+        logger.info(
+            "AIProcessor inicializado",
+            extra={
+                'model': self.model,
+                'max_tpm': config.get('max_tpm', 180000),
+                'max_concurrent': max_concurrent,
+                'temperature': self.temperature,
+                'max_tokens': self.max_tokens,
+                'tiktoken_available': self._tiktoken_available,
+                'action': 'initialize'
+            }
+        )
     
-    def start_batch(self, batch_id: str) -> None:
-        """Inicia tracking de um batch"""
-        self._batch_snapshots[batch_id] = {
-            'start_time': time.time(),
-            'start_stats': Stats(
-                total_requests=self.global_stats.total_requests,
-                successful_requests=self.global_stats.successful_requests,
-                failed_requests=self.global_stats.failed_requests,
-                total_tokens_input=self.global_stats.total_tokens_input,
-                total_tokens_output=self.global_stats.total_tokens_output,
-                total_cost=self.global_stats.total_cost,
-                rate_limit_waits=self.global_stats.rate_limit_waits,
-                total_api_response_time=self.global_stats.total_api_response_time,
-                total_wait_time=self.global_stats.total_wait_time,
-                retry_attempts=self.global_stats.retry_attempts,
-                concurrent_peak=self.global_stats.concurrent_peak,
-                errors_by_type=self.global_stats.errors_by_type.copy()
-            )
+    def _check_tiktoken(self) -> bool:
+        """Verifica se tiktoken está disponível"""
+        try:
+            import tiktoken
+            return True
+        except ImportError:
+            logger.warning("tiktoken não encontrado. Usando estimativa fallback.")
+            return False
+    
+    def _generate_request_id(self) -> str:
+        """Gera ID único para cada requisição"""
+        self._request_counter += 1
+        timestamp = int(time.time() * 1000)
+        return f"req_{timestamp}_{self._request_counter}"
+    
+    def estimate_tokens(self, messages: List[Dict[str, str]], model: str = None) -> int:
+        """
+        Estima tokens usando tiktoken (biblioteca oficial da OpenAI)
+        
+        Melhorias:
+        - Usa tiktoken para precisão máxima
+        - Considera formatação exata das mensagens
+        - Suporte a todos os modelos OpenAI
+        - Fallback para estimativa manual se tiktoken não disponível
+        """
+        if self._tiktoken_available:
+            return self._estimate_tokens_tiktoken(messages, model)
+        else:
+            return self._estimate_tokens_fallback(messages)
+    
+    def _estimate_tokens_tiktoken(self, messages: List[Dict[str, str]], model: str = None) -> int:
+        """Estimativa precisa usando tiktoken"""
+        import tiktoken
+        
+        # Usar modelo atual se não especificado
+        if model is None:
+            model = self.model
+        
+        # Obter encoding para o modelo
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            # Fallback para encoding padrão
+            if "gpt-4o" in model:
+                encoding = tiktoken.get_encoding("o200k_base")
+            else:
+                encoding = tiktoken.get_encoding("cl100k_base")
+        
+        # Configurações por modelo
+        if model in {
+            "gpt-3.5-turbo-0613", "gpt-3.5-turbo-16k-0613",
+            "gpt-4-0314", "gpt-4-32k-0314", "gpt-4-0613", "gpt-4-32k-0613",
+            "gpt-4o-mini-2024-07-18", "gpt-4o-2024-08-06"
+        }:
+            tokens_per_message = 3
+            tokens_per_name = 1
+        elif "gpt-3.5-turbo" in model:
+            tokens_per_message = 3
+            tokens_per_name = 1
+        elif "gpt-4" in model:
+            tokens_per_message = 3
+            tokens_per_name = 1
+        else:
+            tokens_per_message = 3
+            tokens_per_name = 1
+        
+        # Calcular tokens das mensagens
+        num_tokens = 0
+        for message in messages:
+            num_tokens += tokens_per_message
+            for key, value in message.items():
+                if isinstance(value, str):
+                    num_tokens += len(encoding.encode(value))
+                    if key == "name":
+                        num_tokens += tokens_per_name
+        
+        # Tokens para priming da resposta
+        num_tokens += 3
+        
+        # Adicionar tokens de resposta estimados
+        return num_tokens + self.max_tokens
+    
+    def _estimate_tokens_fallback(self, messages: List[Dict[str, str]]) -> int:
+        """Estimativa manual como fallback"""
+        total_text = " ".join([msg.get("content", "") for msg in messages if isinstance(msg.get("content"), str)])
+        
+        if not total_text:
+            return self.max_tokens
+        
+        # Método melhorado: 4 caracteres por token + contagem de palavras
+        tokens_by_chars = max(1, len(total_text) // 4)
+        words = len(total_text.split())
+        tokens_by_words = words
+        
+        # Usar a maior estimativa para ser conservador
+        estimated_tokens = max(tokens_by_chars, tokens_by_words)
+        
+        # Adicionar overhead para formato de mensagem
+        estimated_tokens += len(messages) * 3  # tokens por mensagem
+        estimated_tokens += 3  # priming
+        
+        return estimated_tokens + self.max_tokens
+    
+    def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Calcula custo estimado baseado no modelo e tokens"""
+        pricing = self.pricing.get(self.model, self.pricing['gpt-3.5-turbo'])
+        
+        input_cost = (input_tokens / 1000) * pricing['input']
+        output_cost = (output_tokens / 1000) * pricing['output']
+        
+        return input_cost + output_cost
+    
+    def _prepare_json_schema(self, json_schema: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Prepara o JSON schema para a API OpenAI"""
+        if not json_schema:
+            return None
+        
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": json_schema.get("name", "response_schema"),
+                "description": json_schema.get("description", "Schema for structured response"),
+                "schema": json_schema.get("schema", json_schema),
+                "strict": json_schema.get("strict", True)
+            }
         }
     
-    def end_batch(self, batch_id: str) -> Stats:
-        """Finaliza batch e retorna stats apenas desse batch"""
-        if batch_id not in self._batch_snapshots:
-            raise ValueError(f"Batch {batch_id} não foi iniciado")
+    def _extract_wait_time_from_error(self, error: RateLimitError) -> float:
+        """Extrai tempo de espera do erro de rate limit"""
+        error_msg = str(error)
         
-        snapshot = self._batch_snapshots[batch_id]
-        start_stats = snapshot['start_stats']
-        end_time = time.time()
+        # Procurar padrões como "retry after 20 seconds"
+        match = re.search(r'retry.+?(\d+(?:\.\d+)?).+?seconds?', error_msg, re.IGNORECASE)
+        if match:
+            return float(match.group(1))
         
-        # Calcular diferença = stats apenas deste batch
-        batch_stats = Stats(
-            total_requests=self.global_stats.total_requests - start_stats.total_requests,
-            successful_requests=self.global_stats.successful_requests - start_stats.successful_requests,
-            failed_requests=self.global_stats.failed_requests - start_stats.failed_requests,
-            total_tokens_input=self.global_stats.total_tokens_input - start_stats.total_tokens_input,
-            total_tokens_output=self.global_stats.total_tokens_output - start_stats.total_tokens_output,
-            total_cost=self.global_stats.total_cost - start_stats.total_cost,
-            rate_limit_waits=self.global_stats.rate_limit_waits - start_stats.rate_limit_waits,
-            processing_time=end_time - snapshot['start_time'],
-            start_time=snapshot['start_time'],
+        # Procurar padrões como "20s"
+        match = re.search(r'(\d+(?:\.\d+)?)s', error_msg)
+        if match:
+            return float(match.group(1))
+        
+        # Default: 60 segundos se não conseguir extrair
+        return 60.0
+    
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=4, max=60),
+        retry=retry_if_exception_type(RateLimitError)
+    )
+    async def _make_api_call(self, 
+                           messages: List[Dict[str, str]], 
+                           json_schema: Optional[Dict[str, Any]] = None,
+                           request_id: str = None) -> Dict[str, Any]:
+        """Faz chamada à API com rate limiting, retry automático e estimativa precisa de tokens"""
+        
+        if not request_id:
+            request_id = self._generate_request_id()
+        
+        # Estimar tokens necessários usando método melhorado
+        estimated_tokens = self.estimate_tokens(messages)
+        
+        # Aguardar disponibilidade de tokens
+        await self.rate_limiter.wait_for_tokens(estimated_tokens)
+        
+        # Registrar início de requisição concorrente
+        self.stats_manager.record_concurrent_start()
+        
+        async with self.semaphore:
+            start_time = time.time()
             
-            # Métricas de performance
-            total_api_response_time=self.global_stats.total_api_response_time - start_stats.total_api_response_time,
-            min_response_time=self.global_stats.min_response_time if self.global_stats.min_response_time != float('inf') else 0,
-            max_response_time=self.global_stats.max_response_time,
-            total_wait_time=self.global_stats.total_wait_time - start_stats.total_wait_time,
-            retry_attempts=self.global_stats.retry_attempts - start_stats.retry_attempts,
-            concurrent_peak=self.global_stats.concurrent_peak,
+            try:
+                # Preparar parâmetros da API
+                api_params = {
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature
+                }
+                
+                # Adicionar JSON schema se fornecido
+                if json_schema:
+                    api_params["response_format"] = self._prepare_json_schema(json_schema)
+                
+                # Log da tentativa de chamada
+                logger.debug(
+                    "Iniciando chamada à API",
+                    extra={
+                        'request_id': request_id,
+                        'estimated_tokens': estimated_tokens,
+                        'has_json_schema': json_schema is not None,
+                        'tiktoken_used': self._tiktoken_available,
+                        'action': 'api_call_start'
+                    }
+                )
+                
+                response = await self.client.chat.completions.create(**api_params)
+                
+                end_time = time.time()
+                api_response_time = end_time - start_time
+                
+                # Registrar tokens usados
+                tokens_used = response.usage.total_tokens
+                input_tokens = response.usage.prompt_tokens
+                output_tokens = response.usage.completion_tokens
+                
+                # Extrair cached tokens se disponível
+                cached_tokens = 0
+                if hasattr(response.usage, 'prompt_tokens_details'):
+                    cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
+                
+                self.rate_limiter.record_tokens(tokens_used)
+                
+                # Calcular custo
+                cost = self.calculate_cost(input_tokens, output_tokens)
+                
+                # Processar resposta
+                content = response.choices[0].message.content
+                parsed_content = content
+                
+                # Se JSON schema foi usado, tentar parsear JSON
+                if json_schema and content:
+                    try:
+                        parsed_content = json.loads(content)
+                        logger.debug(
+                            "JSON Schema parseado com sucesso",
+                            extra={
+                                'request_id': request_id,
+                                'action': 'json_parse_success'
+                            }
+                        )
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            "Erro ao parsear JSON Schema",
+                            extra={
+                                'request_id': request_id,
+                                'error': str(e),
+                                'raw_content': content[:200],
+                                'action': 'json_parse_error'
+                            }
+                        )
+                        parsed_content = content
+                
+                # Log de sucesso com comparação de estimativa
+                estimation_accuracy = abs(estimated_tokens - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
+                
+                logger.debug(
+                    "Chamada à API bem-sucedida",
+                    extra={
+                        'request_id': request_id,
+                        'tokens_used': tokens_used,
+                        'input_tokens': input_tokens,
+                        'output_tokens': output_tokens,
+                        'cached_tokens': cached_tokens,
+                        'estimated_tokens': estimated_tokens,
+                        'estimation_accuracy': round(estimation_accuracy, 1),
+                        'api_response_time': round(api_response_time, 3),
+                        'cost': round(cost, 6),
+                        'action': 'api_call_success'
+                    }
+                )
+                
+                return {
+                    'content': parsed_content,
+                    'raw_content': content,
+                    'tokens_used': tokens_used,
+                    'input_tokens': input_tokens,
+                    'output_tokens': output_tokens,
+                    'cached_tokens': cached_tokens,
+                    'cost': cost,
+                    'api_response_time': api_response_time,
+                    'success': True,
+                    'is_json': json_schema is not None,
+                    'attempts': 1
+                }
+                
+            except RateLimitError as e:
+                # Registrar rate limit com tempo no StatsManager
+                wait_time = self._extract_wait_time_from_error(e)
+                self.stats_manager.record_rate_limit_wait(wait_time)
+                
+                logger.warning(
+                    "Rate limit atingido - retry automático",
+                    extra={
+                        'request_id': request_id,
+                        'error': str(e),
+                        'wait_time': wait_time,
+                        'action': 'rate_limit_retry'
+                    }
+                )
+                raise  # Tenacity vai fazer retry
             
-            # Erros por tipo (diferença)
-            errors_by_type={
-                error_type: self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)
-                for error_type in set(list(self.global_stats.errors_by_type.keys()) + list(start_stats.errors_by_type.keys()))
-                if (self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)) > 0
+            except Exception as e:
+                end_time = time.time()
+                api_response_time = end_time - start_time
+                
+                logger.error(
+                    "Erro na chamada à API",
+                    extra={
+                        'request_id': request_id,
+                        'error_type': type(e).__name__,
+                        'error_message': str(e),
+                        'api_response_time': round(api_response_time, 3),
+                        'action': 'api_call_error'
+                    }
+                )
+                
+                return {
+                    'content': None,
+                    'raw_content': None,
+                    'tokens_used': 0,
+                    'input_tokens': 0,
+                    'output_tokens': 0,
+                    'cached_tokens': 0,
+                    'cost': 0.0,
+                    'api_response_time': api_response_time,
+                    'success': False,
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'is_json': False,
+                    'attempts': 1
+                }
+            
+            finally:
+                # Registrar fim de requisição concorrente
+                self.stats_manager.record_concurrent_end()
+    
+    async def process_single(self, 
+                           text: str, 
+                           prompt_template: str,
+                           json_schema: Optional[Dict[str, Any]] = None,
+                           custom_id: Optional[str] = None,
+                           **kwargs) -> Dict[str, Any]:
+        """Processa um único texto com estimativa precisa de tokens"""
+        
+        # Usar ID customizado ou gerar automaticamente
+        request_id = custom_id if custom_id else self._generate_request_id()
+        
+        # Log do início da requisição
+        logger.info(
+            "Iniciando processamento individual",
+            extra={
+                'request_id': request_id,
+                'custom_id_provided': custom_id is not None,
+                'text_length': len(text),
+                'text_preview': text[:100] + "..." if len(text) > 100 else text,
+                'has_json_schema': json_schema is not None,
+                'action': 'single_process_start'
             }
         )
         
-        # Limpar snapshot
-        del self._batch_snapshots[batch_id]
+        start_time = time.time()
         
-        return batch_stats
-    
-    def record_request(self, success: bool, tokens_input: int = 0, 
-                      tokens_output: int = 0, cost: float = 0.0,
-                      api_response_time: float = 0.0, error_type: str = None,
-                      retry_count: int = 0) -> None:
-        """Registra uma requisição com métricas detalhadas"""
-        
-        self.global_stats.total_requests += 1
-        
-        if success:
-            self.global_stats.successful_requests += 1
+        try:
+            # Preparar mensagens
+            formatted_prompt = prompt_template.format(text=text, **kwargs)
+            messages = [{"role": "user", "content": formatted_prompt}]
             
-            # Métricas de response time
-            if api_response_time > 0:
-                self.global_stats.total_api_response_time += api_response_time
-                self.global_stats.min_response_time = min(self.global_stats.min_response_time, api_response_time)
-                self.global_stats.max_response_time = max(self.global_stats.max_response_time, api_response_time)
+            # Fazer chamada à API
+            result = await self._make_api_call(messages, json_schema, request_id)
             
-        else:
-            self.global_stats.failed_requests += 1
+            end_time = time.time()
+            processing_time = end_time - start_time
             
-            # Contar erros por tipo
-            if error_type:
-                if error_type not in self.global_stats.errors_by_type:
-                    self.global_stats.errors_by_type[error_type] = 0
-                self.global_stats.errors_by_type[error_type] += 1
-        
-        # Métricas gerais
-        self.global_stats.total_tokens_input += tokens_input
-        self.global_stats.total_tokens_output += tokens_output
-        self.global_stats.total_cost += cost
-        self.global_stats.retry_attempts += retry_count
-    
-    def record_rate_limit(self) -> None:
-        """Registra uma espera por rate limit (compatibilidade)"""
-        self.global_stats.rate_limit_waits += 1
-    
-    def record_rate_limit_wait(self, wait_time: float) -> None:
-        """Registra espera por rate limit com tempo"""
-        self.global_stats.rate_limit_waits += 1
-        self.global_stats.total_wait_time += wait_time
-    
-    def record_concurrent_start(self) -> None:
-        """Registra início de requisição concorrente"""
-        self._current_concurrent += 1
-        self.global_stats.concurrent_peak = max(self.global_stats.concurrent_peak, self._current_concurrent)
-    
-    def record_concurrent_end(self) -> None:
-        """Registra fim de requisição concorrente"""
-        self._current_concurrent = max(0, self._current_concurrent - 1)
-    
-    def get_global_stats(self) -> Stats:
-        """Retorna stats globais atualizadas"""
-        self.global_stats.processing_time = time.time() - self.global_stats.start_time
-        return self.global_stats
-    
-    def format_stats(self, stats: Stats, title: str = "Stats") -> str:
-        """Formata qualquer stats de forma consistente"""
-        
-        # Preparar erros por tipo
-        errors_summary = ""
-        if stats.errors_by_type:
-            error_list = [f"{error_type}: {count}" for error_type, count in stats.errors_by_type.items()]
-            errors_summary = f"\n   🚨 Erros: {', '.join(error_list)}"
-        
-        # Formatação básica
-        basic_stats = f"""📊 {title.upper()}:
-   ✅ Sucessos: {stats.successful_requests}
-   ❌ Falhas: {stats.failed_requests}
-   🔢 Tokens: {stats.total_tokens:,}
-   💰 Custo: ${stats.total_cost:.4f}
-   ⏱️ Tempo total: {stats.processing_time:.2f}s
-   📈 Taxa: {stats.avg_rate:.2f} req/s
-   📊 Sucesso: {stats.success_rate:.1f}%"""
-        
-        # Adicionar métricas de performance se houver dados
-        performance_stats = ""
-        if stats.successful_requests > 0 and stats.avg_response_time > 0:
-            performance_stats = f"""
-   
-   🚀 PERFORMANCE:
-   ⚡ Response time médio: {stats.avg_response_time:.3f}s
-   ⚡ Response time min/max: {stats.min_response_time:.3f}s / {stats.max_response_time:.3f}s
-   🔄 Taxa de retry: {stats.retry_rate:.2f} retries/req
-   ⏳ Eficiência: {stats.efficiency_rate:.1f}% (tempo processando vs aguardando)
-   🔗 Pico concorrente: {stats.concurrent_peak} requisições
-   💵 Custo por token: ${stats.cost_per_token:.6f}"""
-        
-        # Adicionar rate limits se houver
-        rate_limit_stats = ""
-        if stats.rate_limit_waits > 0:
-            rate_limit_stats = f"\n   ⏳ Rate limits: {stats.rate_limit_waits} ({stats.total_wait_time:.1f}s total)"
-        
-        return basic_stats + performance_stats + rate_limit_stats + errors_summary
-    
-    def reset_global(self) -> None:
-        """Reset stats globais"""
-        self.global_stats = Stats()
-        self._current_concurrent = 0
-    
-    def compare_batches(self, *batch_results) -> str:
-        """Compara múltiplos batches sem repetição"""
-        
-        output = ["📊 COMPARAÇÃO DE BATCHES:", "=" * 60]
-        
-        for i, result in enumerate(batch_results, 1):
-            batch_stats = result['batch_stats']
-            batch_id = result.get('batch_id', f'batch_{i}')
-            
-            output.append(f"\n🔍 Batch {i} ({batch_id}):")
-            
-            # Usar o formatador único
-            batch_formatted = self.format_stats(
-                batch_stats, 
-                title="", 
-            ).replace("📊 :", "").strip()
-            
-            # Indentar as linhas
-            for line in batch_formatted.split('\n'):
-                if line.strip():
-                    output.append(f"   {line.strip()}")
-        
-        return "\n".join(output)
-    
-    def summary_report(self, batch_results: List[Dict], global_stats: Stats) -> str:
-        """Relatório completo sem repetição"""
-        
-        output = ["🎯 RELATÓRIO COMPLETO", "=" * 60]
-        
-        # Batches individuais
-        for i, result in enumerate(batch_results, 1):
-            batch_stats = result['batch_stats']
-            batch_id = result.get('batch_id', f'batch_{i}')
-            
-            formatted = self.format_stats(
-                batch_stats, 
-                title=f"Batch {i} ({batch_id})"
+            # Registrar no StatsManager com métricas detalhadas
+            self.stats_manager.record_request(
+                success=result['success'],
+                tokens_input=result.get('input_tokens', 0),
+                tokens_output=result.get('output_tokens', 0),
+                tokens_cached=result.get('cached_tokens', 0),
+                cost=result.get('cost', 0.0),
+                api_response_time=result.get('api_response_time', 0.0),
+                error_type=result.get('error_type'),
+                retry_count=result.get('attempts', 1) - 1
             )
-            output.append(f"\n{formatted}")
+            
+            if result['success']:
+                # Log de sucesso
+                logger.info(
+                    "Processamento individual concluído",
+                    extra={
+                        'request_id': request_id,
+                        'processing_time': round(processing_time, 3),
+                        'tokens_used': result['tokens_used'],
+                        'cost': round(result['cost'], 6),
+                        'response_preview': str(result['content'])[:200] + "..." if len(str(result['content'])) > 200 else str(result['content']),
+                        'action': 'single_process_success'
+                    }
+                )
+            else:
+                # Log de erro
+                logger.error(
+                    "Falha no processamento individual",
+                    extra={
+                        'request_id': request_id,
+                        'processing_time': round(processing_time, 3),
+                        'error_type': result.get('error_type'),
+                        'error_message': result.get('error'),
+                        'action': 'single_process_error'
+                    }
+                )
+            
+            result['processing_time'] = processing_time
+            result['request_id'] = request_id
+            
+            return result
+            
+        except Exception as e:
+            end_time = time.time()
+            processing_time = end_time - start_time
+            
+            # Registrar erro no StatsManager
+            self.stats_manager.record_request(
+                success=False,
+                error_type=type(e).__name__
+            )
+            
+            logger.error(
+                "Exceção no processamento individual",
+                extra={
+                    'request_id': request_id,
+                    'processing_time': round(processing_time, 3),
+                    'exception_type': type(e).__name__,
+                    'exception_message': str(e),
+                    'action': 'single_process_exception'
+                }
+            )
+            
+            return {
+                'content': None,
+                'tokens_used': 0,
+                'cost': 0.0,
+                'processing_time': processing_time,
+                'success': False,
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'request_id': request_id
+            }
+    
+    async def process_batch(self, 
+                          texts: List[str], 
+                          prompt_template: str,
+                          json_schema: Optional[Dict[str, Any]] = None,
+                          batch_id: Optional[str] = None,
+                          custom_ids: Optional[List[str]] = None,
+                          **kwargs) -> Dict[str, Any]:
+        """Processa múltiplos textos em paralelo com estimativa precisa de tokens"""
         
-        # Global
-        formatted_global = self.format_stats(
-            global_stats, 
-            title="TOTAL GERAL"
+        # Usar batch_id customizado ou gerar automaticamente
+        batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
+        
+        # Validar custom_ids se fornecido
+        if custom_ids and len(custom_ids) != len(texts):
+            raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
+        
+        # Iniciar tracking do batch no StatsManager
+        self.stats_manager.start_batch(batch_id)
+        
+        # Estimar tokens total do batch
+        if texts:
+            sample_messages = [{"role": "user", "content": prompt_template.format(text=texts[0])}]
+            estimated_tokens_per_request = self.estimate_tokens(sample_messages)
+            estimated_total_tokens = estimated_tokens_per_request * len(texts)
+        else:
+            estimated_tokens_per_request = 0
+            estimated_total_tokens = 0
+        
+        # Log do início do lote
+        logger.info(
+            "Iniciando processamento em lote",
+            extra={
+                'batch_id': batch_id,
+                'custom_batch_id_provided': batch_id != f"batch_{int(time.time())}",
+                'total_texts': len(texts),
+                'has_custom_ids': custom_ids is not None,
+                'has_json_schema': json_schema is not None,
+                'estimated_total_tokens': estimated_total_tokens,
+                'estimated_tokens_per_request': estimated_tokens_per_request,
+                'tiktoken_available': self._tiktoken_available,
+                'action': 'batch_process_start'
+            }
         )
-        output.append(f"\n{formatted_global}")
         
-        return "\n".join(output)
+        # Criar tasks para processamento paralelo
+        tasks = []
+        for i, text in enumerate(texts):
+            # Usar ID customizado se fornecido, senão None (será gerado automaticamente)
+            custom_id = custom_ids[i] if custom_ids else None
+            
+            task = self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
+            tasks.append(task)
+        
+        # Executar com monitoramento de progresso
+        results = []
+        completed = 0
+        
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                results.append(result)
+                completed += 1
+                
+                # Log de progresso a cada 10 ou marcos importantes
+                if (completed % 10 == 0 or 
+                    completed == len(texts) or 
+                    completed in [1, 5, 25, 50, 100, 250, 500]):
+                    
+                    elapsed = time.time() - self.stats_manager._batch_snapshots[batch_id]['start_time']
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    eta = (len(texts) - completed) / rate if rate > 0 else 0
+                    
+                    logger.info(
+                        "Progresso do lote",
+                        extra={
+                            'batch_id': batch_id,
+                            'completed': completed,
+                            'total': len(texts),
+                            'progress_percent': round((completed / len(texts)) * 100, 1),
+                            'processing_rate': round(rate, 2),
+                            'eta_seconds': round(eta, 1),
+                            'action': 'batch_progress'
+                        }
+                    )
+                    
+            except Exception as e:
+                logger.error(
+                    "Erro em task do lote",
+                    extra={
+                        'batch_id': batch_id,
+                        'completed': completed,
+                        'error': str(e),
+                        'action': 'batch_task_error'
+                    }
+                )
+                # Adicionar resultado de erro
+                results.append({
+                    'content': None,
+                    'tokens_used': 0,
+                    'cost': 0.0,
+                    'success': False,
+                    'error': str(e),
+                    'error_type': type(e).__name__
+                })
+                completed += 1
+        
+        # Finalizar batch e obter stats específicas do batch
+        batch_stats = self.stats_manager.end_batch(batch_id)
+        
+        # Log final do lote
+        logger.info(
+            "Processamento em lote concluído",
+            extra={
+                'batch_id': batch_id,
+                'batch_total_time': round(batch_stats.processing_time, 2),
+                'batch_requests': batch_stats.total_requests,
+                'batch_successful': batch_stats.successful_requests,
+                'batch_failed': batch_stats.failed_requests,
+                'batch_tokens': batch_stats.total_tokens,
+                'batch_cost': round(batch_stats.total_cost, 4),
+                'batch_rate': round(batch_stats.avg_rate, 2),
+                'batch_rate_limit_waits': batch_stats.rate_limit_waits,
+                'action': 'batch_process_complete'
+            }
+        )
+        
+        return {
+            'results': results,
+            'batch_stats': batch_stats,
+            'batch_id': batch_id
+        }
+    
+    # Métodos para acessar stats
+    def get_global_stats(self):
+        """Retorna estatísticas globais acumuladas de todos os batches"""
+        return self.stats_manager.get_global_stats()
+    
+    def show_stats(self, stats_or_result, title="Stats"):
+        """Mostra qualquer tipo de estatística de forma formatada"""
+        if isinstance(stats_or_result, dict) and 'batch_stats' in stats_or_result:
+            stats = stats_or_result['batch_stats']
+        else:
+            stats = stats_or_result
+        
+        print(self.stats_manager.format_stats(stats, title))
+    
+    def reset_stats(self) -> None:
+        """Reseta estatísticas globais"""
+        logger.info(
+            "Resetando estatísticas do AIProcessor",
+            extra={'action': 'stats_reset'}
+        )
+        self.stats_manager.reset_global()
+    
+    def log_final_summary(self) -> None:
+        """Log de resumo final para análise"""
+        global_stats = self.get_global_stats()
+        if global_stats.total_requests > 0:
+            logger.info(
+                "Resumo final do AIProcessor",
+                extra={
+                    'total_requests': global_stats.total_requests,
+                    'successful_requests': global_stats.successful_requests,
+                    'failed_requests': global_stats.failed_requests,
+                    'success_rate_percent': round(global_stats.success_rate, 2),
+                    'total_tokens_input': global_stats.total_tokens_input,
+                    'total_tokens_output': global_stats.total_tokens_output,
+                    'total_tokens_cached': global_stats.total_tokens_cached,
+                    'total_tokens': global_stats.total_tokens,
+                    'total_cost': round(global_stats.total_cost, 4),
+                    'average_cost_per_request': round(global_stats.total_cost / global_stats.successful_requests, 6) if global_stats.successful_requests > 0 else 0,
+                    'processing_time': round(global_stats.processing_time, 2),
+                    'average_response_time': round(global_stats.avg_response_time, 3),
+                    'rate_limit_waits': global_stats.rate_limit_waits,
+                    'retry_attempts': global_stats.retry_attempts,
+                    'concurrent_peak': global_stats.concurrent_peak,
+                    'efficiency_rate': round(global_stats.efficiency_rate, 1),
+                    'cache_hit_rate': round(global_stats.cache_hit_rate, 1),
+                    'model_used': self.model,
+                    'tiktoken_available': self._tiktoken_available,
+                    'action': 'final_summary'
+                }
+            )
+    
+    def __del__(self):
+        """Log final quando objeto é destruído"""
+        try:
+            self.log_final_summary()
+        except:
+            pass  # Evitar erros durante destruição
