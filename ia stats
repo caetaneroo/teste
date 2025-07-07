@@ -81,11 +81,7 @@ class StatsManager:
     """
     Gerenciador único que serve batch e global - elimina repetição de código
     
-    Características:
-    - Tracking automático de diferenças para stats de batch
-    - Métricas completas incluindo cached tokens e performance
-    - Formatação consistente para qualquer tipo de stats
-    - Comparação entre batches sem repetição
+    CORREÇÃO: Tracking de concorrência corrigido para mostrar pico real por batch
     """
     
     def __init__(self):
@@ -94,9 +90,10 @@ class StatsManager:
         self._current_concurrent = 0  # Tracking de concorrência atual
     
     def start_batch(self, batch_id: str) -> None:
-        """Inicia tracking de um batch - captura snapshot do estado atual"""
+        """Inicia tracking de um batch - CORRIGIDO: resetar pico concorrente"""
         self._batch_snapshots[batch_id] = {
             'start_time': time.time(),
+            'batch_concurrent_peak': 0,  # ✅ CORREÇÃO: Pico específico do batch
             'start_stats': Stats(
                 total_requests=self.global_stats.total_requests,
                 successful_requests=self.global_stats.successful_requests,
@@ -109,13 +106,13 @@ class StatsManager:
                 total_api_response_time=self.global_stats.total_api_response_time,
                 total_wait_time=self.global_stats.total_wait_time,
                 retry_attempts=self.global_stats.retry_attempts,
-                concurrent_peak=self.global_stats.concurrent_peak,
+                concurrent_peak=0,  # ✅ CORREÇÃO: Resetar para o batch
                 errors_by_type=self.global_stats.errors_by_type.copy()
             )
         }
     
     def end_batch(self, batch_id: str) -> Stats:
-        """Finaliza batch e retorna stats apenas desse batch"""
+        """Finaliza batch e retorna stats apenas desse batch - CORRIGIDO"""
         if batch_id not in self._batch_snapshots:
             raise ValueError(f"Batch {batch_id} não foi iniciado")
         
@@ -142,7 +139,9 @@ class StatsManager:
             max_response_time=self.global_stats.max_response_time,
             total_wait_time=self.global_stats.total_wait_time - start_stats.total_wait_time,
             retry_attempts=self.global_stats.retry_attempts - start_stats.retry_attempts,
-            concurrent_peak=self.global_stats.concurrent_peak,
+            
+            # ✅ CORREÇÃO: Usar pico específico do batch, não global
+            concurrent_peak=snapshot.get('batch_concurrent_peak', 0),
             
             # Erros por tipo (diferença)
             errors_by_type={
@@ -200,9 +199,18 @@ class StatsManager:
         self.global_stats.total_wait_time += wait_time
     
     def record_concurrent_start(self) -> None:
-        """Registra início de requisição concorrente"""
+        """Registra início de requisição concorrente - CORRIGIDO"""
         self._current_concurrent += 1
+        
+        # ✅ CORREÇÃO: Atualizar pico global
         self.global_stats.concurrent_peak = max(self.global_stats.concurrent_peak, self._current_concurrent)
+        
+        # ✅ CORREÇÃO: Atualizar pico apenas dos batches ativos
+        for batch_id, snapshot in self._batch_snapshots.items():
+            snapshot['batch_concurrent_peak'] = max(
+                snapshot.get('batch_concurrent_peak', 0), 
+                self._current_concurrent
+            )
     
     def record_concurrent_end(self) -> None:
         """Registra fim de requisição concorrente"""
