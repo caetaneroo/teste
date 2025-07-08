@@ -1,10 +1,3 @@
-from tenacity import AsyncRetrying, RetryError, stop_after_attempt
-import asyncio
-import time
-import json
-import logging
-import re
-
 async def _make_api_call(
     self,
     messages: List[Dict[str, str]],
@@ -12,7 +5,9 @@ async def _make_api_call(
     request_id: str = None
 ) -> Dict[str, Any]:
     """
-    Faz chamada à API com AsyncRetrying e wait time específico do Azure/OpenAI
+    Faz chamada à API com rate limiting coordenado + AsyncRetrying otimizado
+    
+    Baseado nas melhores práticas do Tenacity com semáforos e rate limiting
     """
     
     if not request_id:
@@ -25,26 +20,34 @@ async def _make_api_call(
             'tokens_used': 0,
             'success': False,
             'error': 'Messages inválidas',
-            'error_type': 'ValidationError'
+            'error_type': 'ValidationError',
+            'request_id': request_id
         }
     
-    # Estimar tokens necessários
+    # ✅ FORA: Estimar tokens (uma vez só)
     base_estimate = self.estimate_tokens(messages)
     
-    # Aguardar com rate limiting adaptativo
+    # ✅ FORA: Rate limiting coordenado inicial (antes de tudo)
     calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
     
     # Registrar início de requisição concorrente
     self.stats_manager.record_concurrent_start()
     
+    # ✅ DENTRO: Semáforo protege apenas recursos limitados (API calls)
     async with self.semaphore:
         try:
-            # AsyncRetrying com controle manual
+            # ✅ DENTRO: AsyncRetrying para tentativas de API
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(5),
+                wait=wait_fixed(0.1),  # Wait mínimo para evitar conflito
                 reraise=True
             ):
                 with attempt:
+                    # ✅ DENTRO do LOOP: Verificar rate limit global em tentativas subsequentes
+                    if attempt.retry_state.attempt_number > 1:
+                        # Aguardar rate limiting coordenado para novas tentativas
+                        await self.rate_limiter.wait_for_tokens(base_estimate)
+                    
                     start_time = time.time()
                     
                     try:
@@ -83,7 +86,7 @@ async def _make_api_call(
                             }
                         )
                         
-                        # Fazer chamada à API
+                        # ✅ CHAMADA REAL DA API
                         response = await self.client.chat.completions.create(**api_params)
                         
                         end_time = time.time()
@@ -154,7 +157,7 @@ async def _make_api_call(
                             }
                         )
                         
-                        # Retorno de sucesso
+                        # ✅ RETORNO DE SUCESSO
                         return {
                             'content': parsed_content,
                             'raw_content': content,
@@ -199,23 +202,20 @@ async def _make_api_call(
                             # Tratamento específico para rate limit
                             if _is_rate_limit_error_from_result(error_result):
                                 wait_time = self._extract_wait_time_from_error(e)
-                                self.stats_manager.record_rate_limit_wait(wait_time)
                                 
-                                logger.warning(
-                                    f"Rate limit atingido - aguardando {wait_time}s antes do retry",
+                                # ✅ ATIVAR rate limit global para próximas tentativas
+                                self.rate_limiter.record_api_rate_limit(wait_time)
+                                
+                                logger.debug(
+                                    f"Rate limit detectado - próximas tentativas aguardarão {wait_time}s",
                                     extra={
                                         'request_id': request_id,
                                         'attempt_number': attempt.retry_state.attempt_number,
-                                        'error': str(e),
-                                        'error_type': type(e).__name__,
                                         'wait_time': wait_time,
-                                        'action': 'rate_limit_wait'
+                                        'action': 'rate_limit_detected'
                                     }
                                 )
-                                
-                                # ✅ AGUARDAR o tempo específico do Azure/OpenAI
-                                await asyncio.sleep(wait_time)
-                                
+                            
                             else:
                                 # Outros erros temporários
                                 logger.warning(
@@ -228,15 +228,12 @@ async def _make_api_call(
                                         'action': 'temporary_error_retry'
                                     }
                                 )
-                                
-                                # Aguardar um tempo menor para erros temporários
-                                await asyncio.sleep(min(2 ** attempt.retry_state.attempt_number, 30))
                             
-                            # Re-raise para que AsyncRetrying faça o retry
+                            # ✅ RAISE para que AsyncRetrying faça nova tentativa
                             raise
                         
                         else:
-                            # Erro permanente - não fazer retry
+                            # Erro permanente - retornar sem retry
                             logger.error(
                                 "Erro permanente - sem retry",
                                 extra={
@@ -248,7 +245,6 @@ async def _make_api_call(
                                 }
                             )
                             
-                            # Retornar erro permanente
                             return error_result
                             
         except RetryError as retry_error:
