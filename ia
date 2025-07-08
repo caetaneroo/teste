@@ -7,7 +7,7 @@ import re
 import tiktoken
 from typing import List, Dict, Any, Optional
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
-from iaragen import AsyncIaraGenAI
+from iaragenai import AsyncIaraGenAI
 
 # Importar módulos locais
 from .rate_limiter import AdaptiveRateLimiter
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Constantes de configuração                                                  #
 # --------------------------------------------------------------------------- #
 MAX_TPM = 180000  # Máximo de tokens por minuto
-MAX_RETRY = 5     # Máximo de tentativas de retry
+MAX_RETRY = 2     # Máximo de tentativas de retry
 
 # --------------------------------------------------------------------------- #
 # Função global para detecção de rate limit                                  #
@@ -48,7 +48,7 @@ class AIProcessor:
     Processador de IA com AsyncIaraGenAI, rate limiting adaptativo e logs organizados
     
     Características:
-    - Usa AsyncIaraGenAI da biblioteca iaragen
+    - Usa AsyncIaraGenAI da biblioteca iaragenai
     - Rate limiting coordenado com logs organizados por responsabilidade
     - Processamento paralelo com controle de concorrência
     - Calibração adaptativa de estimativas de tokens
@@ -80,8 +80,8 @@ class AIProcessor:
         )
         
         # Controle de concorrência
-        max_concurrent = config.get('max_concurrent', 10)
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.max_concurrent = config.get('max_concurrent', 10)
+        self.semaphore = asyncio.Semaphore(self.max_concurrent)
         
         # Rate limiting adaptativo
         max_tpm = config.get('max_tpm', MAX_TPM)
@@ -102,7 +102,7 @@ class AIProcessor:
             "AIProcessor inicializado com AsyncIaraGenAI",
             extra={
                 'model': self.model,
-                'max_concurrent': max_concurrent,
+                'max_concurrent': self.max_concurrent,
                 'max_tpm': max_tpm,
                 'calibration_enabled': calibration_enabled,
                 'provider': self.provider,
@@ -467,6 +467,7 @@ class AIProcessor:
                 }
                 
         finally:
+            # ✅ CORREÇÃO: Indentação correta do finally
             # Registrar fim de requisição concorrente
             self.stats_manager.record_concurrent_end()
     
@@ -632,7 +633,7 @@ class AIProcessor:
                 'total_texts': len(texts),
                 'has_custom_ids': custom_ids is not None,
                 'has_json_schema': json_schema is not None,
-                'max_concurrent': self.semaphore._initial_value,
+                'max_concurrent': self.max_concurrent,  # ✅ CORREÇÃO: usar self.max_concurrent
                 'action': 'batch_start'
             }
         )
