@@ -1,0 +1,286 @@
+from tenacity import AsyncRetrying, RetryError, stop_after_attempt
+import asyncio
+import time
+import json
+import logging
+import re
+
+async def _make_api_call(
+    self,
+    messages: List[Dict[str, str]],
+    json_schema: Optional[Dict[str, Any]] = None,
+    request_id: str = None
+) -> Dict[str, Any]:
+    """
+    Faz chamada à API com AsyncRetrying e wait time específico do Azure/OpenAI
+    """
+    
+    if not request_id:
+        request_id = self._generate_request_id()
+    
+    # Validar entrada
+    if not messages or not isinstance(messages, list):
+        return {
+            'content': None,
+            'tokens_used': 0,
+            'success': False,
+            'error': 'Messages inválidas',
+            'error_type': 'ValidationError'
+        }
+    
+    # Estimar tokens necessários
+    base_estimate = self.estimate_tokens(messages)
+    
+    # Aguardar com rate limiting adaptativo
+    calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
+    
+    # Registrar início de requisição concorrente
+    self.stats_manager.record_concurrent_start()
+    
+    async with self.semaphore:
+        try:
+            # AsyncRetrying com controle manual
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(5),
+                reraise=True
+            ):
+                with attempt:
+                    start_time = time.time()
+                    
+                    try:
+                        # Preparar parâmetros da API
+                        api_params = {
+                            "model": self.model,
+                            "messages": messages,
+                            "temperature": self.temperature
+                        }
+                        
+                        # Só incluir max_tokens se estiver definido
+                        if self.max_tokens is not None:
+                            api_params["max_tokens"] = self.max_tokens
+                        
+                        # Adicionar JSON schema se fornecido
+                        if json_schema and isinstance(json_schema, dict):
+                            api_params["response_format"] = {
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": json_schema.get("name", "response_schema"),
+                                    "description": json_schema.get("description", "Schema for structured response"),
+                                    "schema": json_schema.get("schema", json_schema),
+                                    "strict": json_schema.get("strict", True)
+                                }
+                            }
+                        
+                        # Log da tentativa
+                        logger.debug(
+                            f"Tentativa {attempt.retry_state.attempt_number}/5 - Chamada à API",
+                            extra={
+                                'request_id': request_id,
+                                'attempt_number': attempt.retry_state.attempt_number,
+                                'base_estimate': base_estimate,
+                                'calibrated_estimate': calibrated_estimate,
+                                'action': 'api_call_attempt'
+                            }
+                        )
+                        
+                        # Fazer chamada à API
+                        response = await self.client.chat.completions.create(**api_params)
+                        
+                        end_time = time.time()
+                        api_response_time = end_time - start_time
+                        
+                        # Extrair tokens usados
+                        tokens_used = response.usage.total_tokens
+                        input_tokens = response.usage.prompt_tokens
+                        output_tokens = response.usage.completion_tokens
+                        
+                        # Extrair cached tokens se disponível
+                        cached_tokens = 0
+                        if hasattr(response.usage, 'prompt_tokens_details'):
+                            cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
+                        
+                        # Registrar tokens no rate limiter
+                        self.rate_limiter.record_tokens(tokens_used)
+                        self.rate_limiter.record_token_usage(base_estimate, tokens_used)
+                        
+                        # Calcular custo
+                        cost = self.calculate_cost(input_tokens, output_tokens)
+                        
+                        # Processar resposta
+                        content = response.choices[0].message.content
+                        parsed_content = content
+                        
+                        # Se JSON schema foi usado, tentar parsear
+                        if json_schema and isinstance(json_schema, dict) and content:
+                            try:
+                                parsed_content = json.loads(content)
+                                logger.debug(
+                                    "JSON Schema parseado com sucesso",
+                                    extra={
+                                        'request_id': request_id,
+                                        'action': 'json_parse_success'
+                                    }
+                                )
+                            except json.JSONDecodeError as e:
+                                logger.warning(
+                                    "Erro ao parsear JSON Schema",
+                                    extra={
+                                        'request_id': request_id,
+                                        'error': str(e),
+                                        'raw_content': content[:200],
+                                        'action': 'json_parse_error'
+                                    }
+                                )
+                                parsed_content = content
+                        
+                        # Log de sucesso
+                        estimation_accuracy = abs(calibrated_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
+                        
+                        logger.debug(
+                            "Chamada à API bem-sucedida",
+                            extra={
+                                'request_id': request_id,
+                                'attempt_number': attempt.retry_state.attempt_number,
+                                'tokens_used': tokens_used,
+                                'input_tokens': input_tokens,
+                                'output_tokens': output_tokens,
+                                'cached_tokens': cached_tokens,
+                                'base_estimate': base_estimate,
+                                'calibrated_estimate': calibrated_estimate,
+                                'estimation_accuracy': round(estimation_accuracy, 1),
+                                'api_response_time': round(api_response_time, 3),
+                                'cost': round(cost, 6),
+                                'action': 'api_call_success'
+                            }
+                        )
+                        
+                        # Retorno de sucesso
+                        return {
+                            'content': parsed_content,
+                            'raw_content': content,
+                            'tokens_used': tokens_used,
+                            'input_tokens': input_tokens,
+                            'output_tokens': output_tokens,
+                            'cached_tokens': cached_tokens,
+                            'cost': cost,
+                            'api_response_time': api_response_time,
+                            'success': True,
+                            'is_json': json_schema is not None,
+                            'attempts': attempt.retry_state.attempt_number,
+                            'request_id': request_id
+                        }
+                        
+                    except Exception as e:
+                        end_time = time.time()
+                        api_response_time = end_time - start_time
+                        
+                        # Criar resultado de erro
+                        error_result = {
+                            'content': None,
+                            'raw_content': None,
+                            'tokens_used': 0,
+                            'input_tokens': 0,
+                            'output_tokens': 0,
+                            'cached_tokens': 0,
+                            'cost': 0.0,
+                            'api_response_time': api_response_time,
+                            'success': False,
+                            'error': str(e),
+                            'error_type': type(e).__name__,
+                            'is_json': False,
+                            'attempts': attempt.retry_state.attempt_number,
+                            'request_id': request_id
+                        }
+                        
+                        # Verificar se deve fazer retry
+                        should_retry = _should_retry_result(error_result)
+                        
+                        if should_retry:
+                            # Tratamento específico para rate limit
+                            if _is_rate_limit_error_from_result(error_result):
+                                wait_time = self._extract_wait_time_from_error(e)
+                                self.stats_manager.record_rate_limit_wait(wait_time)
+                                
+                                logger.warning(
+                                    f"Rate limit atingido - aguardando {wait_time}s antes do retry",
+                                    extra={
+                                        'request_id': request_id,
+                                        'attempt_number': attempt.retry_state.attempt_number,
+                                        'error': str(e),
+                                        'error_type': type(e).__name__,
+                                        'wait_time': wait_time,
+                                        'action': 'rate_limit_wait'
+                                    }
+                                )
+                                
+                                # ✅ AGUARDAR o tempo específico do Azure/OpenAI
+                                await asyncio.sleep(wait_time)
+                                
+                            else:
+                                # Outros erros temporários
+                                logger.warning(
+                                    f"Erro temporário - tentativa {attempt.retry_state.attempt_number}/5",
+                                    extra={
+                                        'request_id': request_id,
+                                        'attempt_number': attempt.retry_state.attempt_number,
+                                        'error': str(e),
+                                        'error_type': type(e).__name__,
+                                        'action': 'temporary_error_retry'
+                                    }
+                                )
+                                
+                                # Aguardar um tempo menor para erros temporários
+                                await asyncio.sleep(min(2 ** attempt.retry_state.attempt_number, 30))
+                            
+                            # Re-raise para que AsyncRetrying faça o retry
+                            raise
+                        
+                        else:
+                            # Erro permanente - não fazer retry
+                            logger.error(
+                                "Erro permanente - sem retry",
+                                extra={
+                                    'request_id': request_id,
+                                    'attempt_number': attempt.retry_state.attempt_number,
+                                    'error': str(e),
+                                    'error_type': type(e).__name__,
+                                    'action': 'permanent_error'
+                                }
+                            )
+                            
+                            # Retornar erro permanente
+                            return error_result
+                            
+        except RetryError as retry_error:
+            # Todas as tentativas falharam
+            logger.error(
+                "Todas as tentativas de retry falharam",
+                extra={
+                    'request_id': request_id,
+                    'total_attempts': 5,
+                    'final_error': str(retry_error.last_attempt.exception()) if retry_error.last_attempt else 'Desconhecido',
+                    'action': 'retry_exhausted'
+                }
+            )
+            
+            # Retornar resultado final de falha
+            return {
+                'content': None,
+                'raw_content': None,
+                'tokens_used': 0,
+                'input_tokens': 0,
+                'output_tokens': 0,
+                'cached_tokens': 0,
+                'cost': 0.0,
+                'api_response_time': 0.0,
+                'success': False,
+                'error': f'Máximo de tentativas excedido: {retry_error.last_attempt.exception() if retry_error.last_attempt else "Erro desconhecido"}',
+                'error_type': 'RetryError',
+                'is_json': False,
+                'attempts': 5,
+                'request_id': request_id
+            }
+            
+    finally:
+        # Registrar fim de requisição concorrente
+        self.stats_manager.record_concurrent_end()
