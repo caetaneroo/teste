@@ -1,72 +1,209 @@
-for coro in asyncio.as_completed(tasks):
-    try:
-        result = await coro
-        results.append(result)
-        completed += 1
-        
-        # ✅ NOVO: Detectar rate limit sem log individual
-        current_rate_limits = sum(1 for r in results 
-                                if not r.get('success', False) and 
-                                any(indicator in r.get('error', '').lower() 
-                                    for indicator in ['429', 'rate limit', 'azure-openai error']))
-        
-        # ✅ VERIFICAR se houve NOVO evento de rate limit
-        if current_rate_limits > getattr(self, '_last_rate_limit_count', 0):
-            # Calcular estatísticas no momento do rate limit
-            successful_so_far = sum(1 for r in results if r.get('success', False))
-            failed_so_far = completed - successful_so_far
-            remaining = len(texts) - completed
+async def process_batch(
+    self, 
+    texts: List[str], 
+    prompt_template: str,
+    json_schema: Optional[Dict[str, Any]] = None,
+    batch_id: Optional[str] = None,
+    custom_ids: Optional[List[str]] = None,
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    Processa múltiplos textos em paralelo com logs organizados por responsabilidade
+    
+    Características:
+    - Logs de progresso a cada 5 itens (responsabilidade do AI Processor)
+    - Logs de rate limiting delegados para o Rate Limiter
+    - Coordenação eficiente entre componentes
+    - Visibilidade completa do progresso sem poluição de logs
+    """
+    
+    # Usar batch_id customizado ou gerar automaticamente
+    batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
+    
+    # Validar custom_ids se fornecido
+    if custom_ids and len(custom_ids) != len(texts):
+        raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
+    
+    # ✅ INICIALIZAR controles de progresso
+    progress_intervals = self._calculate_progress_intervals(len(texts))
+    self._last_logged_successes = 0
+    
+    # ✅ INICIALIZAR rate limiter para o batch (logs delegados)
+    self.rate_limiter.start_batch(batch_id)
+    
+    # Iniciar tracking do batch no StatsManager
+    self.stats_manager.start_batch(batch_id)
+    
+    # ✅ LOG DE INÍCIO (responsabilidade do AI Processor)
+    logger.info(
+        f"🚀 Iniciando processamento em lote - {len(texts)} textos",
+        extra={
+            'batch_id': batch_id,
+            'total_texts': len(texts),
+            'has_custom_ids': custom_ids is not None,
+            'has_json_schema': json_schema is not None,
+            'max_concurrent': self.semaphore._initial_value,
+            'action': 'batch_start'
+        }
+    )
+    
+    # Criar tasks para processamento paralelo
+    tasks = []
+    for i, text in enumerate(texts):
+        custom_id = custom_ids[i] if custom_ids else None
+        task = self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
+        tasks.append(task)
+    
+    # ✅ EXECUTAR com logs organizados
+    results = []
+    completed = 0
+    start_time = time.time()
+    
+    for coro in asyncio.as_completed(tasks):
+        try:
+            result = await coro
+            results.append(result)
+            completed += 1
             
-            # ✅ LOG DE INFO: Status quando atingiu rate limit
-            logger.info(
-                f"📊 Status no rate limit: {completed}/{len(texts)} processados | "
-                f"✅{successful_so_far} ❌{failed_so_far} | "
-                f"🔄{remaining} restantes",
+            # ✅ DETECTAR rate limit e delegar para rate limiter
+            if not result.get('success', False):
+                error_msg = result.get('error', '').lower()
+                is_rate_limit = any(indicator in error_msg for indicator in [
+                    '429', 'rate limit', 'azure-openai error', 'too many requests'
+                ])
+                
+                if is_rate_limit:
+                    # Calcular estatísticas atuais
+                    successful_so_far = sum(1 for r in results if r.get('success', False))
+                    failed_so_far = completed - successful_so_far
+                    wait_time = self._extract_wait_time_from_error_result(result)
+                    
+                    # ✅ DELEGAR para rate limiter (com contexto completo)
+                    self.rate_limiter.record_api_rate_limit_with_context(
+                        wait_time, completed, len(texts), successful_so_far, failed_so_far
+                    )
+            else:
+                # ✅ NOTIFICAR rate limiter sobre sucesso
+                self.rate_limiter.record_successful_request()
+            
+            # ✅ LOG DE PROGRESSO (responsabilidade do AI Processor - a cada 5)
+            if completed in progress_intervals:
+                elapsed = time.time() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (len(texts) - completed) / rate if rate > 0 else 0
+                
+                successful_so_far = sum(1 for r in results if r.get('success', False))
+                failed_so_far = completed - successful_so_far
+                recent_successes = successful_so_far - self._last_logged_successes
+                self._last_logged_successes = successful_so_far
+                
+                logger.info(
+                    f"📊 Progresso: {completed}/{len(texts)} ({completed/len(texts)*100:.1f}%) | "
+                    f"✅{successful_so_far} ❌{failed_so_far} | "
+                    f"🆕{recent_successes} novos | "
+                    f"⏱️ETA: {eta/60:.1f}min",
+                    extra={
+                        'batch_id': batch_id,
+                        'completed': completed,
+                        'total': len(texts),
+                        'successful_so_far': successful_so_far,
+                        'failed_so_far': failed_so_far,
+                        'recent_successes': recent_successes,
+                        'processing_rate': round(rate, 2),
+                        'eta_minutes': round(eta / 60, 1),
+                        'progress_percent': round((completed / len(texts)) * 100, 1),
+                        'action': 'batch_progress'
+                    }
+                )
+                
+        except Exception as e:
+            logger.error(
+                f"Erro em task do lote - continuando...",
                 extra={
                     'batch_id': batch_id,
                     'completed': completed,
-                    'total': len(texts),
-                    'successful_so_far': successful_so_far,
-                    'failed_so_far': failed_so_far,
-                    'remaining': remaining,
-                    'action': 'rate_limit_status_info'
+                    'error': str(e),
+                    'error_type': type(e).__name__,
+                    'action': 'batch_task_error'
                 }
             )
-            
-            # ✅ LOG DE WARNING: Evento de rate limit
-            logger.warning(
-                f"🚨 Rate limit evento #{current_rate_limits} detectado! "
-                f"Aguardando coordenação global...",
-                extra={
-                    'batch_id': batch_id,
-                    'rate_limit_event_number': current_rate_limits,
-                    'completed_at_rate_limit': completed,
-                    'action': 'rate_limit_event_warning'
-                }
-            )
-            
-            # Atualizar contador
-            self._last_rate_limit_count = current_rate_limits
-        
-        # Log de progresso regular (a cada 5) - SEM rate limits
-        if completed in progress_intervals and current_rate_limits == getattr(self, '_last_rate_limit_count', 0):
-            elapsed = time.time() - start_time
-            rate = completed / elapsed if elapsed > 0 else 0
-            eta = (len(texts) - completed) / rate if rate > 0 else 0
-            
-            successful_so_far = sum(1 for r in results if r.get('success', False))
-            failed_so_far = completed - successful_so_far
-            recent_successes = successful_so_far - self._last_logged_successes
-            self._last_logged_successes = successful_so_far
-            
-            logger.info(
-                f"📊 Progresso: {completed}/{len(texts)} ({completed/len(texts)*100:.1f}%) | "
-                f"✅{successful_so_far} ❌{failed_so_far} | "
-                f"🆕{recent_successes} novos",
-                extra={
-                    'batch_id': batch_id,
-                    'completed': completed,
-                    'total': len(texts),
-                    'action': 'batch_progress_regular'
-                }
-            )
+            results.append({
+                'content': None,
+                'success': False,
+                'error': str(e),
+                'error_type': type(e).__name__
+            })
+            completed += 1
+    
+    # Finalizar batch e obter stats específicas do batch
+    batch_stats = self.stats_manager.end_batch(batch_id)
+    
+    # ✅ LOG DE FIM (responsabilidade do AI Processor)
+    logger.info(
+        f"✅ Batch concluído - {batch_stats.successful_requests} sucessos, "
+        f"{batch_stats.failed_requests} falhas em {batch_stats.processing_time:.1f}s",
+        extra={
+            'batch_id': batch_id,
+            'total_requests': batch_stats.total_requests,
+            'successful_requests': batch_stats.successful_requests,
+            'failed_requests': batch_stats.failed_requests,
+            'processing_time': round(batch_stats.processing_time, 2),
+            'total_tokens': batch_stats.total_tokens,
+            'total_cost': round(batch_stats.total_cost, 4),
+            'avg_rate': round(batch_stats.avg_rate, 2),
+            'success_rate': round(batch_stats.success_rate, 1),
+            'action': 'batch_complete'
+        }
+    )
+    
+    return {
+        'results': results,
+        'batch_stats': batch_stats,
+        'batch_id': batch_id
+    }
+
+def _calculate_progress_intervals(self, total: int) -> List[int]:
+    """
+    ✅ ATUALIZADO: Calcula intervalos de progresso a cada 5 itens, independente do tamanho do lote
+    """
+    if total <= 5:
+        # Lotes muito pequenos: log cada item
+        return list(range(1, total + 1))
+    
+    # ✅ SEMPRE a cada 5, independente do tamanho
+    intervals = list(range(5, total + 1, 5))
+    
+    # Garantir que o total sempre está incluído
+    if total not in intervals:
+        intervals.append(total)
+    
+    # Sempre incluir o primeiro item para feedback inicial
+    if 1 not in intervals:
+        intervals.insert(0, 1)
+    
+    return sorted(intervals)
+
+def _extract_wait_time_from_error_result(self, result: Dict[str, Any]) -> float:
+    """Extrai wait time do resultado de erro"""
+    error_msg = result.get('error', '')
+    
+    # Padrões comuns para extrair tempo de espera
+    import re
+    patterns = [
+        r'retry after (\d+) seconds',
+        r'wait (\d+) seconds',
+        r'(\d+)s',
+        r'retry.*?(\d+)',
+        r'wait.*?(\d+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, error_msg, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                continue
+    
+    # Default para Azure OpenAI
+    return 60.0
