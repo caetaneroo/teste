@@ -23,8 +23,13 @@ class Stats:
     max_response_time: float = 0.0  # Maior tempo de resposta
     total_wait_time: float = 0.0  # Tempo total aguardando rate limits
     retry_attempts: int = 0  # Total de tentativas de retry
-    concurrent_peak: int = 0  # Pico de requisições simultâneas
+    concurrent_peak: int = 0  # Pico de requisições simultâneas (CORRIGIDO)
     errors_by_type: Dict[str, int] = field(default_factory=dict)  # Erros por tipo
+    
+    # ✅ NOVAS: Métricas de rate limiting coordenado
+    api_rate_limits_detected: int = 0  # Rate limits detectados pela API
+    global_rate_limit_activations: int = 0  # Vezes que rate limit global foi ativado
+    coordinated_wait_time: float = 0.0  # Tempo total de espera coordenada
     
     @property
     def total_tokens(self) -> int:
@@ -76,18 +81,30 @@ class Stats:
         """Economia estimada com tokens cached (50% desconto típico)"""
         # Estimativa conservadora: cached tokens custam 50% menos
         return self.total_tokens_cached * 0.5 * 0.0015 / 1000
+    
+    @property
+    def coordination_efficiency(self) -> float:
+        """Eficiência da coordenação vs rate limits individuais"""
+        if self.api_rate_limits_detected == 0:
+            return 100.0
+        return (1 - (self.global_rate_limit_activations / self.api_rate_limits_detected)) * 100
 
 class StatsManager:
     """
-    Gerenciador único que serve batch e global - elimina repetição de código
+    Gerenciador único que serve batch e global - com rate limiting coordenado
     
-    CORREÇÃO: Tracking de concorrência corrigido para mostrar pico real por batch
+    Características:
+    - Tracking automático de diferenças para stats de batch
+    - Métricas completas incluindo cached tokens e coordenação
+    - Formatação consistente para qualquer tipo de stats
+    - Comparação entre batches sem repetição
+    - Pico concorrente CORRIGIDO para mostrar valor real
     """
     
     def __init__(self):
         self.global_stats = Stats()
         self._batch_snapshots = {}
-        self._current_concurrent = 0  # Tracking de concorrência atual
+        self._current_concurrent = 0  # Tracking de concorrência atual (CORRIGIDO)
     
     def start_batch(self, batch_id: str) -> None:
         """Inicia tracking de um batch - CORRIGIDO: resetar pico concorrente"""
@@ -107,7 +124,12 @@ class StatsManager:
                 total_wait_time=self.global_stats.total_wait_time,
                 retry_attempts=self.global_stats.retry_attempts,
                 concurrent_peak=0,  # ✅ CORREÇÃO: Resetar para o batch
-                errors_by_type=self.global_stats.errors_by_type.copy()
+                errors_by_type=self.global_stats.errors_by_type.copy(),
+                
+                # ✅ NOVAS métricas de coordenação
+                api_rate_limits_detected=self.global_stats.api_rate_limits_detected,
+                global_rate_limit_activations=self.global_stats.global_rate_limit_activations,
+                coordinated_wait_time=self.global_stats.coordinated_wait_time
             )
         }
     
@@ -143,6 +165,11 @@ class StatsManager:
             # ✅ CORREÇÃO: Usar pico específico do batch, não global
             concurrent_peak=snapshot.get('batch_concurrent_peak', 0),
             
+            # ✅ NOVAS métricas de coordenação
+            api_rate_limits_detected=self.global_stats.api_rate_limits_detected - start_stats.api_rate_limits_detected,
+            global_rate_limit_activations=self.global_stats.global_rate_limit_activations - start_stats.global_rate_limit_activations,
+            coordinated_wait_time=self.global_stats.coordinated_wait_time - start_stats.coordinated_wait_time,
+            
             # Erros por tipo (diferença)
             errors_by_type={
                 error_type: self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)
@@ -159,8 +186,11 @@ class StatsManager:
     def record_request(self, success: bool, tokens_input: int = 0, 
                       tokens_output: int = 0, tokens_cached: int = 0,
                       cost: float = 0.0, api_response_time: float = 0.0, 
-                      error_type: str = None, retry_count: int = 0) -> None:
-        """Registra uma requisição com métricas detalhadas incluindo cached tokens"""
+                      error_type: str = None, retry_count: int = 0,
+                      # ✅ NOVOS parâmetros para rate limiting coordenado
+                      api_rate_limit_detected: bool = False,
+                      coordinated_wait_time: float = 0.0) -> None:
+        """Registra uma requisição com métricas de rate limiting coordenado"""
         
         self.global_stats.total_requests += 1
         
@@ -188,6 +218,13 @@ class StatsManager:
         self.global_stats.total_tokens_cached += tokens_cached
         self.global_stats.total_cost += cost
         self.global_stats.retry_attempts += retry_count
+        
+        # ✅ NOVAS métricas de coordenação
+        if api_rate_limit_detected:
+            self.global_stats.api_rate_limits_detected += 1
+        
+        if coordinated_wait_time > 0:
+            self.global_stats.coordinated_wait_time += coordinated_wait_time
     
     def record_rate_limit(self) -> None:
         """Registra uma espera por rate limit (compatibilidade)"""
@@ -197,6 +234,23 @@ class StatsManager:
         """Registra espera por rate limit com tempo"""
         self.global_stats.rate_limit_waits += 1
         self.global_stats.total_wait_time += wait_time
+    
+    def record_global_rate_limit_activation(self, wait_time: float, requests_affected: int = 0) -> None:
+        """Registra ativação de rate limit global coordenado"""
+        self.global_stats.global_rate_limit_activations += 1
+        self.global_stats.coordinated_wait_time += wait_time
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            "Rate limit global registrado nas estatísticas",
+            extra={
+                'wait_time': wait_time,
+                'requests_affected': requests_affected,
+                'total_activations': self.global_stats.global_rate_limit_activations,
+                'action': 'global_rate_limit_stats'
+            }
+        )
     
     def record_concurrent_start(self) -> None:
         """Registra início de requisição concorrente - CORRIGIDO"""
@@ -265,12 +319,23 @@ class StatsManager:
    🔗 Pico concorrente: {stats.concurrent_peak} requisições
    💵 Custo por token: ${stats.cost_per_token:.6f}"""
         
+        # ✅ ADICIONAR seção de coordenação se houver dados
+        coordination_stats = ""
+        if stats.api_rate_limits_detected > 0:
+            coordination_stats = f"""
+   
+   🤝 COORDENAÇÃO DE RATE LIMITS:
+   🚨 Rate limits detectados: {stats.api_rate_limits_detected}
+   🌐 Ativações globais: {stats.global_rate_limit_activations}
+   ⏱️ Tempo coordenado: {stats.coordinated_wait_time:.1f}s
+   📈 Eficiência coordenação: {stats.coordination_efficiency:.1f}%"""
+        
         # Adicionar rate limits se houver
         rate_limit_stats = ""
         if stats.rate_limit_waits > 0:
             rate_limit_stats = f"\n   ⏳ Rate limits: {stats.rate_limit_waits} ({stats.total_wait_time:.1f}s total)"
         
-        return basic_stats + cache_stats + performance_stats + rate_limit_stats + errors_summary
+        return basic_stats + cache_stats + performance_stats + coordination_stats + rate_limit_stats + errors_summary
     
     def reset_global(self) -> None:
         """Reset stats globais"""
@@ -333,6 +398,7 @@ class StatsManager:
             'cost_efficiency': stats.total_cost / stats.successful_requests if stats.successful_requests > 0 else 0,
             'time_efficiency': stats.efficiency_rate,
             'cache_efficiency': stats.cache_hit_rate,
+            'coordination_efficiency': stats.coordination_efficiency,
             'error_rate': (stats.failed_requests / stats.total_requests * 100) if stats.total_requests > 0 else 0,
             'avg_tokens_per_request': stats.total_tokens / stats.total_requests if stats.total_requests > 0 else 0
         }
@@ -387,5 +453,11 @@ class StatsManager:
                 'retry_attempts': stats.retry_attempts,
                 'retry_rate': stats.retry_rate,
                 'errors_by_type': stats.errors_by_type
+            },
+            'coordination_metrics': {
+                'api_rate_limits_detected': stats.api_rate_limits_detected,
+                'global_rate_limit_activations': stats.global_rate_limit_activations,
+                'coordinated_wait_time': stats.coordinated_wait_time,
+                'coordination_efficiency': stats.coordination_efficiency
             }
         }
