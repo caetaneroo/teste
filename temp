@@ -1,0 +1,72 @@
+for coro in asyncio.as_completed(tasks):
+    try:
+        result = await coro
+        results.append(result)
+        completed += 1
+        
+        # ✅ NOVO: Detectar rate limit sem log individual
+        current_rate_limits = sum(1 for r in results 
+                                if not r.get('success', False) and 
+                                any(indicator in r.get('error', '').lower() 
+                                    for indicator in ['429', 'rate limit', 'azure-openai error']))
+        
+        # ✅ VERIFICAR se houve NOVO evento de rate limit
+        if current_rate_limits > getattr(self, '_last_rate_limit_count', 0):
+            # Calcular estatísticas no momento do rate limit
+            successful_so_far = sum(1 for r in results if r.get('success', False))
+            failed_so_far = completed - successful_so_far
+            remaining = len(texts) - completed
+            
+            # ✅ LOG DE INFO: Status quando atingiu rate limit
+            logger.info(
+                f"📊 Status no rate limit: {completed}/{len(texts)} processados | "
+                f"✅{successful_so_far} ❌{failed_so_far} | "
+                f"🔄{remaining} restantes",
+                extra={
+                    'batch_id': batch_id,
+                    'completed': completed,
+                    'total': len(texts),
+                    'successful_so_far': successful_so_far,
+                    'failed_so_far': failed_so_far,
+                    'remaining': remaining,
+                    'action': 'rate_limit_status_info'
+                }
+            )
+            
+            # ✅ LOG DE WARNING: Evento de rate limit
+            logger.warning(
+                f"🚨 Rate limit evento #{current_rate_limits} detectado! "
+                f"Aguardando coordenação global...",
+                extra={
+                    'batch_id': batch_id,
+                    'rate_limit_event_number': current_rate_limits,
+                    'completed_at_rate_limit': completed,
+                    'action': 'rate_limit_event_warning'
+                }
+            )
+            
+            # Atualizar contador
+            self._last_rate_limit_count = current_rate_limits
+        
+        # Log de progresso regular (a cada 5) - SEM rate limits
+        if completed in progress_intervals and current_rate_limits == getattr(self, '_last_rate_limit_count', 0):
+            elapsed = time.time() - start_time
+            rate = completed / elapsed if elapsed > 0 else 0
+            eta = (len(texts) - completed) / rate if rate > 0 else 0
+            
+            successful_so_far = sum(1 for r in results if r.get('success', False))
+            failed_so_far = completed - successful_so_far
+            recent_successes = successful_so_far - self._last_logged_successes
+            self._last_logged_successes = successful_so_far
+            
+            logger.info(
+                f"📊 Progresso: {completed}/{len(texts)} ({completed/len(texts)*100:.1f}%) | "
+                f"✅{successful_so_far} ❌{failed_so_far} | "
+                f"🆕{recent_successes} novos",
+                extra={
+                    'batch_id': batch_id,
+                    'completed': completed,
+                    'total': len(texts),
+                    'action': 'batch_progress_regular'
+                }
+            )
