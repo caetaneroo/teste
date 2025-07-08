@@ -19,15 +19,14 @@ class TokenUsageRecord:
 
 class AdaptiveRateLimiter:
     """
-    Rate limiter com calibrador adaptativo baseado em histórico de tokens reais
+    Rate limiter com calibração adaptativa e controle global coordenado
     
     Características:
     - Calibra estimativas com base em dados históricos reais
     - Auto-ajuste estatístico para otimizar precisão
+    - Rate limiting global coordenado (uma warning por batch)
     - Prevenção proativa de rate limits
     - Máximo aproveitamento da quota disponível
-    
-    Nota: Não é "aprendizado de máquina" - é calibração estatística simples
     """
     
     def __init__(self, max_tokens_per_minute: int = 180000, calibration_enabled: bool = True):
@@ -51,8 +50,16 @@ class AdaptiveRateLimiter:
         self.total_waits = 0
         self.total_wait_time = 0.0
         
+        # ✅ NOVO: Controle global de rate limit coordenado
+        self._global_rate_limit_active = False
+        self._global_wait_until = 0.0
+        self._rate_limit_lock = asyncio.Lock()
+        self._rate_limit_logged = False  # Flag para log único por batch
+        self._current_batch_id = None  # Track do batch atual
+        
         # Estatísticas de eficiência
         self.prevented_rate_limits = 0
+        self.api_rate_limits_detected = 0  # Novos: rate limits detectados da API
         
         logger.info(
             "AdaptiveRateLimiter inicializado",
@@ -61,6 +68,20 @@ class AdaptiveRateLimiter:
                 'calibration_enabled': calibration_enabled,
                 'calibration_factor': self.calibration_factor,
                 'action': 'rate_limiter_init'
+            }
+        )
+    
+    def start_batch(self, batch_id: str) -> None:
+        """Inicia um novo batch - reset do controle global"""
+        self._current_batch_id = batch_id
+        self._rate_limit_logged = False
+        self.api_rate_limits_detected = 0
+        
+        logger.debug(
+            f"Rate limiter preparado para batch {batch_id}",
+            extra={
+                'batch_id': batch_id,
+                'action': 'batch_rate_limit_start'
             }
         )
     
@@ -176,7 +197,7 @@ class AdaptiveRateLimiter:
     
     async def wait_for_tokens(self, estimated_tokens: int) -> int:
         """
-        Aguarda tokens disponíveis usando estimativa calibrada
+        Aguarda tokens disponíveis com controle global coordenado
         
         Args:
             estimated_tokens: Estimativa base (geralmente do tiktoken)
@@ -184,9 +205,46 @@ class AdaptiveRateLimiter:
         Returns:
             Estimativa calibrada usada para rate limiting
         """
+        # ✅ VERIFICAR se há rate limit global ativo primeiro
+        async with self._rate_limit_lock:
+            current_time = time.time()
+            
+            # Se há rate limit global ativo
+            if self._global_rate_limit_active and current_time < self._global_wait_until:
+                remaining_wait = self._global_wait_until - current_time
+                
+                # ✅ LOG ÚNICO por batch
+                if not self._rate_limit_logged:
+                    logger.warning(
+                        f"Rate limit global ativo - todas as requests aguardarão {remaining_wait:.1f}s",
+                        extra={
+                            'batch_id': self._current_batch_id,
+                            'global_wait_time': round(remaining_wait, 1),
+                            'wait_until_timestamp': self._global_wait_until,
+                            'api_rate_limits_detected': self.api_rate_limits_detected,
+                            'action': 'global_rate_limit_wait'
+                        }
+                    )
+                    self._rate_limit_logged = True
+                
+                # Aguardar fora do lock
+                await asyncio.sleep(remaining_wait)
+                
+                # Reset do rate limit global
+                self._global_rate_limit_active = False
+                
+                logger.debug(
+                    "Rate limit global finalizado",
+                    extra={
+                        'batch_id': self._current_batch_id,
+                        'action': 'global_rate_limit_end'
+                    }
+                )
+        
         # Aplicar calibração baseada no histórico
         calibrated_tokens = self.get_calibrated_estimate(estimated_tokens)
         
+        # Rate limiting normal (proativo)
         async with self._lock:
             current_time = time.time()
             
@@ -206,35 +264,71 @@ class AdaptiveRateLimiter:
                 self.tokens_used_this_minute = 0
                 self.minute_start = current_time
             
-            # Verificar se precisa aguardar
+            # Verificar se precisa aguardar (rate limiting proativo)
             if self.tokens_used_this_minute + calibrated_tokens > self.max_tpm:
                 wait_time = 60 - (current_time - self.minute_start)
                 
                 if wait_time > 0:
-                    self.total_waits += 1
-                    self.total_wait_time += wait_time
-                    self.prevented_rate_limits += 1
+                    # ✅ ATIVAR rate limit global coordenado
+                    await self._activate_global_rate_limit(wait_time, 'proactive')
                     
-                    logger.warning(
-                        "Rate limit atingido - aguardando reset",
-                        extra={
-                            'wait_time': round(wait_time, 2),
-                            'tokens_used': self.tokens_used_this_minute,
-                            'calibrated_tokens': calibrated_tokens,
-                            'original_estimate': estimated_tokens,
-                            'calibration_factor': round(self.calibration_factor, 3),
-                            'total_waits': self.total_waits,
-                            'action': 'rate_limit_wait'
-                        }
-                    )
-                    
-                    await asyncio.sleep(wait_time)
-                
-                # Reset após espera
-                self.tokens_used_this_minute = 0
-                self.minute_start = time.time()
+                    # Reset após espera
+                    self.tokens_used_this_minute = 0
+                    self.minute_start = time.time()
         
         return calibrated_tokens
+    
+    async def _activate_global_rate_limit(self, wait_time: float, source: str = 'api'):
+        """Ativa rate limit global para todas as requests"""
+        async with self._rate_limit_lock:
+            current_time = time.time()
+            new_wait_until = current_time + wait_time
+            
+            # Só atualizar se é maior que o atual (evitar conflitos)
+            if new_wait_until > self._global_wait_until:
+                self._global_rate_limit_active = True
+                self._global_wait_until = new_wait_until
+                self._rate_limit_logged = False  # Reset para permitir novo log
+                
+                self.total_waits += 1
+                self.total_wait_time += wait_time
+                self.prevented_rate_limits += 1
+                
+                logger.debug(
+                    f"Rate limit global ativado - fonte: {source}",
+                    extra={
+                        'batch_id': self._current_batch_id,
+                        'wait_time': round(wait_time, 1),
+                        'source': source,
+                        'action': 'global_rate_limit_activated'
+                    }
+                )
+    
+    def record_api_rate_limit(self, wait_time: float):
+        """
+        Registra rate limit detectado pela API (Azure/OpenAI)
+        
+        Args:
+            wait_time: Tempo de espera solicitado pela API
+        """
+        self.api_rate_limits_detected += 1
+        
+        # Ativar rate limit global de forma assíncrona
+        async def _set_global_limit():
+            await self._activate_global_rate_limit(wait_time, 'api')
+        
+        # Criar task para não bloquear
+        asyncio.create_task(_set_global_limit())
+        
+        logger.debug(
+            f"Rate limit da API detectado - #{self.api_rate_limits_detected}",
+            extra={
+                'batch_id': self._current_batch_id,
+                'wait_time': round(wait_time, 1),
+                'total_api_rate_limits': self.api_rate_limits_detected,
+                'action': 'api_rate_limit_detected'
+            }
+        )
     
     def record_tokens(self, tokens_used: int) -> None:
         """
@@ -277,7 +371,10 @@ class AdaptiveRateLimiter:
             'calibration_factor': round(self.calibration_factor, 3),
             'calibration_accuracy': round(accuracy_percentage, 1),
             'total_calibrations': self.total_calibrations,
-            'prevented_rate_limits': self.prevented_rate_limits
+            'prevented_rate_limits': self.prevented_rate_limits,
+            'api_rate_limits_detected': self.api_rate_limits_detected,
+            'global_rate_limit_active': self._global_rate_limit_active,
+            'current_batch_id': self._current_batch_id
         }
     
     def get_calibration_stats(self) -> Dict[str, Any]:
@@ -295,9 +392,15 @@ class AdaptiveRateLimiter:
             'history_size': len(self.usage_history),
             'last_recalibration': self.last_recalibration,
             'prevented_rate_limits': self.prevented_rate_limits,
+            'api_rate_limits_detected': self.api_rate_limits_detected,
             'efficiency_metrics': {
                 'avg_wait_time': round(self.total_wait_time / self.total_waits, 2) if self.total_waits > 0 else 0,
                 'wait_frequency': round(self.total_waits / self.total_calibrations, 3) if self.total_calibrations > 0 else 0
+            },
+            'global_coordination': {
+                'global_rate_limit_active': self._global_rate_limit_active,
+                'current_batch_id': self._current_batch_id,
+                'rate_limit_logged': self._rate_limit_logged
             }
         }
     
@@ -313,6 +416,12 @@ class AdaptiveRateLimiter:
         self.accurate_estimates = 0
         self.last_recalibration = time.time()
         self.prevented_rate_limits = 0
+        self.api_rate_limits_detected = 0
+        
+        # Reset controle global
+        self._global_rate_limit_active = False
+        self._global_wait_until = 0.0
+        self._rate_limit_logged = False
     
     def disable_calibration(self) -> None:
         """
@@ -347,6 +456,7 @@ class AdaptiveRateLimiter:
                     'total_wait_time': round(self.total_wait_time, 2),
                     'average_wait_time': round(avg_wait_time, 2),
                     'prevented_rate_limits': self.prevented_rate_limits,
+                    'api_rate_limits_detected': self.api_rate_limits_detected,
                     'max_tpm': self.max_tpm,
                     'efficiency_percent': round(100 - (self.total_wait_time / 60 * 100), 2) if self.total_wait_time < 60 else 0,
                     'action': 'performance_summary'
