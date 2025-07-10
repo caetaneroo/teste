@@ -43,7 +43,7 @@ class Stats:
     total_api_response_time: float = 0.0
     min_response_time: float = float('inf')
     max_response_time: float = 0.0
-    total_wait_time: float = 0.0  # Rate limits proativos
+    total_wait_time: float = 0.0
     retry_attempts: int = 0
     concurrent_peak: int = 0
     errors_by_type: Dict[str, int] = field(default_factory=dict)
@@ -51,11 +51,11 @@ class Stats:
     # MÉTRICAS DE RATE LIMITING COORDENADO
     api_rate_limits_detected: int = 0
     global_rate_limit_activations: int = 0
-    coordinated_wait_time: float = 0.0  # ✅ CORREÇÃO: Tempo de pausa coordenada
+    coordinated_wait_time: float = 0.0
     
     # Breakdown de custos por modelo
     cost_breakdown: Dict[str, float] = field(default_factory=dict)
-    model_used: str = ""  # Modelo principal usado
+    model_used: str = ""
     
     @property
     def total_tokens(self) -> int:
@@ -79,12 +79,12 @@ class Stats:
     
     @property
     def efficiency_rate(self) -> float:
-        """✅ CORREÇÃO: % do tempo gasto processando vs aguardando (incluindo coordenação)"""
+        """% do tempo gasto processando vs aguardando (incluindo coordenação)"""
         total_time = self.processing_time
         if total_time <= 0:
             return 0.0
         
-        # ✅ CORREÇÃO: Incluir AMBOS os tipos de espera
+        # Incluir AMBOS os tipos de espera
         total_wait_time = self.total_wait_time + self.coordinated_wait_time
         processing_time = total_time - total_wait_time
         
@@ -113,7 +113,6 @@ class Stats:
     def cost_savings_from_cache(self) -> float:
         """Economia real baseada no modelo usado"""
         if not self.model_used or self.model_used not in MODEL_PRICING:
-            # Fallback para GPT-3.5 se modelo não identificado
             cache_price = MODEL_PRICING['gpt-35-turbo-16k']['cache']
             input_price = MODEL_PRICING['gpt-35-turbo-16k']['input']
         else:
@@ -121,7 +120,6 @@ class Stats:
             cache_price = pricing['cache']
             input_price = pricing['input']
         
-        # Economia = diferença entre preço normal e preço de cache
         savings_per_token = input_price - cache_price
         return (self.total_tokens_cached / 1000) * savings_per_token
     
@@ -134,20 +132,26 @@ class Stats:
 
 class StatsManager:
     """
-    Gerenciador único que serve batch e global - com correções de eficiência e custos
+    Gerenciador único que serve batch e global - com correções de concorrência e rate limits
     """
     
     def __init__(self):
         self.global_stats = Stats()
         self._batch_snapshots = {}
-        self._current_concurrent = 0  # ✅ CORREÇÃO: Track real de concorrência
-        self._peak_concurrent_ever = 0  # ✅ CORREÇÃO: Pico real global
+        # ✅ CORREÇÃO 1: Track real de concorrência respeitando max_concurrent
+        self._current_concurrent = 0
+        self._max_concurrent_limit = 10  # Será definido pelo AIProcessor
+        self._peak_concurrent_ever = 0
+    
+    def set_max_concurrent(self, max_concurrent: int) -> None:
+        """✅ NOVA: Define o limite máximo de concorrência"""
+        self._max_concurrent_limit = max_concurrent
     
     def start_batch(self, batch_id: str) -> None:
         """Inicia tracking de um batch"""
         self._batch_snapshots[batch_id] = {
             'start_time': time.time(),
-            'batch_peak_concurrent': 0,  # ✅ CORREÇÃO: Pico real do batch
+            'batch_peak_concurrent': 0,
             'start_stats': Stats(
                 total_requests=self.global_stats.total_requests,
                 successful_requests=self.global_stats.successful_requests,
@@ -164,7 +168,7 @@ class StatsManager:
                 max_response_time=self.global_stats.max_response_time,
                 total_wait_time=self.global_stats.total_wait_time,
                 retry_attempts=self.global_stats.retry_attempts,
-                concurrent_peak=0,  # ✅ CORREÇÃO: Resetar para o batch
+                concurrent_peak=0,
                 errors_by_type=self.global_stats.errors_by_type.copy(),
                 api_rate_limits_detected=self.global_stats.api_rate_limits_detected,
                 global_rate_limit_activations=self.global_stats.global_rate_limit_activations,
@@ -201,14 +205,14 @@ class StatsManager:
             total_wait_time=self.global_stats.total_wait_time - start_stats.total_wait_time,
             retry_attempts=self.global_stats.retry_attempts - start_stats.retry_attempts,
             
-            # ✅ CORREÇÃO: Usar pico real de concorrência do batch
-            concurrent_peak=snapshot.get('batch_peak_concurrent', 0),
+            # ✅ CORREÇÃO 1: Usar pico real respeitando limite
+            concurrent_peak=min(snapshot.get('batch_peak_concurrent', 0), self._max_concurrent_limit),
             
+            # ✅ CORREÇÃO 2: Garantir que rate limits sejam propagados
             api_rate_limits_detected=self.global_stats.api_rate_limits_detected - start_stats.api_rate_limits_detected,
             global_rate_limit_activations=self.global_stats.global_rate_limit_activations - start_stats.global_rate_limit_activations,
             coordinated_wait_time=self.global_stats.coordinated_wait_time - start_stats.coordinated_wait_time,
             
-            # Breakdown de custos
             cost_breakdown={
                 model: self.global_stats.cost_breakdown.get(model, 0) - start_stats.cost_breakdown.get(model, 0)
                 for model in set(list(self.global_stats.cost_breakdown.keys()) + list(start_stats.cost_breakdown.keys()))
@@ -279,7 +283,7 @@ class StatsManager:
             # Fallback para custo fornecido
             self.global_stats.total_cost += cost
         
-        # Métricas de coordenação
+        # ✅ CORREÇÃO 2: Métricas de coordenação corrigidas
         if api_rate_limit_detected:
             self.global_stats.api_rate_limits_detected += 1
         if coordinated_wait_time > 0:
@@ -295,9 +299,9 @@ class StatsManager:
         self.global_stats.total_wait_time += wait_time
     
     def record_global_rate_limit_activation(self, wait_time: float, requests_affected: int = 0) -> None:
-        """✅ CORREÇÃO: Registra ativação de rate limit global coordenado"""
+        """Registra ativação de rate limit global coordenado"""
         self.global_stats.global_rate_limit_activations += 1
-        self.global_stats.coordinated_wait_time += wait_time  # ✅ CORREÇÃO: Registrar tempo de pausa
+        self.global_stats.coordinated_wait_time += wait_time
         
         logger = logging.getLogger(__name__)
         logger.debug(
@@ -312,19 +316,21 @@ class StatsManager:
         )
     
     def record_concurrent_start(self) -> None:
-        """✅ CORREÇÃO: Registra início de requisição concorrente com tracking real"""
-        self._current_concurrent += 1
-        
-        # ✅ CORREÇÃO: Track do pico real global
-        self._peak_concurrent_ever = max(self._peak_concurrent_ever, self._current_concurrent)
-        self.global_stats.concurrent_peak = self._peak_concurrent_ever
-        
-        # ✅ CORREÇÃO: Track do pico real por batch
-        for batch_id, snapshot in self._batch_snapshots.items():
-            snapshot['batch_peak_concurrent'] = max(
-                snapshot.get('batch_peak_concurrent', 0), 
-                self._current_concurrent
-            )
+        """✅ CORREÇÃO 1: Registra início respeitando max_concurrent"""
+        # ✅ CORREÇÃO: Só incrementar se não exceder o limite
+        if self._current_concurrent < self._max_concurrent_limit:
+            self._current_concurrent += 1
+            
+            # Track do pico real respeitando limite
+            self._peak_concurrent_ever = max(self._peak_concurrent_ever, self._current_concurrent)
+            self.global_stats.concurrent_peak = self._peak_concurrent_ever
+            
+            # Track do pico real por batch
+            for batch_id, snapshot in self._batch_snapshots.items():
+                snapshot['batch_peak_concurrent'] = max(
+                    snapshot.get('batch_peak_concurrent', 0), 
+                    self._current_concurrent
+                )
     
     def record_concurrent_end(self) -> None:
         """Registra fim de requisição concorrente"""
@@ -376,7 +382,7 @@ class StatsManager:
    🎯 Cache hit rate: {stats.cache_hit_rate:.1f}%
    💵 Economia estimada: ${stats.cost_savings_from_cache:.4f}"""
         
-        # ✅ CORREÇÃO: Performance com eficiência e concorrência corrigidas
+        # Performance com eficiência e concorrência corrigidas
         performance_stats = ""
         if stats.successful_requests > 0 and stats.avg_response_time > 0:
             total_wait = stats.total_wait_time + stats.coordinated_wait_time
