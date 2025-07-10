@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 
-# ✅ NOVA: Tabela de preços por modelo e tipo de token
+# Tabela de preços por modelo e tipo de token
 MODEL_PRICING = {
     'gpt-35-turbo-16k': {'input': 0.0015, 'output': 0.002, 'cache': 0.00075},
     'gpt-4': {'input': 0.03, 'output': 0.06, 'cache': 0.015},
@@ -53,7 +53,7 @@ class Stats:
     global_rate_limit_activations: int = 0
     coordinated_wait_time: float = 0.0  # ✅ CORREÇÃO: Tempo de pausa coordenada
     
-    # ✅ NOVA: Breakdown de custos por modelo
+    # Breakdown de custos por modelo
     cost_breakdown: Dict[str, float] = field(default_factory=dict)
     model_used: str = ""  # Modelo principal usado
     
@@ -111,7 +111,7 @@ class Stats:
     
     @property
     def cost_savings_from_cache(self) -> float:
-        """✅ CORREÇÃO: Economia real baseada no modelo usado"""
+        """Economia real baseada no modelo usado"""
         if not self.model_used or self.model_used not in MODEL_PRICING:
             # Fallback para GPT-3.5 se modelo não identificado
             cache_price = MODEL_PRICING['gpt-35-turbo-16k']['cache']
@@ -140,15 +140,14 @@ class StatsManager:
     def __init__(self):
         self.global_stats = Stats()
         self._batch_snapshots = {}
-        self._current_concurrent = 0
-        self._max_concurrent_ever = 0  # ✅ CORREÇÃO: Track do pico real
+        self._current_concurrent = 0  # ✅ CORREÇÃO: Track real de concorrência
+        self._peak_concurrent_ever = 0  # ✅ CORREÇÃO: Pico real global
     
     def start_batch(self, batch_id: str) -> None:
         """Inicia tracking de um batch"""
         self._batch_snapshots[batch_id] = {
             'start_time': time.time(),
-            'batch_concurrent_peak': 0,
-            'batch_max_concurrent': 0,  # ✅ CORREÇÃO: Pico real do batch
+            'batch_peak_concurrent': 0,  # ✅ CORREÇÃO: Pico real do batch
             'start_stats': Stats(
                 total_requests=self.global_stats.total_requests,
                 successful_requests=self.global_stats.successful_requests,
@@ -165,7 +164,7 @@ class StatsManager:
                 max_response_time=self.global_stats.max_response_time,
                 total_wait_time=self.global_stats.total_wait_time,
                 retry_attempts=self.global_stats.retry_attempts,
-                concurrent_peak=0,
+                concurrent_peak=0,  # ✅ CORREÇÃO: Resetar para o batch
                 errors_by_type=self.global_stats.errors_by_type.copy(),
                 api_rate_limits_detected=self.global_stats.api_rate_limits_detected,
                 global_rate_limit_activations=self.global_stats.global_rate_limit_activations,
@@ -203,13 +202,13 @@ class StatsManager:
             retry_attempts=self.global_stats.retry_attempts - start_stats.retry_attempts,
             
             # ✅ CORREÇÃO: Usar pico real de concorrência do batch
-            concurrent_peak=snapshot.get('batch_max_concurrent', 0),
+            concurrent_peak=snapshot.get('batch_peak_concurrent', 0),
             
             api_rate_limits_detected=self.global_stats.api_rate_limits_detected - start_stats.api_rate_limits_detected,
             global_rate_limit_activations=self.global_stats.global_rate_limit_activations - start_stats.global_rate_limit_activations,
             coordinated_wait_time=self.global_stats.coordinated_wait_time - start_stats.coordinated_wait_time,
             
-            # ✅ NOVA: Breakdown de custos
+            # Breakdown de custos
             cost_breakdown={
                 model: self.global_stats.cost_breakdown.get(model, 0) - start_stats.cost_breakdown.get(model, 0)
                 for model in set(list(self.global_stats.cost_breakdown.keys()) + list(start_stats.cost_breakdown.keys()))
@@ -235,11 +234,11 @@ class StatsManager:
                       api_rate_limit_detected: bool = False,
                       coordinated_wait_time: float = 0.0,
                       model: str = "") -> None:
-        """✅ NOVA: Registra requisição com modelo e custos detalhados"""
+        """Registra requisição com modelo e custos detalhados"""
         
         self.global_stats.total_requests += 1
         
-        # ✅ NOVA: Registrar modelo usado
+        # Registrar modelo usado
         if model and not self.global_stats.model_used:
             self.global_stats.model_used = model
         
@@ -262,7 +261,7 @@ class StatsManager:
         self.global_stats.total_tokens_cached += tokens_cached
         self.global_stats.retry_attempts += retry_count
         
-        # ✅ NOVA: Calcular custo detalhado por modelo
+        # Calcular custo detalhado por modelo
         if model and model in MODEL_PRICING:
             pricing = MODEL_PRICING[model]
             detailed_cost = (
@@ -296,17 +295,18 @@ class StatsManager:
         self.global_stats.total_wait_time += wait_time
     
     def record_global_rate_limit_activation(self, wait_time: float, requests_affected: int = 0) -> None:
-        """Registra ativação de rate limit global coordenado"""
+        """✅ CORREÇÃO: Registra ativação de rate limit global coordenado"""
         self.global_stats.global_rate_limit_activations += 1
-        self.global_stats.coordinated_wait_time += wait_time
+        self.global_stats.coordinated_wait_time += wait_time  # ✅ CORREÇÃO: Registrar tempo de pausa
         
         logger = logging.getLogger(__name__)
         logger.debug(
-            "Rate limit global registrado nas estatísticas",
+            f"Rate limit global registrado: {wait_time:.1f}s de pausa",
             extra={
                 'wait_time': wait_time,
                 'requests_affected': requests_affected,
                 'total_activations': self.global_stats.global_rate_limit_activations,
+                'total_coordinated_wait': self.global_stats.coordinated_wait_time,
                 'action': 'global_rate_limit_stats'
             }
         )
@@ -316,13 +316,13 @@ class StatsManager:
         self._current_concurrent += 1
         
         # ✅ CORREÇÃO: Track do pico real global
-        self._max_concurrent_ever = max(self._max_concurrent_ever, self._current_concurrent)
-        self.global_stats.concurrent_peak = self._max_concurrent_ever
+        self._peak_concurrent_ever = max(self._peak_concurrent_ever, self._current_concurrent)
+        self.global_stats.concurrent_peak = self._peak_concurrent_ever
         
         # ✅ CORREÇÃO: Track do pico real por batch
         for batch_id, snapshot in self._batch_snapshots.items():
-            snapshot['batch_max_concurrent'] = max(
-                snapshot.get('batch_max_concurrent', 0), 
+            snapshot['batch_peak_concurrent'] = max(
+                snapshot.get('batch_peak_concurrent', 0), 
                 self._current_concurrent
             )
     
@@ -357,7 +357,7 @@ class StatsManager:
    📈 Taxa: {stats.avg_rate:.2f} req/s
    📊 Sucesso: {stats.success_rate:.1f}%"""
         
-        # ✅ NOVA: Seção de custo detalhado
+        # Seção de custo detalhado
         cost_stats = ""
         if stats.cost_breakdown:
             cost_lines = [f"   💰 {model}: ${cost:.4f}" for model, cost in stats.cost_breakdown.items()]
@@ -376,9 +376,10 @@ class StatsManager:
    🎯 Cache hit rate: {stats.cache_hit_rate:.1f}%
    💵 Economia estimada: ${stats.cost_savings_from_cache:.4f}"""
         
-        # ✅ CORREÇÃO: Performance com eficiência corrigida
+        # ✅ CORREÇÃO: Performance com eficiência e concorrência corrigidas
         performance_stats = ""
         if stats.successful_requests > 0 and stats.avg_response_time > 0:
+            total_wait = stats.total_wait_time + stats.coordinated_wait_time
             performance_stats = f"""
    
    🚀 PERFORMANCE:
@@ -386,19 +387,18 @@ class StatsManager:
    ⚡ Response time min/max: {stats.min_response_time:.3f}s / {stats.max_response_time:.3f}s
    🔄 Taxa de retry: {stats.retry_rate:.2f} retries/req
    ⏳ Eficiência: {stats.efficiency_rate:.1f}% (processando vs aguardando)
-   🔗 Pico concorrente: {stats.concurrent_peak} requisições simultâneas"""
+   🔗 Pico concorrente: {stats.concurrent_peak} requisições simultâneas
+   ⏱️ Tempo total espera: {total_wait:.1f}s"""
         
         # Adicionar seção de coordenação se houver dados
         coordination_stats = ""
         if stats.api_rate_limits_detected > 0:
-            total_wait = stats.total_wait_time + stats.coordinated_wait_time
             coordination_stats = f"""
    
    🤝 COORDENAÇÃO DE RATE LIMITS:
    🚨 Rate limits detectados: {stats.api_rate_limits_detected}
    🌐 Ativações globais: {stats.global_rate_limit_activations}
    ⏱️ Tempo coordenado: {stats.coordinated_wait_time:.1f}s
-   ⏳ Tempo total espera: {total_wait:.1f}s
    📈 Eficiência coordenação: {stats.coordination_efficiency:.1f}%"""
         
         # Adicionar rate limits se houver
@@ -413,7 +413,7 @@ class StatsManager:
         self.global_stats = Stats()
         self._batch_snapshots.clear()
         self._current_concurrent = 0
-        self._max_concurrent_ever = 0
+        self._peak_concurrent_ever = 0
     
     def compare_batches(self, *batch_results) -> str:
         """Compara múltiplos batches sem repetição"""
@@ -463,7 +463,7 @@ class StatsManager:
         }
     
     def get_cost_breakdown(self, stats: Stats) -> Dict[str, Any]:
-        """✅ NOVA: Retorna breakdown detalhado de custos por modelo"""
+        """Retorna breakdown detalhado de custos por modelo"""
         model_costs = {}
         if stats.model_used and stats.model_used in MODEL_PRICING:
             pricing = MODEL_PRICING[stats.model_used]
