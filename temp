@@ -1,209 +1,399 @@
-async def process_batch(
-    self, 
-    texts: List[str], 
-    prompt_template: str,
+async def _make_api_call(
+    self,
+    messages: List[Dict[str, str]],
     json_schema: Optional[Dict[str, Any]] = None,
-    batch_id: Optional[str] = None,
-    custom_ids: Optional[List[str]] = None,
-    **kwargs
+    request_id: str = None
 ) -> Dict[str, Any]:
     """
-    Processa múltiplos textos em paralelo com logs organizados por responsabilidade
-    
-    Características:
-    - Logs de progresso a cada 5 itens (responsabilidade do AI Processor)
-    - Logs de rate limiting delegados para o Rate Limiter
-    - Coordenação eficiente entre componentes
-    - Visibilidade completa do progresso sem poluição de logs
+    Faz chamada à API com AsyncIaraGenAI e rate limiting coordenado
     """
     
-    # Usar batch_id customizado ou gerar automaticamente
-    batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
+    if not request_id:
+        request_id = self._generate_request_id()
     
-    # Validar custom_ids se fornecido
-    if custom_ids and len(custom_ids) != len(texts):
-        raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
-    
-    # ✅ INICIALIZAR controles de progresso
-    progress_intervals = self._calculate_progress_intervals(len(texts))
-    self._last_logged_successes = 0
-    
-    # ✅ INICIALIZAR rate limiter para o batch (logs delegados)
-    self.rate_limiter.start_batch(batch_id)
-    
-    # Iniciar tracking do batch no StatsManager
-    self.stats_manager.start_batch(batch_id)
-    
-    # ✅ LOG DE INÍCIO (responsabilidade do AI Processor)
-    logger.info(
-        f"🚀 Iniciando processamento em lote - {len(texts)} textos",
-        extra={
-            'batch_id': batch_id,
-            'total_texts': len(texts),
-            'has_custom_ids': custom_ids is not None,
-            'has_json_schema': json_schema is not None,
-            'max_concurrent': self.semaphore._initial_value,
-            'action': 'batch_start'
+    # Validar entrada
+    if not messages or not isinstance(messages, list):
+        return {
+            'content': None,
+            'tokens_used': 0,
+            'success': False,
+            'error': 'Messages inválidas',
+            'error_type': 'ValidationError',
+            'request_id': request_id
         }
-    )
     
-    # Criar tasks para processamento paralelo
-    tasks = []
-    for i, text in enumerate(texts):
-        custom_id = custom_ids[i] if custom_ids else None
-        task = self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
-        tasks.append(task)
+    # Estimar tokens necessários
+    base_estimate = self.estimate_tokens(messages)
     
-    # ✅ EXECUTAR com logs organizados
-    results = []
-    completed = 0
-    start_time = time.time()
+    # Rate limiting coordenado inicial
+    calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
     
-    for coro in asyncio.as_completed(tasks):
-        try:
-            result = await coro
-            results.append(result)
-            completed += 1
-            
-            # ✅ DETECTAR rate limit e delegar para rate limiter
-            if not result.get('success', False):
-                error_msg = result.get('error', '').lower()
-                is_rate_limit = any(indicator in error_msg for indicator in [
-                    '429', 'rate limit', 'azure-openai error', 'too many requests'
-                ])
-                
-                if is_rate_limit:
-                    # Calcular estatísticas atuais
-                    successful_so_far = sum(1 for r in results if r.get('success', False))
-                    failed_so_far = completed - successful_so_far
-                    wait_time = self._extract_wait_time_from_error_result(result)
+    # Registrar início de requisição concorrente
+    self.stats_manager.record_concurrent_start()
+    
+    try:
+        async with self.semaphore:
+            # AsyncRetrying com retry apenas para rate limits
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(MAX_RETRY),
+                wait=wait_fixed(0.1),
+                reraise=True
+            ):
+                with attempt:
+                    # Aguardar rate limiting em todas as tentativas
+                    if attempt.retry_state.attempt_number > 1:
+                        await self.rate_limiter.wait_for_tokens(base_estimate)
                     
-                    # ✅ DELEGAR para rate limiter (com contexto completo)
-                    self.rate_limiter.record_api_rate_limit_with_context(
-                        wait_time, completed, len(texts), successful_so_far, failed_so_far
-                    )
-            else:
-                # ✅ NOTIFICAR rate limiter sobre sucesso
-                self.rate_limiter.record_successful_request()
-            
-            # ✅ LOG DE PROGRESSO (responsabilidade do AI Processor - a cada 5)
-            if completed in progress_intervals:
-                elapsed = time.time() - start_time
-                rate = completed / elapsed if elapsed > 0 else 0
-                eta = (len(texts) - completed) / rate if rate > 0 else 0
-                
-                successful_so_far = sum(1 for r in results if r.get('success', False))
-                failed_so_far = completed - successful_so_far
-                recent_successes = successful_so_far - self._last_logged_successes
-                self._last_logged_successes = successful_so_far
-                
-                logger.info(
-                    f"📊 Progresso: {completed}/{len(texts)} ({completed/len(texts)*100:.1f}%) | "
-                    f"✅{successful_so_far} ❌{failed_so_far} | "
-                    f"🆕{recent_successes} novos | "
-                    f"⏱️ETA: {eta/60:.1f}min",
-                    extra={
-                        'batch_id': batch_id,
-                        'completed': completed,
-                        'total': len(texts),
-                        'successful_so_far': successful_so_far,
-                        'failed_so_far': failed_so_far,
-                        'recent_successes': recent_successes,
-                        'processing_rate': round(rate, 2),
-                        'eta_minutes': round(eta / 60, 1),
-                        'progress_percent': round((completed / len(texts)) * 100, 1),
-                        'action': 'batch_progress'
-                    }
-                )
-                
-        except Exception as e:
-            logger.error(
-                f"Erro em task do lote - continuando...",
-                extra={
-                    'batch_id': batch_id,
-                    'completed': completed,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'batch_task_error'
-                }
-            )
-            results.append({
-                'content': None,
-                'success': False,
-                'error': str(e),
-                'error_type': type(e).__name__
-            })
-            completed += 1
-    
-    # Finalizar batch e obter stats específicas do batch
-    batch_stats = self.stats_manager.end_batch(batch_id)
-    
-    # ✅ LOG DE FIM (responsabilidade do AI Processor)
-    logger.info(
-        f"✅ Batch concluído - {batch_stats.successful_requests} sucessos, "
-        f"{batch_stats.failed_requests} falhas em {batch_stats.processing_time:.1f}s",
-        extra={
-            'batch_id': batch_id,
-            'total_requests': batch_stats.total_requests,
-            'successful_requests': batch_stats.successful_requests,
-            'failed_requests': batch_stats.failed_requests,
-            'processing_time': round(batch_stats.processing_time, 2),
-            'total_tokens': batch_stats.total_tokens,
-            'total_cost': round(batch_stats.total_cost, 4),
-            'avg_rate': round(batch_stats.avg_rate, 2),
-            'success_rate': round(batch_stats.success_rate, 1),
-            'action': 'batch_complete'
+                    start_time = time.time()
+                    
+                    try:
+                        # ✅ PREPARAR E VALIDAR PARÂMETROS DA API
+                        api_params = {
+                            "model": self.model,
+                            "messages": messages,
+                            "temperature": self.temperature
+                        }
+                        
+                        if self.max_tokens is not None:
+                            api_params["max_tokens"] = self.max_tokens
+                        
+                        if json_schema and isinstance(json_schema, dict):
+                            api_params["response_format"] = self._prepare_json_schema(json_schema)
+                        
+                        # ✅ VALIDAÇÃO ESPECÍFICA PARA AsyncIaraGenAI
+                        validation = self._validate_iara_api_params(api_params)
+                        if not validation['valid']:
+                            raise ValueError(f"Parâmetros inválidos para AsyncIaraGenAI: {', '.join(validation['errors'])}")
+                        
+                        # Log warnings se houver
+                        if validation['warnings']:
+                            logger.warning(
+                                f"Avisos nos parâmetros da API: {', '.join(validation['warnings'])}",
+                                extra={
+                                    'request_id': request_id,
+                                    'warnings': validation['warnings'],
+                                    'action': 'api_params_warning'
+                                }
+                            )
+                        
+                        # Log da tentativa
+                        logger.debug(
+                            f"Tentativa {attempt.retry_state.attempt_number}/{MAX_RETRY} - Chamada à API AsyncIaraGenAI",
+                            extra={
+                                'request_id': request_id,
+                                'attempt_number': attempt.retry_state.attempt_number,
+                                'api_params': api_params,
+                                'action': 'api_call_attempt'
+                            }
+                        )
+                        
+                        # ✅ FAZER CHAMADA À API COM DEBUGGING DETALHADO
+                        try:
+                            response = await self.client.chat.completions.create(**api_params)
+                            
+                            # DEBUG: Log detalhado da resposta
+                            logger.debug(
+                                f"Resposta da API recebida - Tipo: {type(response)}",
+                                extra={
+                                    'request_id': request_id,
+                                    'response_type': str(type(response)),
+                                    'response_str': str(response)[:1000],
+                                    'response_attributes': [attr for attr in dir(response) if not attr.startswith('_')],
+                                    'action': 'api_response_debug'
+                                }
+                            )
+                            
+                        except Exception as api_error:
+                            error_context = self._get_detailed_error_context(api_error, api_params, request_id)
+                            
+                            logger.error(
+                                f"Erro na chamada à API AsyncIaraGenAI - {error_context['error_file']}:{error_context['error_line']} em {error_context['error_function']}(): {error_context['error_message']}",
+                                extra={
+                                    'request_id': request_id,
+                                    'error_context': error_context,
+                                    'api_params': api_params,
+                                    'action': 'api_call_error'
+                                }
+                            )
+                            raise api_error
+                        
+                        # ✅ VALIDAÇÃO ROBUSTA DA RESPOSTA
+                        if not response:
+                            raise ValueError("API retornou resposta None/vazia")
+                        
+                        # Verificar se é um objeto com atributos ou um dicionário
+                        if hasattr(response, 'choices'):
+                            choices = response.choices
+                        elif isinstance(response, dict) and 'choices' in response:
+                            choices = response['choices']
+                        else:
+                            raise ValueError(f"API retornou resposta sem 'choices'. Tipo: {type(response)}, Conteúdo: {str(response)[:500]}")
+                        
+                        if not choices:
+                            raise ValueError("API retornou choices vazio")
+                        
+                        if len(choices) == 0:
+                            raise ValueError("API retornou lista choices com 0 elementos")
+                        
+                        # Verificar estrutura do primeiro choice
+                        first_choice = choices[0]
+                        if hasattr(first_choice, 'message'):
+                            message = first_choice.message
+                        elif isinstance(first_choice, dict) and 'message' in first_choice:
+                            message = first_choice['message']
+                        else:
+                            raise ValueError(f"Choice[0] não tem 'message'. Tipo: {type(first_choice)}, Conteúdo: {str(first_choice)}")
+                        
+                        # Verificar content
+                        if hasattr(message, 'content'):
+                            content = message.content
+                        elif isinstance(message, dict) and 'content' in message:
+                            content = message['content']
+                        else:
+                            raise ValueError(f"Message não tem 'content'. Tipo: {type(message)}, Conteúdo: {str(message)}")
+                        
+                        end_time = time.time()
+                        api_response_time = end_time - start_time
+                        
+                        # ✅ EXTRAIR DADOS COM VALIDAÇÃO ROBUSTA
+                        try:
+                            # Verificar usage
+                            if hasattr(response, 'usage') and response.usage:
+                                usage = response.usage
+                                tokens_used = getattr(usage, 'total_tokens', 0)
+                                input_tokens = getattr(usage, 'prompt_tokens', 0)
+                                output_tokens = getattr(usage, 'completion_tokens', 0)
+                            elif isinstance(response, dict) and 'usage' in response and response['usage']:
+                                usage = response['usage']
+                                tokens_used = usage.get('total_tokens', 0)
+                                input_tokens = usage.get('prompt_tokens', 0)
+                                output_tokens = usage.get('completion_tokens', 0)
+                            else:
+                                logger.warning(
+                                    "API retornou resposta sem informações de usage - usando valores padrão",
+                                    extra={
+                                        'request_id': request_id,
+                                        'response_type': str(type(response)),
+                                        'action': 'missing_usage_info'
+                                    }
+                                )
+                                tokens_used = 0
+                                input_tokens = 0
+                                output_tokens = 0
+                                
+                        except Exception as usage_error:
+                            logger.warning(
+                                f"Erro ao extrair tokens da resposta: {usage_error} - usando valores padrão",
+                                extra={
+                                    'request_id': request_id,
+                                    'usage_error': str(usage_error),
+                                    'action': 'usage_extraction_error'
+                                }
+                            )
+                            tokens_used = 0
+                            input_tokens = 0
+                            output_tokens = 0
+                        
+                        # Extrair cached tokens se disponível
+                        cached_tokens = 0
+                        if hasattr(response, 'usage') and hasattr(response.usage, 'prompt_tokens_details'):
+                            cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
+                        
+                        # Registrar tokens no rate limiter
+                        if tokens_used > 0:
+                            self.rate_limiter.record_tokens(tokens_used)
+                            self.rate_limiter.record_token_usage(base_estimate, tokens_used)
+                        
+                        # Calcular custo
+                        cost = self.calculate_cost(input_tokens, output_tokens)
+                        
+                        parsed_content = content
+                        
+                        # Se JSON schema foi usado, tentar parsear
+                        if json_schema and isinstance(json_schema, dict) and content:
+                            try:
+                                parsed_content = json.loads(content)
+                                logger.debug(
+                                    "JSON Schema parseado com sucesso",
+                                    extra={
+                                        'request_id': request_id,
+                                        'action': 'json_parse_success'
+                                    }
+                                )
+                            except json.JSONDecodeError as e:
+                                logger.warning(
+                                    "Erro ao parsear JSON Schema",
+                                    extra={
+                                        'request_id': request_id,
+                                        'error': str(e),
+                                        'raw_content': content[:200] if content else 'None',
+                                        'action': 'json_parse_error'
+                                    }
+                                )
+                                parsed_content = content
+                        
+                        # Log de sucesso
+                        estimation_accuracy = abs(calibrated_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
+                        
+                        logger.debug(
+                            "Chamada à API bem-sucedida",
+                            extra={
+                                'request_id': request_id,
+                                'attempt_number': attempt.retry_state.attempt_number,
+                                'tokens_used': tokens_used,
+                                'input_tokens': input_tokens,
+                                'output_tokens': output_tokens,
+                                'cached_tokens': cached_tokens,
+                                'base_estimate': base_estimate,
+                                'calibrated_estimate': calibrated_estimate,
+                                'estimation_accuracy': round(estimation_accuracy, 1),
+                                'api_response_time': round(api_response_time, 3),
+                                'cost': round(cost, 6),
+                                'action': 'api_call_success'
+                            }
+                        )
+                        
+                        # Retorno de sucesso
+                        return {
+                            'content': parsed_content,
+                            'raw_content': content,
+                            'tokens_used': tokens_used,
+                            'input_tokens': input_tokens,
+                            'output_tokens': output_tokens,
+                            'cached_tokens': cached_tokens,
+                            'cost': cost,
+                            'api_response_time': api_response_time,
+                            'success': True,
+                            'is_json': json_schema is not None,
+                            'attempts': attempt.retry_state.attempt_number,
+                            'request_id': request_id
+                        }
+                        
+                    except Exception as e:
+                        end_time = time.time()
+                        api_response_time = end_time - start_time
+                        
+                        # ✅ CONTEXTO DETALHADO DO ERRO
+                        error_context = self._get_detailed_error_context(e, api_params, request_id)
+                        
+                        # Capturar headers se disponíveis
+                        response_headers = {}
+                        if hasattr(e, 'response') and hasattr(e.response, 'headers'):
+                            response_headers = dict(e.response.headers)
+                        
+                        # Criar resultado de erro
+                        error_result = {
+                            'content': None,
+                            'raw_content': None,
+                            'tokens_used': 0,
+                            'input_tokens': 0,
+                            'output_tokens': 0,
+                            'cached_tokens': 0,
+                            'cost': 0.0,
+                            'api_response_time': api_response_time,
+                            'success': False,
+                            'error': str(e),
+                            'error_type': type(e).__name__,
+                            'error_line': error_context['error_line'],
+                            'error_file': error_context['error_file'],
+                            'error_function': error_context['error_function'],
+                            'response_headers': response_headers,
+                            'is_json': False,
+                            'attempts': attempt.retry_state.attempt_number,
+                            'request_id': request_id,
+                            'full_traceback': error_context['full_traceback']
+                        }
+                        
+                        # ✅ VERIFICAR se é rate limit (única condição para retry)
+                        if is_rate_limit_error(error_result):
+                            wait_time = self._extract_wait_time_from_error_result(error_result)
+                            
+                            logger.debug(
+                                f"Rate limit detectado - request {request_id}",
+                                extra={
+                                    'request_id': request_id,
+                                    'attempt_number': attempt.retry_state.attempt_number,
+                                    'wait_time': wait_time,
+                                    'action': 'rate_limit_detected'
+                                }
+                            )
+                            
+                            # Raise para que AsyncRetrying faça nova tentativa
+                            raise
+                        
+                        else:
+                            # Qualquer outro erro - não fazer retry, apenas retornar
+                            return error_result
+                            
+        # Código nunca deveria chegar aqui devido ao AsyncRetrying
+        return {
+            'content': None,
+            'success': False,
+            'error': 'Erro inesperado no fluxo de retry',
+            'error_type': 'UnexpectedFlowError',
+            'request_id': request_id
         }
-    )
-    
-    return {
-        'results': results,
-        'batch_stats': batch_stats,
-        'batch_id': batch_id
-    }
-
-def _calculate_progress_intervals(self, total: int) -> List[int]:
-    """
-    ✅ ATUALIZADO: Calcula intervalos de progresso a cada 5 itens, independente do tamanho do lote
-    """
-    if total <= 5:
-        # Lotes muito pequenos: log cada item
-        return list(range(1, total + 1))
-    
-    # ✅ SEMPRE a cada 5, independente do tamanho
-    intervals = list(range(5, total + 1, 5))
-    
-    # Garantir que o total sempre está incluído
-    if total not in intervals:
-        intervals.append(total)
-    
-    # Sempre incluir o primeiro item para feedback inicial
-    if 1 not in intervals:
-        intervals.insert(0, 1)
-    
-    return sorted(intervals)
-
-def _extract_wait_time_from_error_result(self, result: Dict[str, Any]) -> float:
-    """Extrai wait time do resultado de erro"""
-    error_msg = result.get('error', '')
-    
-    # Padrões comuns para extrair tempo de espera
-    import re
-    patterns = [
-        r'retry after (\d+) seconds',
-        r'wait (\d+) seconds',
-        r'(\d+)s',
-        r'retry.*?(\d+)',
-        r'wait.*?(\d+)'
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, error_msg, re.IGNORECASE)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                continue
-    
-    # Default para Azure OpenAI
-    return 60.0
+                            
+    except RetryError as retry_error:
+        # Todas as tentativas falharam
+        logger.error(
+            "Todas as tentativas de retry falharam",
+            extra={
+                'request_id': request_id,
+                'total_attempts': MAX_RETRY,
+                'final_error': str(retry_error.last_attempt.exception()) if retry_error.last_attempt else 'Desconhecido',
+                'action': 'retry_exhausted'
+            }
+        )
+        
+        # Retornar resultado final de falha
+        return {
+            'content': None,
+            'raw_content': None,
+            'tokens_used': 0,
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'cached_tokens': 0,
+            'cost': 0.0,
+            'api_response_time': 0.0,
+            'success': False,
+            'error': f'Máximo de tentativas excedido: {retry_error.last_attempt.exception() if retry_error.last_attempt else "Erro desconhecido"}',
+            'error_type': 'RetryError',
+            'is_json': False,
+            'attempts': MAX_RETRY,
+            'request_id': request_id
+        }
+        
+    except Exception as e:
+        # ✅ ERRO INESPERADO COM CONTEXTO COMPLETO
+        error_context = self._get_detailed_error_context(e, {}, request_id)
+        
+        logger.error(
+            f"Erro inesperado na chamada à API - {error_context['error_file']}:{error_context['error_line']} em {error_context['error_function']}(): {str(e)}",
+            extra={
+                'request_id': request_id,
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'error_line': error_context['error_line'],
+                'error_file': error_context['error_file'],
+                'error_function': error_context['error_function'],
+                'full_traceback': error_context['full_traceback'],
+                'action': 'unexpected_api_error'
+            }
+        )
+        
+        return {
+            'content': None,
+            'success': False,
+            'error': str(e),
+            'error_type': type(e).__name__,
+            'error_line': error_context['error_line'],
+            'error_file': error_context['error_file'],
+            'error_function': error_context['error_function'],
+            'full_traceback': error_context['full_traceback'],
+            'request_id': request_id
+        }
+            
+    finally:
+        # Registrar fim de requisição concorrente
+        self.stats_manager.record_concurrent_end()
