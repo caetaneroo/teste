@@ -67,7 +67,7 @@ class AIProcessor:
         self.temperature = config.get('temperature', 0.1)
         self.max_tokens = config.get('max_tokens')
         
-        # ✅ CORREÇÃO 1: Cliente AsyncIaraGenAI com azure_openai (sem traço)
+        # Cliente AsyncIaraGenAI com parâmetros diretos
         self.client = AsyncIaraGenAI(
             client_id=self.client_id,
             client_secret=self.client_secret,
@@ -598,7 +598,7 @@ class AIProcessor:
         **kwargs
     ) -> Dict[str, Any]:
         """
-        ✅ CORREÇÃO FINAL: Processamento híbrido com logs incrementais e correção do as_completed
+        ✅ CORREÇÃO FINAL: Processamento com asyncio.wait() para controle correto de tasks
         """
         
         # Usar batch_id customizado ou gerar automaticamente
@@ -661,75 +661,87 @@ class AIProcessor:
                         }
                     )
         
-        # Processamento híbrido: as_completed com controle de rate limit
+        # ✅ CORREÇÃO: Usar asyncio.wait() com FIRST_COMPLETED para controle correto
         all_results = [None] * len(texts)
         pending_items = list(enumerate(texts))
         start_time = time.time()
         
         while pending_items:
-            # ✅ CORREÇÃO 2: Criar tasks com mapeamento correto
-            task_to_index = {}  # Mapear task para índice original
+            # Criar tasks com mapeamento correto
+            task_to_index = {}
             current_tasks = []
             
             for i, text in pending_items:
                 custom_id = custom_ids[i] if custom_ids else None
-                task = self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
+                task = asyncio.create_task(
+                    self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
+                )
                 current_tasks.append(task)
-                task_to_index[task] = i  # Mapear task para índice original
+                task_to_index[task] = i
             
-            # ✅ CORREÇÃO 2: Processar com as_completed usando mapeamento correto
+            # ✅ USAR asyncio.wait() com FIRST_COMPLETED para logs incrementais
             rate_limit_indices = []
             rate_limit_detected = False
             
-            for completed_task in asyncio.as_completed(current_tasks):
-                try:
-                    result = await completed_task
-                    original_index = task_to_index[completed_task]  # ✅ Usar mapeamento
-                    
-                    # Verificar rate limit
-                    if not result.get('success', False) and is_rate_limit_error(result):
-                        rate_limit_indices.append(original_index)
+            while current_tasks:
+                # Aguardar pelo menos uma task completar
+                done, pending = await asyncio.wait(
+                    current_tasks, 
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Processar tasks completadas
+                for completed_task in done:
+                    try:
+                        result = await completed_task
+                        original_index = task_to_index[completed_task]
                         
-                        # Registrar rate limit apenas uma vez
-                        if not rate_limit_detected:
-                            rate_limit_detected = True
-                            wait_time = self._extract_wait_time_from_error_result(result)
+                        # Verificar rate limit
+                        if not result.get('success', False) and is_rate_limit_error(result):
+                            rate_limit_indices.append(original_index)
                             
-                            # Delegar para rate limiter
-                            self.rate_limiter.record_api_rate_limit_with_context(
-                                wait_time, total_successful, len(texts), total_successful, 0
-                            )
-                    else:
-                        # Resultado definitivo
-                        all_results[original_index] = result
-                        if result.get('success', False):
-                            total_successful += 1
+                            # Registrar rate limit apenas uma vez
+                            if not rate_limit_detected:
+                                rate_limit_detected = True
+                                wait_time = self._extract_wait_time_from_error_result(result)
+                                
+                                # Delegar para rate limiter
+                                self.rate_limiter.record_api_rate_limit_with_context(
+                                    wait_time, total_successful, len(texts), total_successful, 0
+                                )
+                        else:
+                            # Resultado definitivo
+                            all_results[original_index] = result
+                            if result.get('success', False):
+                                total_successful += 1
+                                
+                                # Log de progresso incremental
+                                await log_progress(total_successful)
                             
-                            # Log de progresso incremental
-                            await log_progress(total_successful)
+                            # Notificar rate limiter sobre sucesso
+                            if result.get('success', False):
+                                self.rate_limiter.record_successful_request()
                         
-                        # Notificar rate limiter sobre sucesso
-                        if result.get('success', False):
-                            self.rate_limiter.record_successful_request()
-                    
-                except Exception as e:
-                    logger.error(
-                        f"Erro em task do lote: {e}",
-                        extra={
-                            'batch_id': batch_id,
+                    except Exception as e:
+                        logger.error(
+                            f"Erro em task do lote: {e}",
+                            extra={
+                                'batch_id': batch_id,
+                                'error': str(e),
+                                'error_type': type(e).__name__,
+                                'action': 'batch_task_error'
+                            }
+                        )
+                        original_index = task_to_index.get(completed_task, 0)
+                        all_results[original_index] = {
+                            'content': None,
+                            'success': False,
                             'error': str(e),
-                            'error_type': type(e).__name__,
-                            'action': 'batch_task_error'
+                            'error_type': type(e).__name__
                         }
-                    )
-                    # ✅ CORREÇÃO 2: Usar mapeamento para encontrar índice
-                    original_index = task_to_index.get(completed_task, 0)
-                    all_results[original_index] = {
-                        'content': None,
-                        'success': False,
-                        'error': str(e),
-                        'error_type': type(e).__name__
-                    }
+                
+                # Atualizar lista de tasks pendentes
+                current_tasks = list(pending)
             
             # Preparar próxima rodada
             if rate_limit_indices:
