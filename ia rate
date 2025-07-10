@@ -205,16 +205,18 @@ class AdaptiveRateLimiter:
             if self._global_rate_limit_active and current_time < self._global_wait_until:
                 remaining_wait = self._global_wait_until - current_time
                 
-                # ✅ LOG ÚNICO por batch
+                # ✅ CORREÇÃO 2: LOG ÚNICO UNIFICADO por batch
                 if not self._rate_limit_logged:
                     logger.warning(
-                        f"⏳ Iniciando pausa global de {remaining_wait:.1f}s para rate limit",
+                        f"🚨 Rate limit evento #{self._rate_limit_events} detectado! "
+                        f"Iniciando pausa global de {remaining_wait:.1f}s",
                         extra={
                             'batch_id': self._current_batch_id,
+                            'rate_limit_event_number': self._rate_limit_events,
                             'global_wait_time': round(remaining_wait, 1),
                             'wait_until_timestamp': self._global_wait_until,
                             'api_rate_limits_detected': self.api_rate_limits_detected,
-                            'action': 'global_rate_limit_pause_start'
+                            'action': 'rate_limit_event_and_pause_start'
                         }
                     )
                     self._rate_limit_logged = True
@@ -225,11 +227,12 @@ class AdaptiveRateLimiter:
                 # Reset do rate limit global
                 self._global_rate_limit_active = False
                 
+                # ✅ CORREÇÃO 3: LOG ÚNICO UNIFICADO após pausa
                 logger.info(
-                    "✅ Pausa de rate limit finalizada - processamento retomado",
+                    "✅ Pausa de rate limit finalizada - processamento normal retomado",
                     extra={
                         'batch_id': self._current_batch_id,
-                        'action': 'rate_limit_pause_end'
+                        'action': 'rate_limit_pause_end_and_resolved'
                     }
                 )
         
@@ -305,7 +308,7 @@ class AdaptiveRateLimiter:
     
     def record_api_rate_limit_with_context(self, wait_time: float, completed: int, total: int, successful: int, failed: int):
         """
-        ✅ LOGS ORGANIZADOS: Registra rate limit da API com contexto completo e logs apropriados
+        ✅ CORREÇÃO 1: Registra rate limit da API com contexto corrigido
         """
         
         # Verificar se é um novo evento de rate limit
@@ -313,34 +316,26 @@ class AdaptiveRateLimiter:
             self._rate_limit_event_active = True
             self._rate_limit_events += 1
             
-            remaining = total - completed
+            # ✅ CORREÇÃO 1: Cálculo correto dos restantes
+            # completed = requests processadas até agora (incluindo sucessos e rate limits)
+            # successful = sucessos reais (não incluem rate limits)
+            # failed = falhas reais (não incluem rate limits)
+            # remaining = total - successful (porque rate limits serão reprocessados)
+            remaining = total - successful
             
-            # ✅ LOG DE INFO: Status quando atingiu rate limit
+            # ✅ LOG DE INFO: Status quando atingiu rate limit (corrigido)
             logger.info(
-                f"📊 Status no rate limit: {completed}/{total} processados | "
+                f"📊 Status no rate limit: {successful}/{total} processados | "
                 f"✅{successful} ❌{failed} | "
                 f"🔄{remaining} restantes",
                 extra={
                     'batch_id': self._current_batch_id,
-                    'completed': completed,
+                    'completed': successful,  # ✅ CORREÇÃO: usar successful como completed
                     'total': total,
                     'successful_so_far': successful,
                     'failed_so_far': failed,
                     'remaining': remaining,
                     'action': 'rate_limit_status_info'
-                }
-            )
-            
-            # ✅ LOG DE WARNING: Evento de rate limit
-            logger.warning(
-                f"🚨 Rate limit evento #{self._rate_limit_events} detectado! "
-                f"Aguardando coordenação global...",
-                extra={
-                    'batch_id': self._current_batch_id,
-                    'rate_limit_event_number': self._rate_limit_events,
-                    'completed_at_rate_limit': completed,
-                    'wait_time': wait_time,
-                    'action': 'rate_limit_event_warning'
                 }
             )
         
@@ -357,13 +352,7 @@ class AdaptiveRateLimiter:
         """
         if self._rate_limit_event_active:
             self._rate_limit_event_active = False
-            logger.info(
-                "✅ Rate limit resolvido - processamento normal retomado",
-                extra={
-                    'batch_id': self._current_batch_id,
-                    'action': 'rate_limit_resolved'
-                }
-            )
+            # ✅ CORREÇÃO 3: Log removido daqui - será unificado no wait_for_tokens
     
     def record_tokens(self, tokens_used: int) -> None:
         """
