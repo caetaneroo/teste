@@ -1,5 +1,6 @@
 # core/stats_manager.py
 import time
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 
@@ -23,10 +24,10 @@ class Stats:
     max_response_time: float = 0.0  # Maior tempo de resposta
     total_wait_time: float = 0.0  # Tempo total aguardando rate limits
     retry_attempts: int = 0  # Total de tentativas de retry
-    concurrent_peak: int = 0  # Pico de requisições simultâneas (CORRIGIDO)
+    concurrent_peak: int = 0  # Pico de requisições simultâneas
     errors_by_type: Dict[str, int] = field(default_factory=dict)  # Erros por tipo
     
-    # ✅ NOVAS: Métricas de rate limiting coordenado
+    # MÉTRICAS DE RATE LIMITING COORDENADO
     api_rate_limits_detected: int = 0  # Rate limits detectados pela API
     global_rate_limit_activations: int = 0  # Vezes que rate limit global foi ativado
     coordinated_wait_time: float = 0.0  # Tempo total de espera coordenada
@@ -39,47 +40,46 @@ class Stats:
     @property
     def success_rate(self) -> float:
         """Taxa de sucesso em percentual"""
-        return (self.successful_requests / self.total_requests * 100) if self.total_requests > 0 else 0
+        return (self.successful_requests / self.total_requests * 100) if self.total_requests > 0 else 0.0
     
     @property
     def avg_rate(self) -> float:
         """Taxa média de requisições por segundo"""
-        return (self.successful_requests / self.processing_time) if self.processing_time > 0 else 0
+        return (self.successful_requests / self.processing_time) if self.processing_time > 0 else 0.0
     
     @property
     def avg_response_time(self) -> float:
         """Tempo médio de resposta da API"""
-        return (self.total_api_response_time / self.successful_requests) if self.successful_requests > 0 else 0
+        return (self.total_api_response_time / self.successful_requests) if self.successful_requests > 0 else 0.0
     
     @property
     def efficiency_rate(self) -> float:
         """% do tempo gasto processando vs aguardando rate limits"""
         total_time = self.processing_time
         if total_time <= 0:
-            return 0
+            return 0.0
         processing_time = total_time - self.total_wait_time
-        return (processing_time / total_time * 100) if total_time > 0 else 0
+        return (processing_time / total_time * 100) if total_time > 0 else 0.0
     
     @property
     def retry_rate(self) -> float:
         """Taxa de retry por requisição"""
-        return (self.retry_attempts / self.total_requests) if self.total_requests > 0 else 0
+        return (self.retry_attempts / self.total_requests) if self.total_requests > 0 else 0.0
     
     @property
     def cost_per_token(self) -> float:
         """Custo médio por token"""
-        return (self.total_cost / self.total_tokens) if self.total_tokens > 0 else 0
+        return (self.total_cost / self.total_tokens) if self.total_tokens > 0 else 0.0
     
     @property
     def cache_hit_rate(self) -> float:
         """Taxa de cache hit em percentual"""
         total_input_and_cached = self.total_tokens_input + self.total_tokens_cached
-        return (self.total_tokens_cached / total_input_and_cached * 100) if total_input_and_cached > 0 else 0
+        return (self.total_tokens_cached / total_input_and_cached * 100) if total_input_and_cached > 0 else 0.0
     
     @property
     def cost_savings_from_cache(self) -> float:
         """Economia estimada com tokens cached (50% desconto típico)"""
-        # Estimativa conservadora: cached tokens custam 50% menos
         return self.total_tokens_cached * 0.5 * 0.0015 / 1000
     
     @property
@@ -98,19 +98,19 @@ class StatsManager:
     - Métricas completas incluindo cached tokens e coordenação
     - Formatação consistente para qualquer tipo de stats
     - Comparação entre batches sem repetição
-    - Pico concorrente CORRIGIDO para mostrar valor real
+    - Pico concorrente corrigido para mostrar valor real
     """
     
     def __init__(self):
         self.global_stats = Stats()
         self._batch_snapshots = {}
-        self._current_concurrent = 0  # Tracking de concorrência atual (CORRIGIDO)
+        self._current_concurrent = 0  # Tracking de concorrência atual
     
     def start_batch(self, batch_id: str) -> None:
-        """Inicia tracking de um batch - CORRIGIDO: resetar pico concorrente"""
+        """Inicia tracking de um batch"""
         self._batch_snapshots[batch_id] = {
             'start_time': time.time(),
-            'batch_concurrent_peak': 0,  # ✅ CORREÇÃO: Pico específico do batch
+            'batch_concurrent_peak': 0,  # Pico específico do batch
             'start_stats': Stats(
                 total_requests=self.global_stats.total_requests,
                 successful_requests=self.global_stats.successful_requests,
@@ -120,13 +120,15 @@ class StatsManager:
                 total_tokens_cached=self.global_stats.total_tokens_cached,
                 total_cost=self.global_stats.total_cost,
                 rate_limit_waits=self.global_stats.rate_limit_waits,
+                processing_time=0.0,
+                start_time=time.time(),
                 total_api_response_time=self.global_stats.total_api_response_time,
+                min_response_time=self.global_stats.min_response_time,
+                max_response_time=self.global_stats.max_response_time,
                 total_wait_time=self.global_stats.total_wait_time,
                 retry_attempts=self.global_stats.retry_attempts,
-                concurrent_peak=0,  # ✅ CORREÇÃO: Resetar para o batch
+                concurrent_peak=0,  # Resetar para o batch
                 errors_by_type=self.global_stats.errors_by_type.copy(),
-                
-                # ✅ NOVAS métricas de coordenação
                 api_rate_limits_detected=self.global_stats.api_rate_limits_detected,
                 global_rate_limit_activations=self.global_stats.global_rate_limit_activations,
                 coordinated_wait_time=self.global_stats.coordinated_wait_time
@@ -134,7 +136,7 @@ class StatsManager:
         }
     
     def end_batch(self, batch_id: str) -> Stats:
-        """Finaliza batch e retorna stats apenas desse batch - CORRIGIDO"""
+        """Finaliza batch e retorna stats apenas desse batch"""
         if batch_id not in self._batch_snapshots:
             raise ValueError(f"Batch {batch_id} não foi iniciado")
         
@@ -154,23 +156,15 @@ class StatsManager:
             rate_limit_waits=self.global_stats.rate_limit_waits - start_stats.rate_limit_waits,
             processing_time=end_time - snapshot['start_time'],
             start_time=snapshot['start_time'],
-            
-            # Métricas de performance
             total_api_response_time=self.global_stats.total_api_response_time - start_stats.total_api_response_time,
-            min_response_time=self.global_stats.min_response_time if self.global_stats.min_response_time != float('inf') else 0,
+            min_response_time=self.global_stats.min_response_time if self.global_stats.min_response_time != float('inf') else 0.0,
             max_response_time=self.global_stats.max_response_time,
             total_wait_time=self.global_stats.total_wait_time - start_stats.total_wait_time,
             retry_attempts=self.global_stats.retry_attempts - start_stats.retry_attempts,
-            
-            # ✅ CORREÇÃO: Usar pico específico do batch, não global
-            concurrent_peak=snapshot.get('batch_concurrent_peak', 0),
-            
-            # ✅ NOVAS métricas de coordenação
+            concurrent_peak=snapshot.get('batch_concurrent_peak', 0),  # Usar pico específico do batch
             api_rate_limits_detected=self.global_stats.api_rate_limits_detected - start_stats.api_rate_limits_detected,
             global_rate_limit_activations=self.global_stats.global_rate_limit_activations - start_stats.global_rate_limit_activations,
             coordinated_wait_time=self.global_stats.coordinated_wait_time - start_stats.coordinated_wait_time,
-            
-            # Erros por tipo (diferença)
             errors_by_type={
                 error_type: self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)
                 for error_type in set(list(self.global_stats.errors_by_type.keys()) + list(start_stats.errors_by_type.keys()))
@@ -180,14 +174,12 @@ class StatsManager:
         
         # Limpar snapshot
         del self._batch_snapshots[batch_id]
-        
         return batch_stats
     
     def record_request(self, success: bool, tokens_input: int = 0, 
                       tokens_output: int = 0, tokens_cached: int = 0,
                       cost: float = 0.0, api_response_time: float = 0.0, 
-                      error_type: str = None, retry_count: int = 0,
-                      # ✅ NOVOS parâmetros para rate limiting coordenado
+                      error_type: Optional[str] = None, retry_count: int = 0,
                       api_rate_limit_detected: bool = False,
                       coordinated_wait_time: float = 0.0) -> None:
         """Registra uma requisição com métricas de rate limiting coordenado"""
@@ -196,17 +188,12 @@ class StatsManager:
         
         if success:
             self.global_stats.successful_requests += 1
-            
-            # Métricas de response time
             if api_response_time > 0:
                 self.global_stats.total_api_response_time += api_response_time
                 self.global_stats.min_response_time = min(self.global_stats.min_response_time, api_response_time)
                 self.global_stats.max_response_time = max(self.global_stats.max_response_time, api_response_time)
-            
         else:
             self.global_stats.failed_requests += 1
-            
-            # Contar erros por tipo
             if error_type:
                 if error_type not in self.global_stats.errors_by_type:
                     self.global_stats.errors_by_type[error_type] = 0
@@ -219,10 +206,9 @@ class StatsManager:
         self.global_stats.total_cost += cost
         self.global_stats.retry_attempts += retry_count
         
-        # ✅ NOVAS métricas de coordenação
+        # Métricas de coordenação
         if api_rate_limit_detected:
             self.global_stats.api_rate_limits_detected += 1
-        
         if coordinated_wait_time > 0:
             self.global_stats.coordinated_wait_time += coordinated_wait_time
     
@@ -240,7 +226,6 @@ class StatsManager:
         self.global_stats.global_rate_limit_activations += 1
         self.global_stats.coordinated_wait_time += wait_time
         
-        import logging
         logger = logging.getLogger(__name__)
         logger.debug(
             "Rate limit global registrado nas estatísticas",
@@ -253,13 +238,11 @@ class StatsManager:
         )
     
     def record_concurrent_start(self) -> None:
-        """Registra início de requisição concorrente - CORRIGIDO"""
+        """Registra início de requisição concorrente"""
         self._current_concurrent += 1
-        
-        # ✅ CORREÇÃO: Atualizar pico global
         self.global_stats.concurrent_peak = max(self.global_stats.concurrent_peak, self._current_concurrent)
         
-        # ✅ CORREÇÃO: Atualizar pico apenas dos batches ativos
+        # Atualizar pico apenas dos batches ativos
         for batch_id, snapshot in self._batch_snapshots.items():
             snapshot['batch_concurrent_peak'] = max(
                 snapshot.get('batch_concurrent_peak', 0), 
@@ -319,7 +302,7 @@ class StatsManager:
    🔗 Pico concorrente: {stats.concurrent_peak} requisições
    💵 Custo por token: ${stats.cost_per_token:.6f}"""
         
-        # ✅ ADICIONAR seção de coordenação se houver dados
+        # Adicionar seção de coordenação se houver dados
         coordination_stats = ""
         if stats.api_rate_limits_detected > 0:
             coordination_stats = f"""
@@ -340,11 +323,11 @@ class StatsManager:
     def reset_global(self) -> None:
         """Reset stats globais"""
         self.global_stats = Stats()
+        self._batch_snapshots.clear()
         self._current_concurrent = 0
     
     def compare_batches(self, *batch_results) -> str:
         """Compara múltiplos batches sem repetição"""
-        
         output = ["📊 COMPARAÇÃO DE BATCHES:", "=" * 80]
         
         for i, result in enumerate(batch_results, 1):
@@ -352,12 +335,7 @@ class StatsManager:
             batch_id = result.get('batch_id', f'batch_{i}')
             
             output.append(f"\n🔍 Batch {i} ({batch_id}):")
-            
-            # Usar o formatador único
-            batch_formatted = self.format_stats(
-                batch_stats, 
-                title="", 
-            ).replace("📊 :", "").strip()
+            batch_formatted = self.format_stats(batch_stats, title="").replace("📊 :", "").strip()
             
             # Indentar as linhas
             for line in batch_formatted.split('\n'):
@@ -368,25 +346,17 @@ class StatsManager:
     
     def summary_report(self, batch_results: List[Dict], global_stats: Stats) -> str:
         """Relatório completo sem repetição"""
-        
         output = ["🎯 RELATÓRIO COMPLETO", "=" * 80]
         
         # Batches individuais
         for i, result in enumerate(batch_results, 1):
             batch_stats = result['batch_stats']
             batch_id = result.get('batch_id', f'batch_{i}')
-            
-            formatted = self.format_stats(
-                batch_stats, 
-                title=f"Batch {i} ({batch_id})"
-            )
+            formatted = self.format_stats(batch_stats, title=f"Batch {i} ({batch_id})")
             output.append(f"\n{formatted}")
         
         # Global
-        formatted_global = self.format_stats(
-            global_stats, 
-            title="TOTAL GERAL"
-        )
+        formatted_global = self.format_stats(global_stats, title="TOTAL GERAL")
         output.append(f"\n{formatted_global}")
         
         return "\n".join(output)
@@ -411,8 +381,8 @@ class StatsManager:
             'cost_per_token': stats.cost_per_token,
             'estimated_savings_from_cache': stats.cost_savings_from_cache,
             'cost_breakdown': {
-                'input_tokens_cost': stats.total_tokens_input * stats.cost_per_token if stats.cost_per_token > 0 else 0,
-                'output_tokens_cost': stats.total_tokens_output * stats.cost_per_token if stats.cost_per_token > 0 else 0,
+                'input_tokens_cost': stats.total_tokens_input * 0.0015 / 1000,
+                'output_tokens_cost': stats.total_tokens_output * 0.002 / 1000,
                 'cached_tokens_savings': stats.cost_savings_from_cache
             }
         }
