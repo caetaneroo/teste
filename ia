@@ -819,4 +819,6 @@ class AIProcessor:
         print("⚡ STATUS DO RATE LIMITER:")
         print(f"   🔢 Tokens usados: {status['tokens_used']:,}")
         print(f"   📊 Utilização: {status['utilization_percent']:.1f}%")
-        print(f"   ⏱️ Tempo no
+        print(f"   ⏱️ Tempo no minuto: {status['time_in_minute']:.1f}s")
+        print(f"   🔄 Total de esperas: {status['total_waits']}")
+        print(f"   ⏳ Tempo total de espera: {status['total_wait_time']:.1f}s")
