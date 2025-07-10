@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import traceback
+import sys
 import tiktoken
 from typing import List, Dict, Any, Optional
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
@@ -41,7 +42,7 @@ def is_rate_limit_error(result: Dict[str, Any]) -> bool:
         return False
     
     error_msg = result.get('error', '').lower()
-    return 'token rate limit' in error_msg
+    return 'token rate limit' in error_msg or 'rate limit' in error_msg
 
 
 class AIProcessor:
@@ -216,6 +217,95 @@ class AIProcessor:
         # Default para Azure OpenAI
         return 60.0
     
+    def _validate_api_params(self, api_params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Valida parâmetros da API antes do envio
+        """
+        validation_result = {
+            'valid': True,
+            'errors': [],
+            'warnings': []
+        }
+        
+        # Validar modelo
+        if not api_params.get('model'):
+            validation_result['valid'] = False
+            validation_result['errors'].append('Modelo não especificado')
+        
+        # Validar mensagens
+        messages = api_params.get('messages', [])
+        if not messages:
+            validation_result['valid'] = False
+            validation_result['errors'].append('Mensagens vazias')
+        
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                validation_result['valid'] = False
+                validation_result['errors'].append(f'Mensagem {i} não é um dicionário')
+                continue
+                
+            if 'role' not in msg or 'content' not in msg:
+                validation_result['valid'] = False
+                validation_result['errors'].append(f'Mensagem {i} sem role ou content')
+        
+        # Validar temperatura
+        temp = api_params.get('temperature', 0.1)
+        if not isinstance(temp, (int, float)) or temp < 0 or temp > 2:
+            validation_result['warnings'].append(f'Temperatura {temp} pode ser inválida (deve ser 0-2)')
+        
+        # Validar max_tokens
+        max_tokens = api_params.get('max_tokens')
+        if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens <= 0):
+            validation_result['warnings'].append(f'max_tokens {max_tokens} pode ser inválido')
+        
+        return validation_result
+    
+    def _get_detailed_error_context(self, e: Exception, api_params: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+        """
+        Obtém contexto detalhado do erro para debugging
+        """
+        # Obter traceback com linha específica
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        
+        # Extrair linha específica do erro
+        error_line = None
+        error_file = None
+        error_function = None
+        
+        if exc_traceback:
+            tb = exc_traceback
+            # Navegar até o último frame do traceback
+            while tb.tb_next:
+                tb = tb.tb_next
+            error_line = tb.tb_lineno
+            error_file = tb.tb_frame.f_code.co_filename
+            error_function = tb.tb_frame.f_code.co_name
+        
+        # Contexto completo
+        context = {
+            'error_type': type(e).__name__,
+            'error_message': str(e),
+            'error_line': error_line,
+            'error_file': error_file.split('/')[-1] if error_file else None,
+            'error_function': error_function,
+            'request_id': request_id,
+            'api_params_summary': {
+                'model': api_params.get('model'),
+                'messages_count': len(api_params.get('messages', [])),
+                'temperature': api_params.get('temperature'),
+                'max_tokens': api_params.get('max_tokens'),
+                'has_response_format': 'response_format' in api_params
+            },
+            'full_traceback': traceback.format_exc()
+        }
+        
+        # Adicionar informações específicas do erro se disponível
+        if hasattr(e, 'response'):
+            context['response_status'] = getattr(e.response, 'status_code', None)
+            context['response_headers'] = dict(getattr(e.response, 'headers', {}))
+            
+        return context
+    
     async def _make_api_call(
         self,
         messages: List[Dict[str, str]],
@@ -249,7 +339,7 @@ class AIProcessor:
         # Registrar início de requisição concorrente
         self.stats_manager.record_concurrent_start()
         
-        try:  # ✅ TRY MOVIDO PARA FORA DO SEMAPHORE
+        try:
             async with self.semaphore:
                 # AsyncRetrying com retry apenas para rate limits
                 async for attempt in AsyncRetrying(
@@ -265,7 +355,7 @@ class AIProcessor:
                         start_time = time.time()
                         
                         try:
-                            # Preparar parâmetros da API
+                            # ✅ PREPARAR E VALIDAR PARÂMETROS DA API
                             api_params = {
                                 "model": self.model,
                                 "messages": messages,
@@ -278,6 +368,22 @@ class AIProcessor:
                             if json_schema and isinstance(json_schema, dict):
                                 api_params["response_format"] = self._prepare_json_schema(json_schema)
                             
+                            # ✅ VALIDAR PARÂMETROS ANTES DO ENVIO
+                            validation = self._validate_api_params(api_params)
+                            if not validation['valid']:
+                                raise ValueError(f"Parâmetros inválidos: {', '.join(validation['errors'])}")
+                            
+                            # Log warnings se houver
+                            if validation['warnings']:
+                                logger.warning(
+                                    f"Avisos nos parâmetros da API: {', '.join(validation['warnings'])}",
+                                    extra={
+                                        'request_id': request_id,
+                                        'warnings': validation['warnings'],
+                                        'action': 'api_params_warning'
+                                    }
+                                )
+                            
                             # Log da tentativa
                             logger.debug(
                                 f"Tentativa {attempt.retry_state.attempt_number}/{MAX_RETRY} - Chamada à API",
@@ -286,45 +392,134 @@ class AIProcessor:
                                     'attempt_number': attempt.retry_state.attempt_number,
                                     'base_estimate': base_estimate,
                                     'calibrated_estimate': calibrated_estimate,
+                                    'api_params_summary': api_params.get('model', 'unknown'),
                                     'action': 'api_call_attempt'
                                 }
                             )
                             
-                            # Fazer chamada à API com AsyncIaraGenAI
-                            response = await self.client.chat.completions.create(**api_params)
-                            
-                            # ✅ VALIDAÇÃO DA RESPOSTA
-                            if not response:
-                                raise Exception("API retornou resposta vazia")
+                            # ✅ FAZER CHAMADA À API COM TRATAMENTO ROBUSTO
+                            try:
+                                response = await self.client.chat.completions.create(**api_params)
+                            except Exception as api_error:
+                                # ✅ CONTEXTO DETALHADO DO ERRO DA API
+                                error_context = self._get_detailed_error_context(api_error, api_params, request_id)
                                 
-                            if not hasattr(response, 'choices') or not response.choices:
-                                raise Exception("API retornou resposta sem choices")
+                                logger.error(
+                                    f"Erro na chamada à API - {error_context['error_file']}:{error_context['error_line']} em {error_context['error_function']}(): {error_context['error_message']}",
+                                    extra={
+                                        'request_id': request_id,
+                                        'error_line': error_context['error_line'],
+                                        'error_file': error_context['error_file'],
+                                        'error_function': error_context['error_function'],
+                                        'error_type': error_context['error_type'],
+                                        'api_params_summary': error_context['api_params_summary'],
+                                        'response_status': error_context.get('response_status'),
+                                        'full_traceback': error_context['full_traceback'],
+                                        'action': 'api_call_error'
+                                    }
+                                )
+                                raise api_error
+                            
+                            # ✅ VALIDAÇÃO ROBUSTA DA RESPOSTA
+                            if not response:
+                                raise ValueError("API retornou resposta None/vazia")
+                                
+                            if not hasattr(response, 'choices'):
+                                raise ValueError(f"API retornou resposta sem atributo 'choices'. Tipo da resposta: {type(response)}")
+                                
+                            if not response.choices:
+                                raise ValueError("API retornou choices vazio (lista vazia)")
+                                
+                            if len(response.choices) == 0:
+                                raise ValueError("API retornou lista choices com 0 elementos")
                                 
                             if not hasattr(response.choices[0], 'message'):
-                                raise Exception("API retornou choice sem message")
+                                raise ValueError(f"API retornou choice[0] sem atributo 'message'. Tipo do choice: {type(response.choices[0])}")
+                            
+                            if not hasattr(response, 'usage'):
+                                logger.warning(
+                                    "API retornou resposta sem informações de usage - usando valores padrão",
+                                    extra={
+                                        'request_id': request_id,
+                                        'action': 'missing_usage_info'
+                                    }
+                                )
                             
                             end_time = time.time()
                             api_response_time = end_time - start_time
                             
-                            # Extrair tokens usados
-                            tokens_used = response.usage.total_tokens
-                            input_tokens = response.usage.prompt_tokens
-                            output_tokens = response.usage.completion_tokens
+                            # ✅ EXTRAIR DADOS COM VALIDAÇÃO
+                            try:
+                                if hasattr(response, 'usage') and response.usage:
+                                    tokens_used = getattr(response.usage, 'total_tokens', 0)
+                                    input_tokens = getattr(response.usage, 'prompt_tokens', 0)
+                                    output_tokens = getattr(response.usage, 'completion_tokens', 0)
+                                else:
+                                    # Fallback quando usage não está disponível
+                                    tokens_used = 0
+                                    input_tokens = 0
+                                    output_tokens = 0
+                                    
+                            except AttributeError as usage_error:
+                                logger.warning(
+                                    f"Erro ao extrair tokens da resposta: {usage_error} - usando valores padrão",
+                                    extra={
+                                        'request_id': request_id,
+                                        'response_structure': str(type(response.usage)) if hasattr(response, 'usage') else 'N/A',
+                                        'action': 'usage_extraction_error'
+                                    }
+                                )
+                                # Valores padrão para continuar processamento
+                                tokens_used = 0
+                                input_tokens = 0
+                                output_tokens = 0
                             
                             # Extrair cached tokens se disponível
                             cached_tokens = 0
-                            if hasattr(response.usage, 'prompt_tokens_details'):
+                            if hasattr(response, 'usage') and hasattr(response.usage, 'prompt_tokens_details'):
                                 cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
                             
                             # Registrar tokens no rate limiter
-                            self.rate_limiter.record_tokens(tokens_used)
-                            self.rate_limiter.record_token_usage(base_estimate, tokens_used)
+                            if tokens_used > 0:
+                                self.rate_limiter.record_tokens(tokens_used)
+                                self.rate_limiter.record_token_usage(base_estimate, tokens_used)
                             
                             # Calcular custo
                             cost = self.calculate_cost(input_tokens, output_tokens)
                             
-                            # Processar resposta
-                            content = response.choices[0].message.content
+                            # ✅ PROCESSAR RESPOSTA COM VALIDAÇÃO ROBUSTA
+                            try:
+                                if not response.choices or len(response.choices) == 0:
+                                    raise IndexError("Lista choices está vazia")
+                                    
+                                choice = response.choices[0]
+                                if not hasattr(choice, 'message'):
+                                    raise AttributeError("Choice não tem atributo 'message'")
+                                    
+                                message = choice.message
+                                if not hasattr(message, 'content'):
+                                    raise AttributeError("Message não tem atributo 'content'")
+                                    
+                                content = message.content
+                                
+                            except (IndexError, AttributeError) as content_error:
+                                error_context = self._get_detailed_error_context(content_error, api_params, request_id)
+                                
+                                logger.error(
+                                    f"Erro ao extrair content da resposta - {error_context['error_file']}:{error_context['error_line']}: {content_error}",
+                                    extra={
+                                        'request_id': request_id,
+                                        'error_line': error_context['error_line'],
+                                        'error_file': error_context['error_file'],
+                                        'error_function': error_context['error_function'],
+                                        'choices_length': len(response.choices) if hasattr(response, 'choices') and response.choices else 'N/A',
+                                        'choice_type': str(type(response.choices[0])) if hasattr(response, 'choices') and response.choices else 'N/A',
+                                        'full_traceback': error_context['full_traceback'],
+                                        'action': 'content_extraction_error'
+                                    }
+                                )
+                                content = None
+                            
                             parsed_content = content
                             
                             # Se JSON schema foi usado, tentar parsear
@@ -344,7 +539,7 @@ class AIProcessor:
                                         extra={
                                             'request_id': request_id,
                                             'error': str(e),
-                                            'raw_content': content[:200],
+                                            'raw_content': content[:200] if content else 'None',
                                             'action': 'json_parse_error'
                                         }
                                     )
@@ -391,6 +586,9 @@ class AIProcessor:
                             end_time = time.time()
                             api_response_time = end_time - start_time
                             
+                            # ✅ CONTEXTO DETALHADO DO ERRO
+                            error_context = self._get_detailed_error_context(e, api_params, request_id)
+                            
                             # Capturar headers se disponíveis
                             response_headers = {}
                             if hasattr(e, 'response') and hasattr(e.response, 'headers'):
@@ -409,10 +607,14 @@ class AIProcessor:
                                 'success': False,
                                 'error': str(e),
                                 'error_type': type(e).__name__,
+                                'error_line': error_context['error_line'],
+                                'error_file': error_context['error_file'],
+                                'error_function': error_context['error_function'],
                                 'response_headers': response_headers,
                                 'is_json': False,
                                 'attempts': attempt.retry_state.attempt_number,
-                                'request_id': request_id
+                                'request_id': request_id,
+                                'full_traceback': error_context['full_traceback']
                             }
                             
                             # ✅ VERIFICAR se é rate limit (única condição para retry)
@@ -433,7 +635,7 @@ class AIProcessor:
                                 raise
                             
                             else:
-                                # ✅ REMOVIDO LOG DUPLICADO - apenas retorna o erro
+                                # Qualquer outro erro - não fazer retry, apenas retornar
                                 return error_result
                                 
             # Código nunca deveria chegar aqui devido ao AsyncRetrying
@@ -476,15 +678,19 @@ class AIProcessor:
             }
             
         except Exception as e:
-            # ✅ ERRO INESPERADO COM TRACEBACK DETALHADO
-            error_traceback = traceback.format_exc()
+            # ✅ ERRO INESPERADO COM CONTEXTO COMPLETO
+            error_context = self._get_detailed_error_context(e, {}, request_id)
+            
             logger.error(
-                f"Erro inesperado na chamada à API: {str(e)}",
+                f"Erro inesperado na chamada à API - {error_context['error_file']}:{error_context['error_line']} em {error_context['error_function']}(): {str(e)}",
                 extra={
                     'request_id': request_id,
                     'error': str(e),
                     'error_type': type(e).__name__,
-                    'traceback': error_traceback,
+                    'error_line': error_context['error_line'],
+                    'error_file': error_context['error_file'],
+                    'error_function': error_context['error_function'],
+                    'full_traceback': error_context['full_traceback'],
                     'action': 'unexpected_api_error'
                 }
             )
@@ -494,11 +700,14 @@ class AIProcessor:
                 'success': False,
                 'error': str(e),
                 'error_type': type(e).__name__,
-                'traceback': error_traceback,
+                'error_line': error_context['error_line'],
+                'error_file': error_context['error_file'],
+                'error_function': error_context['error_function'],
+                'full_traceback': error_context['full_traceback'],
                 'request_id': request_id
             }
                 
-        finally:  # ✅ FINALLY NO NÍVEL CORRETO
+        finally:
             # Registrar fim de requisição concorrente
             self.stats_manager.record_concurrent_end()
     
@@ -548,8 +757,29 @@ class AIProcessor:
                 api_rate_limit_detected=api_rate_limit_detected
             )
             
-            # ✅ LOG SIMPLIFICADO - apenas sucesso ou falha crítica
-            if result.get('success'):
+            # ✅ LOG ÚNICO E DETALHADO APENAS PARA FALHAS NÃO-RATE-LIMIT
+            if not result.get('success', False) and not api_rate_limit_detected:
+                # Construir informações detalhadas do erro
+                error_info = {
+                    'request_id': request_id,
+                    'processing_time': round(processing_time, 3),
+                    'error_type': result.get('error_type'),
+                    'error': result.get('error'),
+                    'error_line': result.get('error_line'),
+                    'error_file': result.get('error_file'),
+                    'error_function': result.get('error_function'),
+                    'action': 'single_process_failed'
+                }
+                
+                # Adicionar traceback se disponível
+                if 'full_traceback' in result:
+                    error_info['full_traceback'] = result['full_traceback']
+                
+                logger.error(
+                    f"Processamento individual falhou - {result.get('error_file', 'N/A')}:{result.get('error_line', 'N/A')} em {result.get('error_function', 'N/A')}(): {result.get('error')}",
+                    extra=error_info
+                )
+            elif result.get('success', False):
                 logger.debug(
                     "Processamento individual concluído",
                     extra={
@@ -558,24 +788,6 @@ class AIProcessor:
                         'action': 'single_process_success'
                     }
                 )
-            elif not api_rate_limit_detected:
-                # ✅ LOG ÚNICO DE ERRO COM TRACEBACK
-                error_info = {
-                    'request_id': request_id,
-                    'processing_time': round(processing_time, 3),
-                    'error_type': result.get('error_type'),
-                    'error': result.get('error'),
-                    'action': 'single_process_failed'
-                }
-                
-                # Adicionar traceback se disponível
-                if 'traceback' in result:
-                    error_info['traceback'] = result['traceback']
-                
-                logger.error(
-                    f"Processamento individual falhou: {result.get('error')}",
-                    extra=error_info
-                )
             
             return result
             
@@ -583,16 +795,33 @@ class AIProcessor:
             end_time = time.time()
             processing_time = end_time - start_time
             
-            # ✅ ERRO INESPERADO COM TRACEBACK
+            # ✅ ERRO INESPERADO COM CONTEXTO COMPLETO
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            error_line = None
+            error_file = None
+            error_function = None
+            
+            if exc_traceback:
+                tb = exc_traceback
+                while tb.tb_next:
+                    tb = tb.tb_next
+                error_line = tb.tb_lineno
+                error_file = tb.tb_frame.f_code.co_filename
+                error_function = tb.tb_frame.f_code.co_name
+            
             error_traceback = traceback.format_exc()
+            
             logger.error(
-                f"Erro inesperado no processamento individual: {str(e)}",
+                f"Erro inesperado no processamento individual - {error_file.split('/')[-1] if error_file else 'N/A'}:{error_line} em {error_function}(): {str(e)}",
                 extra={
                     'request_id': request_id,
                     'processing_time': round(processing_time, 3),
                     'error': str(e),
                     'error_type': type(e).__name__,
-                    'traceback': error_traceback,
+                    'error_line': error_line,
+                    'error_file': error_file.split('/')[-1] if error_file else None,
+                    'error_function': error_function,
+                    'full_traceback': error_traceback,
                     'action': 'single_process_unexpected_error'
                 }
             )
@@ -602,7 +831,10 @@ class AIProcessor:
                 'success': False,
                 'error': str(e),
                 'error_type': type(e).__name__,
-                'traceback': error_traceback,
+                'error_line': error_line,
+                'error_file': error_file.split('/')[-1] if error_file else None,
+                'error_function': error_function,
+                'full_traceback': error_traceback,
                 'processing_time': processing_time,
                 'custom_id': custom_id,
                 'request_id': request_id
@@ -737,16 +969,33 @@ class AIProcessor:
                     )
                     
             except Exception as e:
-                # ✅ LOG ÚNICO DE ERRO DE TASK COM TRACEBACK
+                # ✅ LOG ÚNICO DE ERRO DE TASK COM CONTEXTO COMPLETO
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                error_line = None
+                error_file = None
+                error_function = None
+                
+                if exc_traceback:
+                    tb = exc_traceback
+                    while tb.tb_next:
+                        tb = tb.tb_next
+                    error_line = tb.tb_lineno
+                    error_file = tb.tb_frame.f_code.co_filename
+                    error_function = tb.tb_frame.f_code.co_name
+                
                 error_traceback = traceback.format_exc()
+                
                 logger.error(
-                    f"Erro em task do lote: {str(e)}",
+                    f"Erro em task do lote - {error_file.split('/')[-1] if error_file else 'N/A'}:{error_line} em {error_function}(): {str(e)}",
                     extra={
                         'batch_id': batch_id,
                         'completed': completed,
                         'error': str(e),
                         'error_type': type(e).__name__,
-                        'traceback': error_traceback,
+                        'error_line': error_line,
+                        'error_file': error_file.split('/')[-1] if error_file else None,
+                        'error_function': error_function,
+                        'full_traceback': error_traceback,
                         'action': 'batch_task_error'
                     }
                 )
@@ -755,7 +1004,10 @@ class AIProcessor:
                     'success': False,
                     'error': str(e),
                     'error_type': type(e).__name__,
-                    'traceback': error_traceback
+                    'error_line': error_line,
+                    'error_file': error_file.split('/')[-1] if error_file else None,
+                    'error_function': error_function,
+                    'full_traceback': error_traceback
                 })
                 completed += 1
         
