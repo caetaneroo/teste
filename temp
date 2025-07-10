@@ -1,399 +1,43 @@
-async def _make_api_call(
-    self,
-    messages: List[Dict[str, str]],
-    json_schema: Optional[Dict[str, Any]] = None,
-    request_id: str = None
-) -> Dict[str, Any]:
+# ✅ VALIDAÇÃO ESPECÍFICA PARA AsyncIaraGenAI
+def _validate_iara_api_params(self, api_params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Faz chamada à API com AsyncIaraGenAI e rate limiting coordenado
+    Valida parâmetros específicos para AsyncIaraGenAI
     """
+    validation_result = {
+        'valid': True,
+        'errors': [],
+        'warnings': []
+    }
     
-    if not request_id:
-        request_id = self._generate_request_id()
+    # Verificar se o modelo é suportado pela AsyncIaraGenAI
+    supported_models = [
+        'gpt-35-turbo', 'gpt-35-turbo-16k', 'gpt-4', 'gpt-4-32k',
+        'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini'
+    ]
     
-    # Validar entrada
-    if not messages or not isinstance(messages, list):
-        return {
-            'content': None,
-            'tokens_used': 0,
-            'success': False,
-            'error': 'Messages inválidas',
-            'error_type': 'ValidationError',
-            'request_id': request_id
-        }
+    model = api_params.get('model', '')
+    if model not in supported_models:
+        validation_result['warnings'].append(f'Modelo {model} pode não ser suportado pela AsyncIaraGenAI')
     
-    # Estimar tokens necessários
-    base_estimate = self.estimate_tokens(messages)
-    
-    # Rate limiting coordenado inicial
-    calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
-    
-    # Registrar início de requisição concorrente
-    self.stats_manager.record_concurrent_start()
-    
-    try:
-        async with self.semaphore:
-            # AsyncRetrying com retry apenas para rate limits
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(MAX_RETRY),
-                wait=wait_fixed(0.1),
-                reraise=True
-            ):
-                with attempt:
-                    # Aguardar rate limiting em todas as tentativas
-                    if attempt.retry_state.attempt_number > 1:
-                        await self.rate_limiter.wait_for_tokens(base_estimate)
-                    
-                    start_time = time.time()
-                    
-                    try:
-                        # ✅ PREPARAR E VALIDAR PARÂMETROS DA API
-                        api_params = {
-                            "model": self.model,
-                            "messages": messages,
-                            "temperature": self.temperature
-                        }
-                        
-                        if self.max_tokens is not None:
-                            api_params["max_tokens"] = self.max_tokens
-                        
-                        if json_schema and isinstance(json_schema, dict):
-                            api_params["response_format"] = self._prepare_json_schema(json_schema)
-                        
-                        # ✅ VALIDAÇÃO ESPECÍFICA PARA AsyncIaraGenAI
-                        validation = self._validate_iara_api_params(api_params)
-                        if not validation['valid']:
-                            raise ValueError(f"Parâmetros inválidos para AsyncIaraGenAI: {', '.join(validation['errors'])}")
-                        
-                        # Log warnings se houver
-                        if validation['warnings']:
-                            logger.warning(
-                                f"Avisos nos parâmetros da API: {', '.join(validation['warnings'])}",
-                                extra={
-                                    'request_id': request_id,
-                                    'warnings': validation['warnings'],
-                                    'action': 'api_params_warning'
-                                }
-                            )
-                        
-                        # Log da tentativa
-                        logger.debug(
-                            f"Tentativa {attempt.retry_state.attempt_number}/{MAX_RETRY} - Chamada à API AsyncIaraGenAI",
-                            extra={
-                                'request_id': request_id,
-                                'attempt_number': attempt.retry_state.attempt_number,
-                                'api_params': api_params,
-                                'action': 'api_call_attempt'
-                            }
-                        )
-                        
-                        # ✅ FAZER CHAMADA À API COM DEBUGGING DETALHADO
-                        try:
-                            response = await self.client.chat.completions.create(**api_params)
-                            
-                            # DEBUG: Log detalhado da resposta
-                            logger.debug(
-                                f"Resposta da API recebida - Tipo: {type(response)}",
-                                extra={
-                                    'request_id': request_id,
-                                    'response_type': str(type(response)),
-                                    'response_str': str(response)[:1000],
-                                    'response_attributes': [attr for attr in dir(response) if not attr.startswith('_')],
-                                    'action': 'api_response_debug'
-                                }
-                            )
-                            
-                        except Exception as api_error:
-                            error_context = self._get_detailed_error_context(api_error, api_params, request_id)
-                            
-                            logger.error(
-                                f"Erro na chamada à API AsyncIaraGenAI - {error_context['error_file']}:{error_context['error_line']} em {error_context['error_function']}(): {error_context['error_message']}",
-                                extra={
-                                    'request_id': request_id,
-                                    'error_context': error_context,
-                                    'api_params': api_params,
-                                    'action': 'api_call_error'
-                                }
-                            )
-                            raise api_error
-                        
-                        # ✅ VALIDAÇÃO ROBUSTA DA RESPOSTA
-                        if not response:
-                            raise ValueError("API retornou resposta None/vazia")
-                        
-                        # Verificar se é um objeto com atributos ou um dicionário
-                        if hasattr(response, 'choices'):
-                            choices = response.choices
-                        elif isinstance(response, dict) and 'choices' in response:
-                            choices = response['choices']
-                        else:
-                            raise ValueError(f"API retornou resposta sem 'choices'. Tipo: {type(response)}, Conteúdo: {str(response)[:500]}")
-                        
-                        if not choices:
-                            raise ValueError("API retornou choices vazio")
-                        
-                        if len(choices) == 0:
-                            raise ValueError("API retornou lista choices com 0 elementos")
-                        
-                        # Verificar estrutura do primeiro choice
-                        first_choice = choices[0]
-                        if hasattr(first_choice, 'message'):
-                            message = first_choice.message
-                        elif isinstance(first_choice, dict) and 'message' in first_choice:
-                            message = first_choice['message']
-                        else:
-                            raise ValueError(f"Choice[0] não tem 'message'. Tipo: {type(first_choice)}, Conteúdo: {str(first_choice)}")
-                        
-                        # Verificar content
-                        if hasattr(message, 'content'):
-                            content = message.content
-                        elif isinstance(message, dict) and 'content' in message:
-                            content = message['content']
-                        else:
-                            raise ValueError(f"Message não tem 'content'. Tipo: {type(message)}, Conteúdo: {str(message)}")
-                        
-                        end_time = time.time()
-                        api_response_time = end_time - start_time
-                        
-                        # ✅ EXTRAIR DADOS COM VALIDAÇÃO ROBUSTA
-                        try:
-                            # Verificar usage
-                            if hasattr(response, 'usage') and response.usage:
-                                usage = response.usage
-                                tokens_used = getattr(usage, 'total_tokens', 0)
-                                input_tokens = getattr(usage, 'prompt_tokens', 0)
-                                output_tokens = getattr(usage, 'completion_tokens', 0)
-                            elif isinstance(response, dict) and 'usage' in response and response['usage']:
-                                usage = response['usage']
-                                tokens_used = usage.get('total_tokens', 0)
-                                input_tokens = usage.get('prompt_tokens', 0)
-                                output_tokens = usage.get('completion_tokens', 0)
-                            else:
-                                logger.warning(
-                                    "API retornou resposta sem informações de usage - usando valores padrão",
-                                    extra={
-                                        'request_id': request_id,
-                                        'response_type': str(type(response)),
-                                        'action': 'missing_usage_info'
-                                    }
-                                )
-                                tokens_used = 0
-                                input_tokens = 0
-                                output_tokens = 0
-                                
-                        except Exception as usage_error:
-                            logger.warning(
-                                f"Erro ao extrair tokens da resposta: {usage_error} - usando valores padrão",
-                                extra={
-                                    'request_id': request_id,
-                                    'usage_error': str(usage_error),
-                                    'action': 'usage_extraction_error'
-                                }
-                            )
-                            tokens_used = 0
-                            input_tokens = 0
-                            output_tokens = 0
-                        
-                        # Extrair cached tokens se disponível
-                        cached_tokens = 0
-                        if hasattr(response, 'usage') and hasattr(response.usage, 'prompt_tokens_details'):
-                            cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
-                        
-                        # Registrar tokens no rate limiter
-                        if tokens_used > 0:
-                            self.rate_limiter.record_tokens(tokens_used)
-                            self.rate_limiter.record_token_usage(base_estimate, tokens_used)
-                        
-                        # Calcular custo
-                        cost = self.calculate_cost(input_tokens, output_tokens)
-                        
-                        parsed_content = content
-                        
-                        # Se JSON schema foi usado, tentar parsear
-                        if json_schema and isinstance(json_schema, dict) and content:
-                            try:
-                                parsed_content = json.loads(content)
-                                logger.debug(
-                                    "JSON Schema parseado com sucesso",
-                                    extra={
-                                        'request_id': request_id,
-                                        'action': 'json_parse_success'
-                                    }
-                                )
-                            except json.JSONDecodeError as e:
-                                logger.warning(
-                                    "Erro ao parsear JSON Schema",
-                                    extra={
-                                        'request_id': request_id,
-                                        'error': str(e),
-                                        'raw_content': content[:200] if content else 'None',
-                                        'action': 'json_parse_error'
-                                    }
-                                )
-                                parsed_content = content
-                        
-                        # Log de sucesso
-                        estimation_accuracy = abs(calibrated_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
-                        
-                        logger.debug(
-                            "Chamada à API bem-sucedida",
-                            extra={
-                                'request_id': request_id,
-                                'attempt_number': attempt.retry_state.attempt_number,
-                                'tokens_used': tokens_used,
-                                'input_tokens': input_tokens,
-                                'output_tokens': output_tokens,
-                                'cached_tokens': cached_tokens,
-                                'base_estimate': base_estimate,
-                                'calibrated_estimate': calibrated_estimate,
-                                'estimation_accuracy': round(estimation_accuracy, 1),
-                                'api_response_time': round(api_response_time, 3),
-                                'cost': round(cost, 6),
-                                'action': 'api_call_success'
-                            }
-                        )
-                        
-                        # Retorno de sucesso
-                        return {
-                            'content': parsed_content,
-                            'raw_content': content,
-                            'tokens_used': tokens_used,
-                            'input_tokens': input_tokens,
-                            'output_tokens': output_tokens,
-                            'cached_tokens': cached_tokens,
-                            'cost': cost,
-                            'api_response_time': api_response_time,
-                            'success': True,
-                            'is_json': json_schema is not None,
-                            'attempts': attempt.retry_state.attempt_number,
-                            'request_id': request_id
-                        }
-                        
-                    except Exception as e:
-                        end_time = time.time()
-                        api_response_time = end_time - start_time
-                        
-                        # ✅ CONTEXTO DETALHADO DO ERRO
-                        error_context = self._get_detailed_error_context(e, api_params, request_id)
-                        
-                        # Capturar headers se disponíveis
-                        response_headers = {}
-                        if hasattr(e, 'response') and hasattr(e.response, 'headers'):
-                            response_headers = dict(e.response.headers)
-                        
-                        # Criar resultado de erro
-                        error_result = {
-                            'content': None,
-                            'raw_content': None,
-                            'tokens_used': 0,
-                            'input_tokens': 0,
-                            'output_tokens': 0,
-                            'cached_tokens': 0,
-                            'cost': 0.0,
-                            'api_response_time': api_response_time,
-                            'success': False,
-                            'error': str(e),
-                            'error_type': type(e).__name__,
-                            'error_line': error_context['error_line'],
-                            'error_file': error_context['error_file'],
-                            'error_function': error_context['error_function'],
-                            'response_headers': response_headers,
-                            'is_json': False,
-                            'attempts': attempt.retry_state.attempt_number,
-                            'request_id': request_id,
-                            'full_traceback': error_context['full_traceback']
-                        }
-                        
-                        # ✅ VERIFICAR se é rate limit (única condição para retry)
-                        if is_rate_limit_error(error_result):
-                            wait_time = self._extract_wait_time_from_error_result(error_result)
-                            
-                            logger.debug(
-                                f"Rate limit detectado - request {request_id}",
-                                extra={
-                                    'request_id': request_id,
-                                    'attempt_number': attempt.retry_state.attempt_number,
-                                    'wait_time': wait_time,
-                                    'action': 'rate_limit_detected'
-                                }
-                            )
-                            
-                            # Raise para que AsyncRetrying faça nova tentativa
-                            raise
-                        
-                        else:
-                            # Qualquer outro erro - não fazer retry, apenas retornar
-                            return error_result
-                            
-        # Código nunca deveria chegar aqui devido ao AsyncRetrying
-        return {
-            'content': None,
-            'success': False,
-            'error': 'Erro inesperado no fluxo de retry',
-            'error_type': 'UnexpectedFlowError',
-            'request_id': request_id
-        }
-                            
-    except RetryError as retry_error:
-        # Todas as tentativas falharam
-        logger.error(
-            "Todas as tentativas de retry falharam",
-            extra={
-                'request_id': request_id,
-                'total_attempts': MAX_RETRY,
-                'final_error': str(retry_error.last_attempt.exception()) if retry_error.last_attempt else 'Desconhecido',
-                'action': 'retry_exhausted'
-            }
-        )
-        
-        # Retornar resultado final de falha
-        return {
-            'content': None,
-            'raw_content': None,
-            'tokens_used': 0,
-            'input_tokens': 0,
-            'output_tokens': 0,
-            'cached_tokens': 0,
-            'cost': 0.0,
-            'api_response_time': 0.0,
-            'success': False,
-            'error': f'Máximo de tentativas excedido: {retry_error.last_attempt.exception() if retry_error.last_attempt else "Erro desconhecido"}',
-            'error_type': 'RetryError',
-            'is_json': False,
-            'attempts': MAX_RETRY,
-            'request_id': request_id
-        }
-        
-    except Exception as e:
-        # ✅ ERRO INESPERADO COM CONTEXTO COMPLETO
-        error_context = self._get_detailed_error_context(e, {}, request_id)
-        
-        logger.error(
-            f"Erro inesperado na chamada à API - {error_context['error_file']}:{error_context['error_line']} em {error_context['error_function']}(): {str(e)}",
-            extra={
-                'request_id': request_id,
-                'error': str(e),
-                'error_type': type(e).__name__,
-                'error_line': error_context['error_line'],
-                'error_file': error_context['error_file'],
-                'error_function': error_context['error_function'],
-                'full_traceback': error_context['full_traceback'],
-                'action': 'unexpected_api_error'
-            }
-        )
-        
-        return {
-            'content': None,
-            'success': False,
-            'error': str(e),
-            'error_type': type(e).__name__,
-            'error_line': error_context['error_line'],
-            'error_file': error_context['error_file'],
-            'error_function': error_context['error_function'],
-            'full_traceback': error_context['full_traceback'],
-            'request_id': request_id
-        }
+    # Verificar estrutura das mensagens
+    messages = api_params.get('messages', [])
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            validation_result['errors'].append(f'Mensagem {i} deve ser um dicionário')
+            continue
             
-    finally:
-        # Registrar fim de requisição concorrente
-        self.stats_manager.record_concurrent_end()
+        if 'role' not in msg:
+            validation_result['errors'].append(f'Mensagem {i} deve ter "role"')
+            
+        if 'content' not in msg:
+            validation_result['errors'].append(f'Mensagem {i} deve ter "content"')
+            
+        # Verificar roles válidos
+        valid_roles = ['system', 'user', 'assistant']
+        if msg.get('role') not in valid_roles:
+            validation_result['errors'].append(f'Mensagem {i} tem role inválido: {msg.get("role")}')
+    
+    if validation_result['errors']:
+        validation_result['valid'] = False
+    
+    return validation_result
