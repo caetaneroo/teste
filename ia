@@ -78,7 +78,6 @@ class AIProcessor:
         
         # Gerenciador de estatísticas
         self.stats_manager = StatsManager()
-        # ✅ CORREÇÃO 1: Informar limite de concorrência ao stats_manager
         self.stats_manager.set_max_concurrent(self.max_concurrent)
         
         # Encoder para estimativa de tokens
@@ -700,7 +699,7 @@ class AIProcessor:
                                 rate_limit_detected = True
                                 wait_time = self._extract_wait_time_from_error_result(result)
                                 
-                                # ✅ CORREÇÃO 2: Registrar rate limit no stats_manager
+                                # Registrar rate limit no stats_manager
                                 self.stats_manager.record_global_rate_limit_activation(wait_time, len(rate_limit_indices))
                                 
                                 # Delegar para rate limiter
@@ -782,10 +781,10 @@ class AIProcessor:
             'batch_id': batch_id
         }
     
-    # ✅ NOVA: Função única de stats consolidada
+    # ✅ NOVA: Função única de stats consolidada (SEM resumo executivo)
     def get_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True) -> Dict[str, Any]:
         """
-        🎯 FUNÇÃO ÚNICA DE STATS - Consolida todas as métricas em um só lugar
+        🎯 FUNÇÃO ÚNICA DE STATS - Consolida todas as métricas (global primeiro, depois batch)
         
         Args:
             batch_result: Resultado de um batch específico (opcional)
@@ -796,108 +795,62 @@ class AIProcessor:
         """
         complete_stats = {}
         
-        # 1. STATS DO BATCH (se fornecido)
-        if batch_result and 'batch_stats' in batch_result:
-            batch_stats = batch_result['batch_stats']
-            batch_id = batch_result.get('batch_id', 'unknown')
-            
-            complete_stats['batch'] = {
-                'id': batch_id,
-                'summary': self.stats_manager.format_stats(batch_stats, f"Batch {batch_id}"),
-                'metrics': self.stats_manager.export_stats_json(batch_stats),
-                'efficiency': self.stats_manager.get_efficiency_metrics(batch_stats),
-                'cost_breakdown': self.stats_manager.get_cost_breakdown(batch_stats)
-            }
-        
-        # 2. STATS GLOBAIS (se solicitado)
+        # 1. STATS GLOBAIS PRIMEIRO (se solicitado)
         if include_global:
             global_stats = self.stats_manager.get_global_stats()
+            rate_limiter_status = self.rate_limiter.get_status()
+            calibration_stats = self.rate_limiter.get_calibration_stats()
+            
             complete_stats['global'] = {
-                'summary': self.stats_manager.format_stats(global_stats, "Global"),
+                'summary': self.stats_manager.format_stats(global_stats, "ESTATÍSTICAS GLOBAIS"),
                 'metrics': self.stats_manager.export_stats_json(global_stats),
                 'efficiency': self.stats_manager.get_efficiency_metrics(global_stats),
-                'cost_breakdown': self.stats_manager.get_cost_breakdown(global_stats)
-            }
-        
-        # 3. STATS DO RATE LIMITER
-        rate_limiter_status = self.rate_limiter.get_status()
-        calibration_stats = self.rate_limiter.get_calibration_stats()
-        
-        complete_stats['rate_limiter'] = {
-            'status': rate_limiter_status,
-            'calibration': calibration_stats,
-            'summary': f"""⚡ RATE LIMITER STATUS:
+                'cost_breakdown': self.stats_manager.get_cost_breakdown(global_stats),
+                'rate_limiter': {
+                    'status': rate_limiter_status,
+                    'calibration': calibration_stats,
+                    'summary': f"""⚡ RATE LIMITER GLOBAL:
    🔢 Tokens usados: {rate_limiter_status['tokens_used']:,}
    📊 Utilização: {rate_limiter_status['utilization_percent']:.1f}%
    ⏱️ Tempo no minuto: {rate_limiter_status['time_in_minute']:.1f}s
    🔄 Total de esperas: {rate_limiter_status['total_waits']}
    ⏳ Tempo total de espera: {rate_limiter_status['total_wait_time']:.1f}s
    
-🎯 CALIBRAÇÃO:
+🎯 CALIBRAÇÃO GLOBAL:
    📊 Precisão: {calibration_stats['accuracy_percentage']:.1f}%
    🔧 Fator atual: {calibration_stats['current_calibration_factor']:.3f}
    📈 Total calibrações: {calibration_stats['total_calibrations']}
    🛡️ Rate limits prevenidos: {calibration_stats['prevented_rate_limits']}
    🚨 Rate limits detectados: {calibration_stats['api_rate_limits_detected']}"""
-        }
-        
-        # 4. PERFORMANCE CONSOLIDADA
-        if batch_result:
-            batch_stats = batch_result['batch_stats']
-            complete_stats['performance'] = {
-                'throughput': {
-                    'requests_per_second': batch_stats.avg_rate,
-                    'requests_per_minute': batch_stats.avg_rate * 60,
-                    'tokens_per_second': batch_stats.total_tokens / batch_stats.processing_time if batch_stats.processing_time > 0 else 0
-                },
-                'efficiency': {
-                    'success_rate': batch_stats.success_rate,
-                    'time_efficiency': batch_stats.efficiency_rate,
-                    'cache_efficiency': batch_stats.cache_hit_rate,
-                    'coordination_efficiency': batch_stats.coordination_efficiency
-                },
-                'response_times': {
-                    'average': batch_stats.avg_response_time,
-                    'minimum': batch_stats.min_response_time,
-                    'maximum': batch_stats.max_response_time
-                },
-                'concurrency': {
-                    'peak_concurrent': batch_stats.concurrent_peak,
-                    'max_configured': self.max_concurrent
                 }
             }
         
-        # 5. RESUMO EXECUTIVO
-        if batch_result:
+        # 2. STATS DO BATCH (se fornecido)
+        if batch_result and 'batch_stats' in batch_result:
             batch_stats = batch_result['batch_stats']
-            total_wait = batch_stats.total_wait_time + batch_stats.coordinated_wait_time
+            batch_id = batch_result.get('batch_id', 'unknown')
             
-            complete_stats['executive_summary'] = f"""📈 RESUMO EXECUTIVO:
-   
-✅ RESULTADOS:
-   • {batch_stats.successful_requests} sucessos de {batch_stats.total_requests} requests ({batch_stats.success_rate:.1f}%)
-   • {batch_stats.total_tokens:,} tokens processados
-   • ${batch_stats.total_cost:.4f} de custo total
-   
-⚡ PERFORMANCE:
-   • {batch_stats.avg_rate:.2f} requests/segundo
-   • {batch_stats.avg_response_time:.3f}s tempo médio de resposta
-   • {batch_stats.concurrent_peak} pico de concorrência
-   
-🎯 EFICIÊNCIA:
-   • {batch_stats.efficiency_rate:.1f}% eficiência de tempo
-   • {batch_stats.cache_hit_rate:.1f}% cache hit rate
-   • {batch_stats.coordination_efficiency:.1f}% eficiência de coordenação
-   
-💰 CUSTOS:
-   • ${batch_stats.cost_per_token:.6f} por token
-   • ${batch_stats.cost_savings_from_cache:.4f} economia com cache
-   • Modelo: {batch_stats.model_used or 'N/A'}
-   
-⏱️ TEMPOS:
-   • {batch_stats.processing_time:.2f}s tempo total
-   • {total_wait:.1f}s tempo de espera
-   • {batch_stats.api_rate_limits_detected} rate limits detectados"""
+            complete_stats['batch'] = {
+                'id': batch_id,
+                'summary': self.stats_manager.format_stats(batch_stats, f"BATCH {batch_id}"),
+                'metrics': self.stats_manager.export_stats_json(batch_stats),
+                'efficiency': self.stats_manager.get_efficiency_metrics(batch_stats),
+                'cost_breakdown': self.stats_manager.get_cost_breakdown(batch_stats),
+                'rate_limiter': {
+                    'batch_specific': {
+                        'api_rate_limits_detected': batch_stats.api_rate_limits_detected,
+                        'global_rate_limit_activations': batch_stats.global_rate_limit_activations,
+                        'coordinated_wait_time': batch_stats.coordinated_wait_time,
+                        'coordination_efficiency': batch_stats.coordination_efficiency
+                    },
+                    'summary': f"""⚡ RATE LIMITER BATCH {batch_id}:
+   🚨 Rate limits detectados: {batch_stats.api_rate_limits_detected}
+   🌐 Ativações globais: {batch_stats.global_rate_limit_activations}
+   ⏱️ Tempo coordenado: {batch_stats.coordinated_wait_time:.1f}s
+   📈 Eficiência coordenação: {batch_stats.coordination_efficiency:.1f}%
+   🔗 Pico concorrente: {batch_stats.concurrent_peak} requisições"""
+                }
+            }
         
         return complete_stats
     
@@ -938,10 +891,10 @@ class AIProcessor:
         print(f"   🔄 Total de esperas: {status['total_waits']}")
         print(f"   ⏳ Tempo total de espera: {status['total_wait_time']:.1f}s")
     
-    # ✅ NOVA: Método de conveniência para mostrar stats completas
+    # ✅ ATUALIZADA: Método de conveniência para mostrar stats completas (SEM resumo executivo)
     def show_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True):
         """
-        🎯 Mostra todas as estatísticas de forma organizada
+        🎯 Mostra todas as estatísticas de forma organizada (global primeiro, depois batch)
         """
         complete_stats = self.get_complete_stats(batch_result, include_global)
         
@@ -949,24 +902,18 @@ class AIProcessor:
         print("🎯 RELATÓRIO COMPLETO DE ESTATÍSTICAS")
         print("=" * 80)
         
-        # Resumo executivo
-        if 'executive_summary' in complete_stats:
-            print(complete_stats['executive_summary'])
-            print()
-        
-        # Stats do batch
-        if 'batch' in complete_stats:
-            print(complete_stats['batch']['summary'])
-            print()
-        
-        # Stats globais
+        # 1. STATS GLOBAIS PRIMEIRO
         if 'global' in complete_stats:
             print(complete_stats['global']['summary'])
             print()
+            print(complete_stats['global']['rate_limiter']['summary'])
+            print()
         
-        # Rate limiter
-        if 'rate_limiter' in complete_stats:
-            print(complete_stats['rate_limiter']['summary'])
+        # 2. STATS DO BATCH
+        if 'batch' in complete_stats:
+            print(complete_stats['batch']['summary'])
+            print()
+            print(complete_stats['batch']['rate_limiter']['summary'])
             print()
         
         print("=" * 80)
