@@ -598,7 +598,7 @@ class AIProcessor:
         **kwargs
     ) -> Dict[str, Any]:
         """
-        ✅ CORREÇÃO COMPLETA: Processamento com logs sincronizados e sem duplicação
+        ✅ CORREÇÃO FINAL: Processamento híbrido com logs incrementais
         """
         
         # Usar batch_id customizado ou gerar automaticamente
@@ -608,15 +608,9 @@ class AIProcessor:
         if custom_ids and len(custom_ids) != len(texts):
             raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
         
-        # ✅ CONTROLE CENTRALIZADO DE ESTADO
-        batch_state = {
-            'total_successful': 0,
-            'logged_progress': set(),
-            'rate_limit_in_progress': False,
-            'last_logged_progress': 0
-        }
-        
-        # Lock para sincronização de logs
+        # ✅ CONTROLE DE ESTADO SIMPLIFICADO
+        total_successful = 0
+        logged_progress = set()
         progress_lock = asyncio.Lock()
         
         # Inicializar rate limiter para o batch
@@ -638,19 +632,13 @@ class AIProcessor:
             }
         )
         
-        # ✅ FUNÇÃO AUXILIAR PARA LOG DE PROGRESSO SINCRONIZADO
-        async def log_progress_if_needed(current_successful: int, force: bool = False):
+        # ✅ FUNÇÃO PARA LOG DE PROGRESSO
+        async def log_progress(current_successful: int):
             async with progress_lock:
                 progress_intervals = self._calculate_progress_intervals(len(texts))
                 
-                should_log = (
-                    current_successful in progress_intervals and 
-                    current_successful not in batch_state['logged_progress']
-                ) or force
-                
-                if should_log and current_successful > batch_state['last_logged_progress']:
-                    batch_state['logged_progress'].add(current_successful)
-                    batch_state['last_logged_progress'] = current_successful
+                if current_successful in progress_intervals and current_successful not in logged_progress:
+                    logged_progress.add(current_successful)
                     
                     elapsed = time.time() - start_time
                     rate = current_successful / elapsed if elapsed > 0 else 0
@@ -673,13 +661,13 @@ class AIProcessor:
                         }
                     )
         
-        # ✅ PROCESSAMENTO SEQUENCIAL POR RODADAS
+        # ✅ PROCESSAMENTO HÍBRIDO: as_completed com controle de rate limit
         all_results = [None] * len(texts)
         pending_items = list(enumerate(texts))
         start_time = time.time()
         
         while pending_items:
-            # ✅ CRIAR TASKS PARA RODADA ATUAL
+            # ✅ CRIAR TASKS PARA TODOS OS ITENS PENDENTES
             current_tasks = []
             current_indices = []
             
@@ -689,88 +677,74 @@ class AIProcessor:
                 current_tasks.append(task)
                 current_indices.append(i)
             
-            # ✅ AGUARDAR TODAS AS TASKS DA RODADA SIMULTANEAMENTE
-            try:
-                current_results = await asyncio.gather(*current_tasks, return_exceptions=True)
-            except Exception as e:
-                logger.error(f"Erro crítico na rodada: {e}", extra={'batch_id': batch_id, 'action': 'batch_round_error'})
-                continue
-            
-            # ✅ PROCESSAR RESULTADOS DE FORMA SINCRONIZADA
+            # ✅ PROCESSAR COM as_completed PARA LOGS INCREMENTAIS
             rate_limit_indices = []
-            rate_limit_detected_this_round = False
-            new_successes = 0
+            rate_limit_detected = False
+            completed_in_round = 0
             
-            for task_idx, result in enumerate(current_results):
-                original_index = current_indices[task_idx]
-                
-                # Tratar exceções
-                if isinstance(result, Exception):
+            for coro in asyncio.as_completed(current_tasks):
+                try:
+                    result = await coro
+                    task_idx = current_tasks.index(coro)
+                    original_index = current_indices[task_idx]
+                    completed_in_round += 1
+                    
+                    # ✅ VERIFICAR RATE LIMIT
+                    if not result.get('success', False) and is_rate_limit_error(result):
+                        rate_limit_indices.append(original_index)
+                        
+                        # ✅ REGISTRAR RATE LIMIT APENAS UMA VEZ
+                        if not rate_limit_detected:
+                            rate_limit_detected = True
+                            wait_time = self._extract_wait_time_from_error_result(result)
+                            
+                            # Delegar para rate limiter
+                            self.rate_limiter.record_api_rate_limit_with_context(
+                                wait_time, total_successful, len(texts), total_successful, 0
+                            )
+                    else:
+                        # ✅ RESULTADO DEFINITIVO
+                        all_results[original_index] = result
+                        if result.get('success', False):
+                            total_successful += 1
+                            
+                            # ✅ LOG DE PROGRESSO INCREMENTAL
+                            await log_progress(total_successful)
+                        
+                        # Notificar rate limiter sobre sucesso
+                        if result.get('success', False):
+                            self.rate_limiter.record_successful_request()
+                    
+                except Exception as e:
                     logger.error(
-                        f"Erro em task do lote: {result}",
+                        f"Erro em task do lote: {e}",
                         extra={
                             'batch_id': batch_id,
-                            'error': str(result),
-                            'error_type': type(result).__name__,
+                            'error': str(e),
+                            'error_type': type(e).__name__,
                             'action': 'batch_task_error'
                         }
                     )
+                    # Encontrar índice da task que falhou
+                    task_idx = current_tasks.index(coro)
+                    original_index = current_indices[task_idx]
                     all_results[original_index] = {
                         'content': None,
                         'success': False,
-                        'error': str(result),
-                        'error_type': type(result).__name__
+                        'error': str(e),
+                        'error_type': type(e).__name__
                     }
-                    continue
-                
-                # ✅ VERIFICAR RATE LIMIT
-                if not result.get('success', False) and is_rate_limit_error(result):
-                    rate_limit_indices.append(original_index)
-                    
-                    # ✅ REGISTRAR RATE LIMIT APENAS UMA VEZ POR RODADA
-                    if not rate_limit_detected_this_round:
-                        rate_limit_detected_this_round = True
-                        batch_state['rate_limit_in_progress'] = True
-                        wait_time = self._extract_wait_time_from_error_result(result)
-                        
-                        # Delegar para rate limiter
-                        self.rate_limiter.record_api_rate_limit_with_context(
-                            wait_time, batch_state['total_successful'], len(texts), batch_state['total_successful'], 0
-                        )
-                else:
-                    # ✅ RESULTADO DEFINITIVO (sucesso ou falha real)
-                    all_results[original_index] = result
-                    if result.get('success', False):
-                        new_successes += 1
-                    
-                    # Notificar rate limiter sobre sucesso
-                    if result.get('success', False):
-                        self.rate_limiter.record_successful_request()
-            
-            # ✅ ATUALIZAR CONTADOR GLOBAL
-            batch_state['total_successful'] += new_successes
-            
-            # ✅ LOG DE PROGRESSO SINCRONIZADO
-            if new_successes > 0:
-                await log_progress_if_needed(batch_state['total_successful'])
             
             # ✅ PREPARAR PRÓXIMA RODADA
             if rate_limit_indices:
                 # Filtrar apenas rate limits para reprocessamento
                 pending_items = [(i, texts[i]) for i in rate_limit_indices]
                 
-                # ✅ AGUARDAR BREVEMENTE PARA EVITAR SPAM
-                await asyncio.sleep(0.5)
-                
-                # Reset do flag de rate limit
-                batch_state['rate_limit_in_progress'] = False
+                # ✅ AGUARDAR BREVEMENTE
+                await asyncio.sleep(0.1)
             else:
                 # Não há mais rate limits, finalizar
                 pending_items = []
-        
-        # ✅ LOG FINAL DE PROGRESSO SE NECESSÁRIO
-        if batch_state['total_successful'] == len(texts):
-            await log_progress_if_needed(batch_state['total_successful'], force=True)
         
         # Filtrar resultados válidos
         final_results = [r for r in all_results if r is not None]
