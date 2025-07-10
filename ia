@@ -46,15 +46,6 @@ def is_rate_limit_error(result: Dict[str, Any]) -> bool:
 class AIProcessor:
     """
     Processador de IA com AsyncIaraGenAI, rate limiting adaptativo e logs organizados
-    
-    Características:
-    - Usa AsyncIaraGenAI da biblioteca iaragenai
-    - Rate limiting coordenado com logs organizados por responsabilidade
-    - Processamento paralelo com controle de concorrência
-    - Calibração adaptativa de estimativas de tokens
-    - Métricas detalhadas de performance
-    - Suporte a JSON Schema estruturado
-    - Retry apenas para rate limits (token rate limit)
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -87,6 +78,8 @@ class AIProcessor:
         
         # Gerenciador de estatísticas
         self.stats_manager = StatsManager()
+        # ✅ CORREÇÃO 1: Informar limite de concorrência ao stats_manager
+        self.stats_manager.set_max_concurrent(self.max_concurrent)
         
         # Encoder para estimativa de tokens
         try:
@@ -513,7 +506,7 @@ class AIProcessor:
                     retry_count=max(0, result.get('attempts', 1) - 1),
                     api_rate_limit_detected=False,
                     coordinated_wait_time=0.0,
-                    model=self.model  # Passar modelo
+                    model=self.model
                 )
             
             # Log baseado no resultado - não logar rate limits como erro individual
@@ -706,6 +699,9 @@ class AIProcessor:
                             if not rate_limit_detected:
                                 rate_limit_detected = True
                                 wait_time = self._extract_wait_time_from_error_result(result)
+                                
+                                # ✅ CORREÇÃO 2: Registrar rate limit no stats_manager
+                                self.stats_manager.record_global_rate_limit_activation(wait_time, len(rate_limit_indices))
                                 
                                 # Delegar para rate limiter
                                 self.rate_limiter.record_api_rate_limit_with_context(
