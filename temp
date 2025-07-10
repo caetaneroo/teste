@@ -5,7 +5,7 @@ async def _make_api_call(
     request_id: str = None
 ) -> Dict[str, Any]:
     """
-    Faz chamada à API com AsyncIaraGenAI e lógica assíncrona corrigida
+    Wrapper robusto para AsyncIaraGenAI com proteção total contra list index out of range
     """
     
     if not request_id:
@@ -13,16 +13,11 @@ async def _make_api_call(
     
     # Validar entrada
     if not messages or not isinstance(messages, list):
-        return {
-            'content': None,
-            'tokens_used': 0,
-            'success': False,
-            'error': 'Messages inválidas',
-            'error_type': 'ValidationError',
-            'request_id': request_id
-        }
+        return self._create_error_result(
+            'Messages inválidas', 'ValidationError', request_id
+        )
     
-    # ✅ PREPARAR PARÂMETROS ANTES DO ASYNC
+    # Preparar parâmetros
     api_params = {
         "model": self.model,
         "messages": messages,
@@ -35,297 +30,406 @@ async def _make_api_call(
     if json_schema and isinstance(json_schema, dict):
         api_params["response_format"] = self._prepare_json_schema(json_schema)
     
-    # Validar parâmetros
-    validation = self._validate_api_params(api_params)
-    if not validation['valid']:
-        return {
-            'content': None,
-            'tokens_used': 0,
-            'success': False,
-            'error': f"Parâmetros inválidos: {', '.join(validation['errors'])}",
-            'error_type': 'ValidationError',
-            'request_id': request_id
-        }
-    
-    # Estimar tokens necessários
+    # Estimar tokens e rate limiting
     base_estimate = self.estimate_tokens(messages)
-    
-    # ✅ RATE LIMITING FORA DO SEMÁFORO
     calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
     
-    # ✅ CONTROLE DE CONCORRÊNCIA SIMPLIFICADO
+    # Controle de concorrência
     concurrent_started = False
     
     try:
-        # Registrar início de requisição concorrente
         self.stats_manager.record_concurrent_start()
         concurrent_started = True
         
-        # ✅ RETRY LOGIC FORA DO SEMÁFORO
-        last_error = None
-        
+        # ✅ RETRY COM PROTEÇÃO TOTAL
         for attempt_num in range(1, MAX_RETRY + 1):
             try:
-                # ✅ SEMÁFORO APENAS PARA A CHAMADA DA API
                 async with self.semaphore:
-                    # Rate limiting adicional para tentativas > 1
                     if attempt_num > 1:
                         await self.rate_limiter.wait_for_tokens(base_estimate)
-                        await asyncio.sleep(0.1)  # Pequeno delay entre tentativas
+                        await asyncio.sleep(0.2)  # Delay maior entre tentativas
                     
                     start_time = time.time()
                     
-                    # Log da tentativa
-                    logger.debug(
-                        f"Tentativa {attempt_num}/{MAX_RETRY} - Chamada à API",
-                        extra={
-                            'request_id': request_id,
-                            'attempt_number': attempt_num,
-                            'base_estimate': base_estimate,
-                            'calibrated_estimate': calibrated_estimate,
-                            'action': 'api_call_attempt'
-                        }
-                    )
-                    
-                    # ✅ CHAMADA À API ISOLADA
+                    # ✅ CHAMADA PROTEGIDA COM TIMEOUT
                     try:
-                        response = await self.client.chat.completions.create(**api_params)
+                        response = await asyncio.wait_for(
+                            self.client.chat.completions.create(**api_params),
+                            timeout=30.0  # Timeout de 30 segundos
+                        )
+                    except asyncio.TimeoutError:
+                        raise Exception("Timeout na chamada da API (30s)")
                     except Exception as api_error:
-                        end_time = time.time()
-                        api_response_time = end_time - start_time
-                        
-                        # Contexto detalhado do erro
-                        error_context = self._get_detailed_error_context(api_error, api_params, request_id)
-                        
-                        # Criar resultado de erro
-                        error_result = {
-                            'content': None,
-                            'tokens_used': 0,
-                            'success': False,
-                            'error': str(api_error),
-                            'error_type': type(api_error).__name__,
-                            'error_line': error_context['error_line'],
-                            'error_file': error_context['error_file'],
-                            'error_function': error_context['error_function'],
-                            'api_response_time': api_response_time,
-                            'attempts': attempt_num,
-                            'request_id': request_id,
-                            'full_traceback': error_context['full_traceback']
-                        }
-                        
-                        # ✅ VERIFICAR SE É RATE LIMIT
-                        if is_rate_limit_error(error_result):
-                            logger.debug(
-                                f"Rate limit detectado - tentativa {attempt_num}",
-                                extra={
-                                    'request_id': request_id,
-                                    'attempt_number': attempt_num,
-                                    'action': 'rate_limit_detected'
-                                }
-                            )
-                            
-                            # Se não é a última tentativa, continua o loop
-                            if attempt_num < MAX_RETRY:
-                                last_error = error_result
-                                continue
-                            else:
-                                # Última tentativa, retorna erro
-                                return error_result
-                        else:
-                            # Erro não é rate limit, retorna imediatamente
-                            return error_result
+                        # Log detalhado do erro da API
+                        logger.error(
+                            f"Erro na API AsyncIaraGenAI - Tentativa {attempt_num}: {str(api_error)}",
+                            extra={
+                                'request_id': request_id,
+                                'attempt': attempt_num,
+                                'api_error_type': type(api_error).__name__,
+                                'api_params_model': api_params.get('model'),
+                                'api_params_messages_count': len(api_params.get('messages', [])),
+                                'action': 'api_call_error'
+                            }
+                        )
+                        raise api_error
                     
                     end_time = time.time()
                     api_response_time = end_time - start_time
                 
-                # ✅ PROCESSAMENTO DA RESPOSTA FORA DO SEMÁFORO
-                try:
-                    # Validação robusta da resposta
-                    if not response:
-                        raise ValueError("API retornou resposta None/vazia")
-                    
-                    # Verificar choices
-                    if hasattr(response, 'choices'):
-                        choices = response.choices
-                    elif isinstance(response, dict) and 'choices' in response:
-                        choices = response['choices']
-                    else:
-                        raise ValueError(f"API retornou resposta sem 'choices'. Tipo: {type(response)}")
-                    
-                    if not choices or len(choices) == 0:
-                        raise ValueError("API retornou choices vazio")
-                    
-                    # Extrair content
-                    first_choice = choices[0]
-                    if hasattr(first_choice, 'message'):
-                        message = first_choice.message
-                    elif isinstance(first_choice, dict) and 'message' in first_choice:
-                        message = first_choice['message']
-                    else:
-                        raise ValueError(f"Choice[0] não tem 'message'. Tipo: {type(first_choice)}")
-                    
-                    if hasattr(message, 'content'):
-                        content = message.content
-                    elif isinstance(message, dict) and 'content' in message:
-                        content = message['content']
-                    else:
-                        raise ValueError(f"Message não tem 'content'. Tipo: {type(message)}")
-                    
-                    # Extrair usage
-                    tokens_used = 0
-                    input_tokens = 0
-                    output_tokens = 0
-                    
-                    try:
-                        if hasattr(response, 'usage') and response.usage:
-                            usage = response.usage
-                            tokens_used = getattr(usage, 'total_tokens', 0)
-                            input_tokens = getattr(usage, 'prompt_tokens', 0)
-                            output_tokens = getattr(usage, 'completion_tokens', 0)
-                        elif isinstance(response, dict) and 'usage' in response:
-                            usage = response['usage']
-                            tokens_used = usage.get('total_tokens', 0)
-                            input_tokens = usage.get('prompt_tokens', 0)
-                            output_tokens = usage.get('completion_tokens', 0)
-                    except Exception as usage_error:
-                        logger.warning(
-                            f"Erro ao extrair usage: {usage_error}",
-                            extra={'request_id': request_id, 'action': 'usage_extraction_error'}
-                        )
-                    
-                    # Registrar tokens no rate limiter
-                    if tokens_used > 0:
-                        self.rate_limiter.record_tokens(tokens_used)
-                        self.rate_limiter.record_token_usage(base_estimate, tokens_used)
-                    
-                    # Calcular custo
-                    cost = self.calculate_cost(input_tokens, output_tokens)
-                    
-                    # Processar JSON se necessário
-                    parsed_content = content
-                    if json_schema and isinstance(json_schema, dict) and content:
-                        try:
-                            parsed_content = json.loads(content)
-                        except json.JSONDecodeError:
-                            parsed_content = content
-                    
-                    # Log de sucesso
-                    logger.debug(
-                        "Chamada à API bem-sucedida",
-                        extra={
-                            'request_id': request_id,
-                            'attempt_number': attempt_num,
-                            'tokens_used': tokens_used,
-                            'api_response_time': round(api_response_time, 3),
-                            'action': 'api_call_success'
-                        }
-                    )
-                    
-                    # ✅ RETORNO DE SUCESSO
-                    return {
-                        'content': parsed_content,
-                        'raw_content': content,
-                        'tokens_used': tokens_used,
-                        'input_tokens': input_tokens,
-                        'output_tokens': output_tokens,
-                        'cached_tokens': 0,
-                        'cost': cost,
-                        'api_response_time': api_response_time,
-                        'success': True,
-                        'is_json': json_schema is not None,
-                        'attempts': attempt_num,
-                        'request_id': request_id
-                    }
-                    
-                except Exception as processing_error:
-                    # Erro no processamento da resposta
-                    error_context = self._get_detailed_error_context(processing_error, api_params, request_id)
-                    
-                    logger.error(
-                        f"Erro no processamento da resposta - {error_context['error_file']}:{error_context['error_line']}: {processing_error}",
-                        extra={
-                            'request_id': request_id,
-                            'error_context': error_context,
-                            'response_type': str(type(response)),
-                            'action': 'response_processing_error'
-                        }
-                    )
-                    
-                    return {
-                        'content': None,
-                        'tokens_used': 0,
-                        'success': False,
-                        'error': str(processing_error),
-                        'error_type': type(processing_error).__name__,
-                        'error_line': error_context['error_line'],
-                        'error_file': error_context['error_file'],
-                        'error_function': error_context['error_function'],
-                        'api_response_time': api_response_time,
-                        'attempts': attempt_num,
-                        'request_id': request_id,
-                        'full_traceback': error_context['full_traceback']
-                    }
+                # ✅ PROCESSAMENTO ULTRA-DEFENSIVO DA RESPOSTA
+                result = self._process_response_safely(
+                    response, api_response_time, base_estimate, 
+                    calibrated_estimate, json_schema, attempt_num, request_id
+                )
                 
+                if result['success']:
+                    return result
+                else:
+                    # Se não é rate limit, retorna erro imediatamente
+                    if not is_rate_limit_error(result):
+                        return result
+                    
+                    # Se é rate limit e não é última tentativa, continua
+                    if attempt_num < MAX_RETRY:
+                        logger.debug(f"Rate limit - tentativa {attempt_num}, continuando...")
+                        continue
+                    else:
+                        return result
+                        
             except Exception as attempt_error:
-                # Erro na tentativa
-                last_error = {
-                    'content': None,
-                    'tokens_used': 0,
-                    'success': False,
-                    'error': str(attempt_error),
-                    'error_type': type(attempt_error).__name__,
-                    'attempts': attempt_num,
-                    'request_id': request_id
-                }
+                error_result = self._create_error_result(
+                    str(attempt_error), type(attempt_error).__name__, 
+                    request_id, attempt_num, api_response_time if 'api_response_time' in locals() else 0.0
+                )
                 
-                # Se não é rate limit ou é a última tentativa, retorna erro
-                if not is_rate_limit_error(last_error) or attempt_num >= MAX_RETRY:
-                    return last_error
+                # Se não é rate limit ou é última tentativa, retorna
+                if not is_rate_limit_error(error_result) or attempt_num >= MAX_RETRY:
+                    return error_result
                 
                 # Continua para próxima tentativa
                 continue
         
         # Se chegou aqui, todas as tentativas falharam
-        if last_error:
-            return last_error
-        else:
-            return {
-                'content': None,
-                'tokens_used': 0,
-                'success': False,
-                'error': 'Máximo de tentativas excedido',
-                'error_type': 'RetryError',
-                'attempts': MAX_RETRY,
-                'request_id': request_id
-            }
-            
-    except Exception as e:
-        # Erro inesperado
-        error_context = self._get_detailed_error_context(e, api_params, request_id)
+        return self._create_error_result(
+            'Máximo de tentativas excedido', 'RetryError', request_id, MAX_RETRY
+        )
         
-        logger.error(
-            f"Erro inesperado - {error_context['error_file']}:{error_context['error_line']}: {e}",
+    except Exception as e:
+        error_context = self._get_detailed_error_context(e, api_params, request_id)
+        return self._create_error_result(
+            str(e), type(e).__name__, request_id, 
+            error_line=error_context['error_line'],
+            error_file=error_context['error_file'],
+            error_function=error_context['error_function'],
+            full_traceback=error_context['full_traceback']
+        )
+        
+    finally:
+        if concurrent_started:
+            self.stats_manager.record_concurrent_end()
+
+def _process_response_safely(
+    self, 
+    response, 
+    api_response_time: float,
+    base_estimate: int,
+    calibrated_estimate: int,
+    json_schema: Optional[Dict[str, Any]],
+    attempt_num: int,
+    request_id: str
+) -> Dict[str, Any]:
+    """
+    Processa resposta da API com proteção total contra erros de estrutura
+    """
+    try:
+        # ✅ VALIDAÇÃO DEFENSIVA TOTAL
+        if response is None:
+            return self._create_error_result(
+                "API retornou None", "NullResponseError", request_id, attempt_num, api_response_time
+            )
+        
+        # ✅ LOG DE DEBUGGING DETALHADO
+        logger.debug(
+            f"Processando resposta - Tipo: {type(response)}",
             extra={
                 'request_id': request_id,
-                'error_context': error_context,
-                'action': 'unexpected_error'
+                'response_type': str(type(response)),
+                'response_attributes': [attr for attr in dir(response) if not attr.startswith('_')],
+                'response_str_preview': str(response)[:500],
+                'action': 'response_processing_start'
             }
         )
         
+        # ✅ EXTRAÇÃO DEFENSIVA DE CHOICES
+        choices = None
+        
+        # Método 1: Atributo choices
+        if hasattr(response, 'choices'):
+            choices = getattr(response, 'choices', None)
+            logger.debug(f"Choices via atributo: {type(choices)}, length: {len(choices) if choices else 'N/A'}")
+        
+        # Método 2: Dicionário choices
+        elif isinstance(response, dict) and 'choices' in response:
+            choices = response.get('choices')
+            logger.debug(f"Choices via dict: {type(choices)}, length: {len(choices) if choices else 'N/A'}")
+        
+        # Método 3: Verificar se response é uma lista (caso especial)
+        elif isinstance(response, list) and len(response) > 0:
+            # Algumas APIs retornam lista diretamente
+            choices = response
+            logger.debug(f"Response é lista direta: {type(choices)}, length: {len(choices)}")
+        
+        else:
+            # ✅ LOG DETALHADO PARA DEBUGGING
+            logger.error(
+                "Estrutura de resposta não reconhecida",
+                extra={
+                    'request_id': request_id,
+                    'response_type': str(type(response)),
+                    'response_dir': [attr for attr in dir(response) if not attr.startswith('_')],
+                    'response_str': str(response),
+                    'is_dict': isinstance(response, dict),
+                    'dict_keys': list(response.keys()) if isinstance(response, dict) else 'N/A',
+                    'action': 'unknown_response_structure'
+                }
+            )
+            
+            return self._create_error_result(
+                f"Estrutura de resposta não reconhecida. Tipo: {type(response)}", 
+                "UnknownResponseStructure", request_id, attempt_num, api_response_time
+            )
+        
+        # ✅ VALIDAÇÃO DE CHOICES
+        if choices is None:
+            return self._create_error_result(
+                "Choices é None", "NullChoicesError", request_id, attempt_num, api_response_time
+            )
+        
+        if not isinstance(choices, (list, tuple)):
+            return self._create_error_result(
+                f"Choices não é lista/tuple. Tipo: {type(choices)}", 
+                "InvalidChoicesType", request_id, attempt_num, api_response_time
+            )
+        
+        if len(choices) == 0:
+            return self._create_error_result(
+                "Lista choices está vazia", "EmptyChoicesError", request_id, attempt_num, api_response_time
+            )
+        
+        # ✅ EXTRAÇÃO DEFENSIVA DO PRIMEIRO CHOICE
+        try:
+            first_choice = choices[0]
+        except (IndexError, TypeError) as choice_error:
+            return self._create_error_result(
+                f"Erro ao acessar choices[0]: {choice_error}", 
+                "ChoiceIndexError", request_id, attempt_num, api_response_time
+            )
+        
+        # ✅ EXTRAÇÃO DEFENSIVA DE MESSAGE
+        message = None
+        
+        if hasattr(first_choice, 'message'):
+            message = getattr(first_choice, 'message', None)
+        elif isinstance(first_choice, dict) and 'message' in first_choice:
+            message = first_choice.get('message')
+        else:
+            return self._create_error_result(
+                f"Choice[0] não tem 'message'. Tipo: {type(first_choice)}", 
+                "NoMessageError", request_id, attempt_num, api_response_time
+            )
+        
+        if message is None:
+            return self._create_error_result(
+                "Message é None", "NullMessageError", request_id, attempt_num, api_response_time
+            )
+        
+        # ✅ EXTRAÇÃO DEFENSIVA DE CONTENT
+        content = None
+        
+        if hasattr(message, 'content'):
+            content = getattr(message, 'content', None)
+        elif isinstance(message, dict) and 'content' in message:
+            content = message.get('content')
+        else:
+            return self._create_error_result(
+                f"Message não tem 'content'. Tipo: {type(message)}", 
+                "NoContentError", request_id, attempt_num, api_response_time
+            )
+        
+        # ✅ EXTRAÇÃO DEFENSIVA DE USAGE
+        tokens_used = 0
+        input_tokens = 0
+        output_tokens = 0
+        
+        try:
+            if hasattr(response, 'usage') and response.usage:
+                usage = response.usage
+                tokens_used = getattr(usage, 'total_tokens', 0)
+                input_tokens = getattr(usage, 'prompt_tokens', 0)
+                output_tokens = getattr(usage, 'completion_tokens', 0)
+            elif isinstance(response, dict) and 'usage' in response:
+                usage = response['usage']
+                tokens_used = usage.get('total_tokens', 0)
+                input_tokens = usage.get('prompt_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0)
+        except Exception as usage_error:
+            logger.warning(
+                f"Erro ao extrair usage: {usage_error} - usando valores padrão",
+                extra={'request_id': request_id, 'action': 'usage_extraction_warning'}
+            )
+        
+        # Registrar tokens no rate limiter
+        if tokens_used > 0:
+            self.rate_limiter.record_tokens(tokens_used)
+            self.rate_limiter.record_token_usage(base_estimate, tokens_used)
+        
+        # Calcular custo
+        cost = self.calculate_cost(input_tokens, output_tokens)
+        
+        # Processar JSON se necessário
+        parsed_content = content
+        if json_schema and isinstance(json_schema, dict) and content:
+            try:
+                parsed_content = json.loads(content)
+            except json.JSONDecodeError:
+                parsed_content = content
+        
+        # Log de sucesso
+        logger.debug(
+            "Resposta processada com sucesso",
+            extra={
+                'request_id': request_id,
+                'attempt_number': attempt_num,
+                'tokens_used': tokens_used,
+                'api_response_time': round(api_response_time, 3),
+                'content_length': len(str(content)) if content else 0,
+                'action': 'response_processing_success'
+            }
+        )
+        
+        # ✅ RETORNO DE SUCESSO
         return {
-            'content': None,
-            'tokens_used': 0,
-            'success': False,
-            'error': str(e),
-            'error_type': type(e).__name__,
-            'error_line': error_context['error_line'],
-            'error_file': error_context['error_file'],
-            'error_function': error_context['error_function'],
-            'request_id': request_id,
-            'full_traceback': error_context['full_traceback']
+            'content': parsed_content,
+            'raw_content': content,
+            'tokens_used': tokens_used,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'cached_tokens': 0,
+            'cost': cost,
+            'api_response_time': api_response_time,
+            'success': True,
+            'is_json': json_schema is not None,
+            'attempts': attempt_num,
+            'request_id': request_id
         }
         
-    finally:
-        # ✅ CLEANUP GARANTIDO
-        if concurrent_started:
-            self.stats_manager.record_concurrent_end()
+    except Exception as processing_error:
+        error_context = self._get_detailed_error_context(processing_error, {}, request_id)
+        
+        logger.error(
+            f"Erro no processamento da resposta: {processing_error}",
+            extra={
+                'request_id': request_id,
+                'processing_error': str(processing_error),
+                'error_context': error_context,
+                'action': 'response_processing_error'
+            }
+        )
+        
+        return self._create_error_result(
+            f"Erro no processamento: {processing_error}", 
+            type(processing_error).__name__, 
+            request_id, attempt_num, api_response_time,
+            error_line=error_context['error_line'],
+            error_file=error_context['error_file'],
+            error_function=error_context['error_function'],
+            full_traceback=error_context['full_traceback']
+        )
+
+def _create_error_result(
+    self, 
+    error_message: str, 
+    error_type: str, 
+    request_id: str, 
+    attempts: int = 1,
+    api_response_time: float = 0.0,
+    error_line: Optional[int] = None,
+    error_file: Optional[str] = None,
+    error_function: Optional[str] = None,
+    full_traceback: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Cria resultado de erro padronizado
+    """
+    result = {
+        'content': None,
+        'raw_content': None,
+        'tokens_used': 0,
+        'input_tokens': 0,
+        'output_tokens': 0,
+        'cached_tokens': 0,
+        'cost': 0.0,
+        'api_response_time': api_response_time,
+        'success': False,
+        'error': error_message,
+        'error_type': error_type,
+        'is_json': False,
+        'attempts': attempts,
+        'request_id': request_id
+    }
+    
+    if error_line is not None:
+        result['error_line'] = error_line
+    if error_file is not None:
+        result['error_file'] = error_file
+    if error_function is not None:
+        result['error_function'] = error_function
+    if full_traceback is not None:
+        result['full_traceback'] = full_traceback
+    
+    return result
+
+
+def _validate_iara_api_params(self, api_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validação específica para AsyncIaraGenAI
+    """
+    validation_result = {
+        'valid': True,
+        'errors': [],
+        'warnings': []
+    }
+    
+    # Verificar modelo suportado
+    supported_models = [
+        'gpt-35-turbo', 'gpt-35-turbo-16k', 'gpt-4', 'gpt-4-32k',
+        'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini'
+    ]
+    
+    model = api_params.get('model', '')
+    if model not in supported_models:
+        validation_result['warnings'].append(f'Modelo {model} pode não ser suportado')
+    
+    # Validar mensagens
+    messages = api_params.get('messages', [])
+    if not messages:
+        validation_result['valid'] = False
+        validation_result['errors'].append('Lista de mensagens vazia')
+    
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            validation_result['valid'] = False
+            validation_result['errors'].append(f'Mensagem {i} deve ser dict')
+            continue
+            
+        if 'role' not in msg or 'content' not in msg:
+            validation_result['valid'] = False
+            validation_result['errors'].append(f'Mensagem {i} deve ter role e content')
+        
+        valid_roles = ['system', 'user', 'assistant']
+        if msg.get('role') not in valid_roles:
+            validation_result['valid'] = False
+            validation_result['errors'].append(f'Role inválido na mensagem {i}: {msg.get("role")}')
+    
+    return validation_result
