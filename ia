@@ -61,22 +61,19 @@ class AIProcessor:
         # Configurações de autenticação
         self.client_id = config['client_id']
         self.client_secret = config['client_secret']
-        self.environment = config.get('environment', 'dev')
-        self.provider = config.get('provider', 'azure-openai')
-        self.correlation_id = config.get('correlation_id', 'teste-ia-biatendimento')
         
         # Configurações do modelo
         self.model = config.get('model', 'gpt-35-turbo-16k')
         self.temperature = config.get('temperature', 0.1)
         self.max_tokens = config.get('max_tokens')
         
-        # ✅ CLIENTE AsyncIaraGenAI
+        # ✅ CORREÇÃO 1: Cliente AsyncIaraGenAI com parâmetros diretos
         self.client = AsyncIaraGenAI(
             client_id=self.client_id,
             client_secret=self.client_secret,
-            environment=self.environment,
-            provider=self.provider,
-            correlation_id=self.correlation_id
+            environment=config.get('environment', 'dev'),
+            provider=config.get('provider', 'azure-openai'),
+            correlation_id=config.get('correlation_id', 'teste-ia-biatendimento')
         )
         
         # Controle de concorrência
@@ -105,8 +102,8 @@ class AIProcessor:
                 'max_concurrent': self.max_concurrent,
                 'max_tpm': max_tpm,
                 'calibration_enabled': calibration_enabled,
-                'provider': self.provider,
-                'environment': self.environment,
+                'provider': config.get('provider', 'azure-openai'),
+                'environment': config.get('environment', 'dev'),
                 'action': 'ai_processor_init'
             }
         )
@@ -467,7 +464,6 @@ class AIProcessor:
             }
             
         finally:
-            # ✅ CORREÇÃO 1: Indentação correta do finally
             # Registrar fim de requisição concorrente
             self.stats_manager.record_concurrent_end()
     
@@ -502,20 +498,21 @@ class AIProcessor:
             result['processing_time'] = processing_time
             result['custom_id'] = custom_id
             
-            # Registrar no StatsManager
+            # Registrar no StatsManager apenas se não for rate limit
             api_rate_limit_detected = is_rate_limit_error(result)
             
-            self.stats_manager.record_request(
-                success=result.get('success', False),
-                tokens_input=result.get('input_tokens', 0),
-                tokens_output=result.get('output_tokens', 0),
-                tokens_cached=result.get('cached_tokens', 0),
-                cost=result.get('cost', 0.0),
-                api_response_time=result.get('api_response_time', 0.0),
-                error_type=result.get('error_type'),
-                retry_count=max(0, result.get('attempts', 1) - 1),
-                api_rate_limit_detected=api_rate_limit_detected
-            )
+            if not api_rate_limit_detected:
+                self.stats_manager.record_request(
+                    success=result.get('success', False),
+                    tokens_input=result.get('input_tokens', 0),
+                    tokens_output=result.get('output_tokens', 0),
+                    tokens_cached=result.get('cached_tokens', 0),
+                    cost=result.get('cost', 0.0),
+                    api_response_time=result.get('api_response_time', 0.0),
+                    error_type=result.get('error_type'),
+                    retry_count=max(0, result.get('attempts', 1) - 1),
+                    api_rate_limit_detected=False
+                )
             
             # ✅ CORREÇÃO 2: Log baseado no resultado - não logar rate limits como erro individual
             if result.get('success'):
@@ -547,15 +544,18 @@ class AIProcessor:
             end_time = time.time()
             processing_time = end_time - start_time
             
-            logger.error(
-                f"Erro inesperado no processamento individual: {e}",
-                extra={
-                    'request_id': request_id,
-                    'processing_time': round(processing_time, 3),
-                    'error': str(e),
-                    'action': 'single_process_unexpected_error'
-                }
-            )
+            # ✅ CORREÇÃO 2: Verificar se é rate limit antes de logar como erro inesperado
+            error_str = str(e).lower()
+            if 'token rate limit' not in error_str:
+                logger.error(
+                    f"Erro inesperado no processamento individual: {e}",
+                    extra={
+                        'request_id': request_id,
+                        'processing_time': round(processing_time, 3),
+                        'error': str(e),
+                        'action': 'single_process_unexpected_error'
+                    }
+                )
             
             return {
                 'content': None,
@@ -598,7 +598,7 @@ class AIProcessor:
         **kwargs
     ) -> Dict[str, Any]:
         """
-        ✅ CORREÇÃO 2: Processa múltiplos textos com reprocessamento de rate limits
+        ✅ CORREÇÃO 3: Processa múltiplos textos com contagem correta de sucessos
         """
         
         # Usar batch_id customizado ou gerar automaticamente
@@ -627,11 +627,12 @@ class AIProcessor:
             }
         )
         
-        # ✅ NOVA LÓGICA: Processamento com reprocessamento de rate limits
-        all_results = []
+        # ✅ CORREÇÃO 3: Nova lógica de contagem - apenas sucessos acumulados
+        all_results = [None] * len(texts)  # Lista com posições fixas
         pending_items = list(enumerate(texts))  # Lista de (índice, texto) pendentes
         progress_intervals = self._calculate_progress_intervals(len(texts))
-        completed_count = 0
+        total_successful = 0  # ✅ Contador global de sucessos
+        completed_requests = 0  # Contador de requests processadas (incluindo rate limits)
         start_time = time.time()
         
         while pending_items:
@@ -646,15 +647,13 @@ class AIProcessor:
                 current_indices.append(i)
             
             # Executar tasks atuais
-            current_results = []
             rate_limit_indices = []
             
-            for idx, coro in enumerate(asyncio.as_completed(current_tasks)):
+            for task_idx, coro in enumerate(asyncio.as_completed(current_tasks)):
                 try:
                     result = await coro
-                    original_index = current_indices[idx]
-                    current_results.append((original_index, result))
-                    completed_count += 1
+                    original_index = current_indices[task_idx]
+                    completed_requests += 1
                     
                     # Verificar se é rate limit
                     if not result.get('success', False) and is_rate_limit_error(result):
@@ -662,38 +661,37 @@ class AIProcessor:
                         wait_time = self._extract_wait_time_from_error_result(result)
                         
                         # Delegar para rate limiter
-                        successful_so_far = sum(1 for _, r in current_results if r.get('success', False))
-                        failed_so_far = len(current_results) - successful_so_far
-                        
                         self.rate_limiter.record_api_rate_limit_with_context(
-                            wait_time, completed_count, len(texts), successful_so_far, failed_so_far
+                            wait_time, completed_requests, len(texts), total_successful, 0
                         )
                     else:
+                        # Resultado definitivo (sucesso ou falha real)
+                        all_results[original_index] = result
+                        if result.get('success', False):
+                            total_successful += 1
+                        
                         # Notificar rate limiter sobre sucesso
                         self.rate_limiter.record_successful_request()
                     
-                    # Log de progresso a cada 5
-                    if completed_count in progress_intervals:
+                    # ✅ CORREÇÃO 3: Log de progresso apenas com sucessos acumulados
+                    if total_successful in progress_intervals or (total_successful == len(texts)):
                         elapsed = time.time() - start_time
-                        rate = completed_count / elapsed if elapsed > 0 else 0
-                        eta = (len(texts) - completed_count) / rate if rate > 0 else 0
-                        
-                        successful_so_far = sum(1 for _, r in current_results if r.get('success', False))
-                        failed_so_far = len(current_results) - successful_so_far
+                        rate = total_successful / elapsed if elapsed > 0 else 0
+                        eta = (len(texts) - total_successful) / rate if rate > 0 else 0
                         
                         logger.info(
-                            f"📊 Progresso: {completed_count}/{len(texts)} ({completed_count/len(texts)*100:.1f}%) | "
-                            f"✅{successful_so_far} ❌{failed_so_far} | "
+                            f"📊 Progresso: {total_successful}/{len(texts)} ({total_successful/len(texts)*100:.1f}%) | "
+                            f"✅{total_successful} ❌0 | "
                             f"⏱️ETA: {eta/60:.1f}min",
                             extra={
                                 'batch_id': batch_id,
-                                'completed': completed_count,
+                                'completed': total_successful,
                                 'total': len(texts),
-                                'successful_so_far': successful_so_far,
-                                'failed_so_far': failed_so_far,
+                                'successful_so_far': total_successful,
+                                'failed_so_far': 0,
                                 'processing_rate': round(rate, 2),
                                 'eta_minutes': round(eta / 60, 1),
-                                'progress_percent': round((completed_count / len(texts)) * 100, 1),
+                                'progress_percent': round((total_successful / len(texts)) * 100, 1),
                                 'action': 'batch_progress'
                             }
                         )
@@ -703,41 +701,34 @@ class AIProcessor:
                         f"Erro em task do lote - continuando...",
                         extra={
                             'batch_id': batch_id,
-                            'completed': completed_count,
+                            'completed': completed_requests,
                             'error': str(e),
                             'error_type': type(e).__name__,
                             'action': 'batch_task_error'
                         }
                     )
-                    original_index = current_indices[idx]
-                    current_results.append((original_index, {
+                    original_index = current_indices[task_idx]
+                    all_results[original_index] = {
                         'content': None,
                         'success': False,
                         'error': str(e),
                         'error_type': type(e).__name__
-                    }))
-                    completed_count += 1
+                    }
+                    completed_requests += 1
             
-            # Adicionar resultados atuais à lista final
-            all_results.extend(current_results)
-            
-            # ✅ NOVA LÓGICA: Preparar próxima iteração apenas com rate limits
+            # ✅ Preparar próxima iteração apenas com rate limits
             if rate_limit_indices:
                 # Filtrar apenas os itens que deram rate limit para reprocessamento
                 pending_items = [(i, texts[i]) for i in rate_limit_indices]
                 
-                # Resetar contador para não contar rate limits como progresso
-                completed_count -= len(rate_limit_indices)
-                
-                # Remover resultados de rate limit da lista final (serão reprocessados)
-                all_results = [(i, r) for i, r in all_results if i not in rate_limit_indices]
+                # Resetar contador de requests para não contar rate limits
+                completed_requests -= len(rate_limit_indices)
             else:
                 # Não há mais rate limits, finalizar
                 pending_items = []
         
-        # Ordenar resultados pelo índice original
-        all_results.sort(key=lambda x: x[0])
-        final_results = [result for _, result in all_results]
+        # Filtrar resultados válidos (remover None)
+        final_results = [r for r in all_results if r is not None]
         
         # Finalizar batch e obter stats específicas do batch
         batch_stats = self.stats_manager.end_batch(batch_id)
