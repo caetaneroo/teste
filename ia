@@ -140,7 +140,7 @@ class AIProcessor:
     
     def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
         """
-        Calcula custo estimado baseado nos tokens
+        Calcula custo estimado baseado nos tokens (fallback)
         """
         # Preços estimados para GPT-3.5 Turbo (USD por 1K tokens)
         input_cost_per_1k = 0.0015
@@ -306,7 +306,7 @@ class AIProcessor:
                             self.rate_limiter.record_tokens(tokens_used)
                             self.rate_limiter.record_token_usage(base_estimate, tokens_used)
                             
-                            # Calcular custo
+                            # Calcular custo (fallback)
                             cost = self.calculate_cost(input_tokens, output_tokens)
                             
                             # Processar resposta
@@ -498,7 +498,7 @@ class AIProcessor:
             result['processing_time'] = processing_time
             result['custom_id'] = custom_id
             
-            # Registrar no StatsManager apenas se não for rate limit
+            # Registrar no StatsManager com modelo
             api_rate_limit_detected = is_rate_limit_error(result)
             
             if not api_rate_limit_detected:
@@ -511,7 +511,9 @@ class AIProcessor:
                     api_response_time=result.get('api_response_time', 0.0),
                     error_type=result.get('error_type'),
                     retry_count=max(0, result.get('attempts', 1) - 1),
-                    api_rate_limit_detected=False
+                    api_rate_limit_detected=False,
+                    coordinated_wait_time=0.0,
+                    model=self.model  # Passar modelo
                 )
             
             # Log baseado no resultado - não logar rate limits como erro individual
@@ -598,7 +600,7 @@ class AIProcessor:
         **kwargs
     ) -> Dict[str, Any]:
         """
-        ✅ CORREÇÃO FINAL: Processamento com asyncio.wait() para controle correto de tasks
+        Processamento com asyncio.wait() para controle correto de tasks
         """
         
         # Usar batch_id customizado ou gerar automaticamente
@@ -661,7 +663,7 @@ class AIProcessor:
                         }
                     )
         
-        # ✅ CORREÇÃO: Usar asyncio.wait() com FIRST_COMPLETED para controle correto
+        # Usar asyncio.wait() com FIRST_COMPLETED para controle correto
         all_results = [None] * len(texts)
         pending_items = list(enumerate(texts))
         start_time = time.time()
@@ -679,7 +681,7 @@ class AIProcessor:
                 current_tasks.append(task)
                 task_to_index[task] = i
             
-            # ✅ USAR asyncio.wait() com FIRST_COMPLETED para logs incrementais
+            # Usar asyncio.wait() com FIRST_COMPLETED para logs incrementais
             rate_limit_indices = []
             rate_limit_detected = False
             
@@ -784,9 +786,128 @@ class AIProcessor:
             'batch_id': batch_id
         }
     
-    # Métodos de utilidade e estatísticas
+    # ✅ NOVA: Função única de stats consolidada
+    def get_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True) -> Dict[str, Any]:
+        """
+        🎯 FUNÇÃO ÚNICA DE STATS - Consolida todas as métricas em um só lugar
+        
+        Args:
+            batch_result: Resultado de um batch específico (opcional)
+            include_global: Se deve incluir stats globais
+            
+        Returns:
+            Dicionário com todas as métricas organizadas por categoria
+        """
+        complete_stats = {}
+        
+        # 1. STATS DO BATCH (se fornecido)
+        if batch_result and 'batch_stats' in batch_result:
+            batch_stats = batch_result['batch_stats']
+            batch_id = batch_result.get('batch_id', 'unknown')
+            
+            complete_stats['batch'] = {
+                'id': batch_id,
+                'summary': self.stats_manager.format_stats(batch_stats, f"Batch {batch_id}"),
+                'metrics': self.stats_manager.export_stats_json(batch_stats),
+                'efficiency': self.stats_manager.get_efficiency_metrics(batch_stats),
+                'cost_breakdown': self.stats_manager.get_cost_breakdown(batch_stats)
+            }
+        
+        # 2. STATS GLOBAIS (se solicitado)
+        if include_global:
+            global_stats = self.stats_manager.get_global_stats()
+            complete_stats['global'] = {
+                'summary': self.stats_manager.format_stats(global_stats, "Global"),
+                'metrics': self.stats_manager.export_stats_json(global_stats),
+                'efficiency': self.stats_manager.get_efficiency_metrics(global_stats),
+                'cost_breakdown': self.stats_manager.get_cost_breakdown(global_stats)
+            }
+        
+        # 3. STATS DO RATE LIMITER
+        rate_limiter_status = self.rate_limiter.get_status()
+        calibration_stats = self.rate_limiter.get_calibration_stats()
+        
+        complete_stats['rate_limiter'] = {
+            'status': rate_limiter_status,
+            'calibration': calibration_stats,
+            'summary': f"""⚡ RATE LIMITER STATUS:
+   🔢 Tokens usados: {rate_limiter_status['tokens_used']:,}
+   📊 Utilização: {rate_limiter_status['utilization_percent']:.1f}%
+   ⏱️ Tempo no minuto: {rate_limiter_status['time_in_minute']:.1f}s
+   🔄 Total de esperas: {rate_limiter_status['total_waits']}
+   ⏳ Tempo total de espera: {rate_limiter_status['total_wait_time']:.1f}s
+   
+🎯 CALIBRAÇÃO:
+   📊 Precisão: {calibration_stats['accuracy_percentage']:.1f}%
+   🔧 Fator atual: {calibration_stats['current_calibration_factor']:.3f}
+   📈 Total calibrações: {calibration_stats['total_calibrations']}
+   🛡️ Rate limits prevenidos: {calibration_stats['prevented_rate_limits']}
+   🚨 Rate limits detectados: {calibration_stats['api_rate_limits_detected']}"""
+        }
+        
+        # 4. PERFORMANCE CONSOLIDADA
+        if batch_result:
+            batch_stats = batch_result['batch_stats']
+            complete_stats['performance'] = {
+                'throughput': {
+                    'requests_per_second': batch_stats.avg_rate,
+                    'requests_per_minute': batch_stats.avg_rate * 60,
+                    'tokens_per_second': batch_stats.total_tokens / batch_stats.processing_time if batch_stats.processing_time > 0 else 0
+                },
+                'efficiency': {
+                    'success_rate': batch_stats.success_rate,
+                    'time_efficiency': batch_stats.efficiency_rate,
+                    'cache_efficiency': batch_stats.cache_hit_rate,
+                    'coordination_efficiency': batch_stats.coordination_efficiency
+                },
+                'response_times': {
+                    'average': batch_stats.avg_response_time,
+                    'minimum': batch_stats.min_response_time,
+                    'maximum': batch_stats.max_response_time
+                },
+                'concurrency': {
+                    'peak_concurrent': batch_stats.concurrent_peak,
+                    'max_configured': self.max_concurrent
+                }
+            }
+        
+        # 5. RESUMO EXECUTIVO
+        if batch_result:
+            batch_stats = batch_result['batch_stats']
+            total_wait = batch_stats.total_wait_time + batch_stats.coordinated_wait_time
+            
+            complete_stats['executive_summary'] = f"""📈 RESUMO EXECUTIVO:
+   
+✅ RESULTADOS:
+   • {batch_stats.successful_requests} sucessos de {batch_stats.total_requests} requests ({batch_stats.success_rate:.1f}%)
+   • {batch_stats.total_tokens:,} tokens processados
+   • ${batch_stats.total_cost:.4f} de custo total
+   
+⚡ PERFORMANCE:
+   • {batch_stats.avg_rate:.2f} requests/segundo
+   • {batch_stats.avg_response_time:.3f}s tempo médio de resposta
+   • {batch_stats.concurrent_peak} pico de concorrência
+   
+🎯 EFICIÊNCIA:
+   • {batch_stats.efficiency_rate:.1f}% eficiência de tempo
+   • {batch_stats.cache_hit_rate:.1f}% cache hit rate
+   • {batch_stats.coordination_efficiency:.1f}% eficiência de coordenação
+   
+💰 CUSTOS:
+   • ${batch_stats.cost_per_token:.6f} por token
+   • ${batch_stats.cost_savings_from_cache:.4f} economia com cache
+   • Modelo: {batch_stats.model_used or 'N/A'}
+   
+⏱️ TEMPOS:
+   • {batch_stats.processing_time:.2f}s tempo total
+   • {total_wait:.1f}s tempo de espera
+   • {batch_stats.api_rate_limits_detected} rate limits detectados"""
+        
+        return complete_stats
+    
+    # Métodos de utilidade mantidos para compatibilidade
     def get_global_stats(self):
-        """Retorna estatísticas globais atualizadas"""
+        """Retorna stats globais atualizadas"""
         return self.stats_manager.get_global_stats()
     
     def show_stats(self, result_or_stats, title: str = "Stats"):
@@ -820,3 +941,36 @@ class AIProcessor:
         print(f"   ⏱️ Tempo no minuto: {status['time_in_minute']:.1f}s")
         print(f"   🔄 Total de esperas: {status['total_waits']}")
         print(f"   ⏳ Tempo total de espera: {status['total_wait_time']:.1f}s")
+    
+    # ✅ NOVA: Método de conveniência para mostrar stats completas
+    def show_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True):
+        """
+        🎯 Mostra todas as estatísticas de forma organizada
+        """
+        complete_stats = self.get_complete_stats(batch_result, include_global)
+        
+        print("=" * 80)
+        print("🎯 RELATÓRIO COMPLETO DE ESTATÍSTICAS")
+        print("=" * 80)
+        
+        # Resumo executivo
+        if 'executive_summary' in complete_stats:
+            print(complete_stats['executive_summary'])
+            print()
+        
+        # Stats do batch
+        if 'batch' in complete_stats:
+            print(complete_stats['batch']['summary'])
+            print()
+        
+        # Stats globais
+        if 'global' in complete_stats:
+            print(complete_stats['global']['summary'])
+            print()
+        
+        # Rate limiter
+        if 'rate_limiter' in complete_stats:
+            print(complete_stats['rate_limiter']['summary'])
+            print()
+        
+        print("=" * 80)
