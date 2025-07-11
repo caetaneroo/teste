@@ -412,8 +412,8 @@ class AIProcessor:
                             all_results[original_index] = result
                             if result.get('success', False):
                                 total_successful += 1
-                                if not pause_due_to_rate_limit:
-                                    await log_progress(total_successful)
+                                # ✅ Sempre logar progresso, inclusive após pausas
+                                await log_progress(total_successful)
                             if result.get('success', False):
                                 self.rate_limiter.record_successful_request()
                     except Exception as e:
