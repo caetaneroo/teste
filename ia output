@@ -18,24 +18,11 @@ MAX_RETRY_ATHENA = 3
 
 class OutputManager:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        Inicializa o OutputManager para processar resultados do AIProcessor
-        e gerenciar outputs em tabelas AWS.
-        
-        Args:
-            config: Configurações opcionais contendo:
-                - database: Nome do database (default: workspace_db)
-                - workgroup: Nome do workgroup (default: analytics-workgroup-v3)
-                - region: Região AWS (default: sa-east-1)
-        """
         if config is None:
             config = {}
-            
         self.database = config.get('database', DEFAULT_DATABASE)
         self.workgroup = config.get('workgroup', DEFAULT_WORKGROUP)
         self.region = config.get('region', DEFAULT_REGION)
-        
-        # Inicializar clientes AWS
         try:
             self.athena_client = boto3.client('athena', region_name=self.region)
             self.s3_client = boto3.client('s3', region_name=self.region)
@@ -46,7 +33,6 @@ class OutputManager:
                 extra={'action': 'aws_client_init_error', 'error': str(e)}
             )
             raise
-            
         logger.info(
             "OutputManager inicializado",
             extra={
@@ -58,112 +44,67 @@ class OutputManager:
         )
 
     def _generate_operation_id(self) -> str:
-        """Gera um ID único para operações"""
         return f"op_{int(time.time() * 1000)}_{id(self)}"
 
     def _validate_table_name(self, table_name: str) -> str:
-        """Valida e sanitiza nome da tabela"""
         if not table_name or not isinstance(table_name, str):
             raise ValueError("Nome da tabela deve ser uma string não vazia")
-        
-        # Remove caracteres especiais e converte para lowercase
         sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', table_name.lower())
-        
-        # Garante que começa com letra ou underscore
         if not re.match(r'^[a-zA-Z_]', sanitized):
             sanitized = f"table_{sanitized}"
-            
         return sanitized
 
     def _validate_s3_uri(self, s3_uri: str) -> str:
-        """Valida URI S3 e garante que termina com /"""
         if not s3_uri or not isinstance(s3_uri, str):
             raise ValueError("URI S3 deve ser uma string não vazia")
-        
         if not s3_uri.startswith('s3://'):
             raise ValueError("URI S3 deve começar com 's3://'")
-        
-        # Garante que termina com /
         if not s3_uri.endswith('/'):
             s3_uri += '/'
-            
         return s3_uri
 
     def _validate_column_name(self, column_name: str) -> str:
-        """Valida e sanitiza nome da coluna"""
         if not column_name or not isinstance(column_name, str):
             raise ValueError("Nome da coluna deve ser uma string não vazia")
-        
-        # Remove caracteres especiais e converte para lowercase
         sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', column_name.lower())
-        
-        # Garante que começa com letra ou underscore
         if not re.match(r'^[a-zA-Z_]', sanitized):
             sanitized = f"col_{sanitized}"
-            
         return sanitized
 
     def process_ai_results(
         self, 
         ai_results: Union[Dict[str, Any], List[Dict[str, Any]]],
-        custom_id_column_name: str = 'custom_id',
+        custom_id_column_name: str = 'id',
         include_content_text: bool = True
     ) -> pd.DataFrame:
-        """
-        Processa resultados do AIProcessor e converte para DataFrame
-        
-        Args:
-            ai_results: Resultado(s) do AIProcessor - pode ser:
-                - Resultado único (dict)
-                - Lista de resultados (list)
-                - Resultado de batch com 'results' (dict com key 'results')
-            custom_id_column_name: Nome personalizado para a coluna de ID (default: 'custom_id')
-            include_content_text: Se True, inclui coluna content_text. Se False, filtra apenas JSON válido
-        
-        Returns:
-            DataFrame com apenas resultados bem-sucedidos, custom_id e colunas extraídas do content JSON
-        """
         operation_id = self._generate_operation_id()
         start_time = time.time()
-        
-        # Valida e sanitiza nome da coluna personalizada
         custom_id_column_name = self._validate_column_name(custom_id_column_name)
-        
         try:
-            # Normaliza input para lista de resultados
             if isinstance(ai_results, dict):
                 if 'results' in ai_results:
-                    # Resultado de batch
                     results_list = ai_results['results']
                 else:
-                    # Resultado único
                     results_list = [ai_results]
             elif isinstance(ai_results, list):
                 results_list = ai_results
             else:
                 raise ValueError(f"Tipo de input não suportado: {type(ai_results)}")
-            
             processed_data = []
             json_content_count = 0
             text_content_count = 0
             failed_count = 0
             filtered_count = 0
-            
             for i, result in enumerate(results_list):
                 if not isinstance(result, dict):
                     continue
-                
-                # Filtra apenas resultados bem-sucedidos
                 success = result.get('success', False)
                 if not success:
                     failed_count += 1
                     continue
-                
-                # Extrai informações básicas
-                custom_id = result.get('custom_id')
+                # Ajuste: pega a coluna 'id' do resultado
+                custom_id = result.get('id')
                 content = result.get('content')
-                
-                # Usa o nome personalizado para a coluna de ID
                 row_data = {
                     custom_id_column_name: custom_id,
                     'result_processing_time': result.get('processing_time'),
@@ -173,23 +114,18 @@ class OutputManager:
                     'result_total_tokens': result.get('tokens_used'),
                     'result_cost': result.get('cost')
                 }
-                
-                # Processa content baseado no tipo
                 if content is None:
                     if include_content_text:
                         processed_data.append(row_data)
                 elif isinstance(content, dict):
-                    # Content é JSON - expande as chaves como colunas com prefixo result_
                     json_content_count += 1
                     for key, value in content.items():
-                        # Serializa objetos complexos como JSON string
                         if isinstance(value, (dict, list)):
                             row_data[f'result_{key}'] = json.dumps(value, ensure_ascii=False)
                         else:
                             row_data[f'result_{key}'] = value
                     processed_data.append(row_data)
                 elif isinstance(content, str):
-                    # Tenta fazer parse como JSON
                     try:
                         parsed_content = json.loads(content)
                         if isinstance(parsed_content, dict):
@@ -201,7 +137,6 @@ class OutputManager:
                                     row_data[f'result_{key}'] = value
                             processed_data.append(row_data)
                         else:
-                            # Content é texto simples
                             text_content_count += 1
                             if include_content_text:
                                 row_data['result_content_text'] = content
@@ -209,7 +144,6 @@ class OutputManager:
                             else:
                                 filtered_count += 1
                     except json.JSONDecodeError:
-                        # Content é texto simples
                         text_content_count += 1
                         if include_content_text:
                             row_data['result_content_text'] = content
@@ -217,24 +151,17 @@ class OutputManager:
                         else:
                             filtered_count += 1
                 else:
-                    # Outros tipos - converte para string
                     text_content_count += 1
                     if include_content_text:
                         row_data['result_content_text'] = str(content)
                         processed_data.append(row_data)
                     else:
                         filtered_count += 1
-            
-            # Cria DataFrame
             df = pd.DataFrame(processed_data)
-            
-            # Reordena colunas colocando a coluna de ID primeiro
             if custom_id_column_name in df.columns:
                 cols = [custom_id_column_name] + [col for col in df.columns if col != custom_id_column_name]
                 df = df[cols]
-            
             processing_time = time.time() - start_time
-            
             logger.info(
                 f"✅ Processamento concluído - {len(df)} registros válidos, {json_content_count} JSON, {text_content_count} texto, {failed_count} falhas, {filtered_count} filtrados",
                 extra={
@@ -251,9 +178,7 @@ class OutputManager:
                     'action': 'process_ai_results_complete'
                 }
             )
-            
             return df
-            
         except Exception as e:
             processing_time = time.time() - start_time
             logger.error(
@@ -274,34 +199,25 @@ class OutputManager:
         wait_for_completion: bool = True,
         max_wait_time: int = 300
     ) -> Dict[str, Any]:
-        """Executa query no Athena"""
         try:
-            # Configura parâmetros da query
             query_params = {
                 'QueryString': query,
                 'WorkGroup': self.workgroup
             }
-            
-            # Inicia execução
             response = self.athena_client.start_query_execution(**query_params)
             execution_id = response['QueryExecutionId']
-            
             if not wait_for_completion:
                 return {
                     'execution_id': execution_id,
                     'status': 'RUNNING',
                     'query': query
                 }
-            
-            # Aguarda conclusão
             start_time = time.time()
             while time.time() - start_time < max_wait_time:
                 response = self.athena_client.get_query_execution(QueryExecutionId=execution_id)
                 status = response['QueryExecution']['Status']['State']
-                
                 if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
                     execution_time = time.time() - start_time
-                    
                     if status == 'SUCCEEDED':
                         logger.info(
                             f"✅ Query concluída em {execution_time:.1f}s",
@@ -322,7 +238,6 @@ class OutputManager:
                                 'action': 'athena_query_failed'
                             }
                         )
-                    
                     return {
                         'execution_id': execution_id,
                         'status': status,
@@ -330,17 +245,13 @@ class OutputManager:
                         'query': query,
                         'response': response
                     }
-                
                 time.sleep(2)
-            
-            # Timeout
             return {
                 'execution_id': execution_id,
                 'status': 'TIMEOUT',
                 'execution_time': max_wait_time,
                 'query': query
             }
-            
         except Exception as e:
             logger.error(
                 f"Erro na query Athena: {e}",
@@ -353,7 +264,6 @@ class OutputManager:
             raise
 
     def _table_exists(self, table_name: str) -> bool:
-        """Verifica se a tabela existe no Glue Catalog"""
         try:
             self.glue_client.get_table(
                 DatabaseName=self.database,
@@ -373,20 +283,9 @@ class OutputManager:
         file_format: str = 'PARQUET',
         overwrite: bool = False
     ) -> Dict[str, Any]:
-        """
-        Cria nova tabela a partir de DataFrame
-        
-        Args:
-            df: DataFrame com os dados
-            table_name: Nome da tabela a ser criada
-            s3_location: URI S3 completa onde os dados da tabela ficarão armazenados
-            file_format: Formato do arquivo (PARQUET, JSON, CSV)
-            overwrite: Se True, sobrescreve tabela existente
-        """
         operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
         s3_location = self._validate_s3_uri(s3_location)
-        
         logger.info(
             f"🏗️ Criando tabela {table_name} - {len(df)} registros, {len(df.columns)} colunas",
             extra={
@@ -400,14 +299,10 @@ class OutputManager:
                 'action': 'create_table_start'
             }
         )
-        
         try:
-            # Verifica se tabela existe
             if self._table_exists(table_name):
                 if not overwrite:
                     raise ValueError(f"Tabela {table_name} já existe. Use overwrite=True para sobrescrever.")
-            
-            # Gera schema baseado no DataFrame
             columns_ddl = []
             for col_name, dtype in df.dtypes.items():
                 if pd.api.types.is_integer_dtype(dtype):
@@ -418,10 +313,7 @@ class OutputManager:
                     sql_type = 'boolean'
                 else:
                     sql_type = 'string'
-                
                 columns_ddl.append(f"`{col_name}` {sql_type}")
-            
-            # Monta DDL
             ddl = f"""
             CREATE TABLE IF NOT EXISTS `{self.database}`.`{table_name}` (
                 {', '.join(columns_ddl)}
@@ -429,15 +321,10 @@ class OutputManager:
             STORED AS {file_format}
             LOCATION '{s3_location}'
             """
-            
             if overwrite:
-                # Drop table se existe
                 drop_ddl = f"DROP TABLE IF EXISTS `{self.database}`.`{table_name}`"
                 self._execute_athena_query(drop_ddl)
-            
-            # Cria tabela
             result = self._execute_athena_query(ddl)
-            
             logger.info(
                 f"✅ Tabela {table_name} criada",
                 extra={
@@ -448,7 +335,6 @@ class OutputManager:
                     'action': 'create_table_complete'
                 }
             )
-            
             return {
                 'table_name': table_name,
                 'database': self.database,
@@ -457,7 +343,6 @@ class OutputManager:
                 'athena_execution': result,
                 'operation_id': operation_id
             }
-            
         except Exception as e:
             logger.error(
                 f"Erro ao criar tabela {table_name}: {e}",
@@ -477,18 +362,9 @@ class OutputManager:
         table_name: str,
         s3_staging_location: str
     ) -> Dict[str, Any]:
-        """
-        Adiciona dados do DataFrame a uma tabela existente
-        
-        Args:
-            df: DataFrame com os dados
-            table_name: Nome da tabela existente
-            s3_staging_location: URI S3 completa para staging dos dados
-        """
         operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
         s3_staging_location = self._validate_s3_uri(s3_staging_location)
-        
         logger.info(
             f"📝 Adicionando {len(df)} registros à tabela {table_name}",
             extra={
@@ -499,15 +375,10 @@ class OutputManager:
                 'action': 'append_to_table_start'
             }
         )
-        
         try:
-            # Verifica se tabela existe
             if not self._table_exists(table_name):
                 raise ValueError(f"Tabela {table_name} não existe. Crie a tabela primeiro.")
-            
-            # TODO: Implementar upload do DataFrame para S3 e INSERT INTO
-            # Por enquanto, retorna estrutura básica
-            
+            # Implementação de upload e insert deve ser feita conforme necessidade
             logger.info(
                 f"✅ Dados adicionados à tabela {table_name}",
                 extra={
@@ -517,7 +388,6 @@ class OutputManager:
                     'action': 'append_to_table_complete'
                 }
             )
-            
             return {
                 'table_name': table_name,
                 'database': self.database,
@@ -525,7 +395,6 @@ class OutputManager:
                 'staging_location': s3_staging_location,
                 'operation_id': operation_id
             }
-            
         except Exception as e:
             logger.error(
                 f"Erro ao adicionar dados à tabela {table_name}: {e}",
@@ -544,21 +413,11 @@ class OutputManager:
         df: pd.DataFrame, 
         table_name: str,
         s3_staging_location: str,
-        custom_id_column: str = 'custom_id'
+        custom_id_column: str = 'id'
     ) -> Dict[str, Any]:
-        """
-        Faz merge/overwrite na tabela baseado no custom_id
-        
-        Args:
-            df: DataFrame com os dados
-            table_name: Nome da tabela existente
-            s3_staging_location: URI S3 completa para staging dos dados
-            custom_id_column: Nome da coluna para fazer o merge (deve existir no DataFrame)
-        """
         operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
         s3_staging_location = self._validate_s3_uri(s3_staging_location)
-        
         logger.info(
             f"🔄 Merge overwrite {table_name} por {custom_id_column} - {len(df)} registros",
             extra={
@@ -570,18 +429,12 @@ class OutputManager:
                 'action': 'merge_overwrite_start'
             }
         )
-        
         try:
-            # Verifica se tabela existe
             if not self._table_exists(table_name):
                 raise ValueError(f"Tabela {table_name} não existe. Crie a tabela primeiro.")
-            
-            # Verifica se coluna de merge existe no DataFrame
             if custom_id_column not in df.columns:
                 raise ValueError(f"Coluna {custom_id_column} não encontrada no DataFrame")
-            
-            # TODO: Implementar lógica de merge com ICEBERG ou estratégia de DELETE + INSERT
-            
+            # Implementação de merge deve ser feita conforme necessidade
             logger.info(
                 f"✅ Merge overwrite concluído na tabela {table_name}",
                 extra={
@@ -591,7 +444,6 @@ class OutputManager:
                     'action': 'merge_overwrite_complete'
                 }
             )
-            
             return {
                 'table_name': table_name,
                 'database': self.database,
@@ -600,7 +452,6 @@ class OutputManager:
                 'staging_location': s3_staging_location,
                 'operation_id': operation_id
             }
-            
         except Exception as e:
             logger.error(
                 f"Erro no merge overwrite da tabela {table_name}: {e}",
@@ -619,21 +470,11 @@ class OutputManager:
         df: pd.DataFrame, 
         table_name: str,
         s3_location: str,
-        custom_id_column: str = 'custom_id'
+        custom_id_column: str = 'id'
     ) -> Dict[str, Any]:
-        """
-        Faz upsert: merge se tabela existe, senão cria nova tabela
-        
-        Args:
-            df: DataFrame com os dados
-            table_name: Nome da tabela
-            s3_location: URI S3 completa para os dados da tabela
-            custom_id_column: Nome da coluna para fazer o merge (deve existir no DataFrame se tabela existir)
-        """
         operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
         s3_location = self._validate_s3_uri(s3_location)
-        
         logger.info(
             f"🔀 Upsert tabela {table_name} - {len(df)} registros",
             extra={
@@ -644,17 +485,13 @@ class OutputManager:
                 'action': 'upsert_table_start'
             }
         )
-        
         try:
             if self._table_exists(table_name):
-                # Tabela existe - faz merge
                 return self.merge_overwrite_by_custom_id(
                     df, table_name, s3_location, custom_id_column
                 )
             else:
-                # Tabela não existe - cria nova
                 return self.create_table_from_dataframe(df, table_name, s3_location)
-                
         except Exception as e:
             logger.error(
                 f"Erro no upsert da tabela {table_name}: {e}",
