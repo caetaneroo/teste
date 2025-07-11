@@ -61,9 +61,6 @@ class OutputManager:
         Processa resultados do AIProcessor e retorna DataFrame.
         Apenas sucessos são processados.
         """
-        start_time = time.time()
-        logger.info("🔄 Iniciando processamento dos resultados do AI Processor")
-        
         id_column_name = self._validate_column_name(id_column_name)
         
         if isinstance(ai_results, dict):
@@ -140,9 +137,8 @@ class OutputManager:
             cols = [id_column_name] + [c for c in df.columns if c != id_column_name]
             df = df[cols]
         
-        processing_time = time.time() - start_time
         result_cols_str = ', '.join(sorted(result_columns)) if result_columns else 'nenhuma'
-        logger.info(f"✅ AI Results processados | Sucessos: {success_count} | DataFrame: {len(df)} linhas | Colunas resultado: {result_cols_str} | Tempo: {processing_time:.2f}s")
+        logger.info(f"✅ AI Results processados | Sucessos: {success_count} | DataFrame: {len(df)} linhas | Colunas resultado: {result_cols_str}")
         
         return df
 
@@ -177,6 +173,7 @@ class OutputManager:
             temp_path=temp_path,
             partition_cols=partition_cols,
             mode='overwrite',
+            keep_files=False,
             boto3_session=self.session,
             workgroup=self.workgroup
         )
@@ -216,6 +213,7 @@ class OutputManager:
             temp_path=temp_path,
             partition_cols=partition_cols,
             mode='append',
+            keep_files=False,
             boto3_session=self.session,
             workgroup=self.workgroup
         )
@@ -268,6 +266,7 @@ class OutputManager:
             merge_cols=merge_keys,
             partition_cols=partition_cols,
             mode='upsert',
+            keep_files=False,
             boto3_session=self.session,
             workgroup=self.workgroup
         )
@@ -315,6 +314,7 @@ class OutputManager:
             merge_cols=merge_keys,
             partition_cols=partition_cols,
             mode='upsert',
+            keep_files=False,
             boto3_session=self.session,
             workgroup=self.workgroup
         )
@@ -355,6 +355,7 @@ class OutputManager:
             temp_path=temp_path,
             partition_cols=partition_cols,
             mode='overwrite_partitions',
+            keep_files=False,
             boto3_session=self.session,
             workgroup=self.workgroup
         )
