@@ -3,9 +3,14 @@ import json
 import logging
 import pandas as pd
 import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
 from typing import List, Dict, Any, Optional, Union
 from botocore.exceptions import ClientError
 import re
+import os
+from datetime import datetime
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -25,169 +30,175 @@ class OutputManager:
             self.s3_client = boto3.client('s3', region_name=self.region)
             self.glue_client = boto3.client('glue', region_name=self.region)
         except Exception as e:
-            logger.error(
-                f"Erro ao inicializar clientes AWS: {e}",
-                extra={'action': 'aws_client_init_error', 'error': str(e)}
-            )
+            logger.error(f"Erro ao inicializar clientes AWS: {e}")
             raise
-        logger.info(
-            "OutputManager inicializado",
-            extra={
-                'database': self.database,
-                'workgroup': self.workgroup,
-                'region': self.region,
-                'action': 'output_manager_init'
-            }
-        )
 
     def _generate_operation_id(self) -> str:
         return f"op_{int(time.time() * 1000)}_{id(self)}"
 
     def _validate_table_name(self, table_name: str) -> str:
-        if not table_name or not isinstance(table_name, str):
-            raise ValueError("Nome da tabela deve ser uma string não vazia")
         sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', table_name.lower())
         if not re.match(r'^[a-zA-Z_]', sanitized):
             sanitized = f"table_{sanitized}"
         return sanitized
 
     def _validate_s3_uri(self, s3_uri: str) -> str:
-        if not s3_uri or not isinstance(s3_uri, str):
-            raise ValueError("URI S3 deve ser uma string não vazia")
         if not s3_uri.startswith('s3://'):
             raise ValueError("URI S3 deve começar com 's3://'")
         if not s3_uri.endswith('/'):
             s3_uri += '/'
         return s3_uri
 
-    def _validate_column_name(self, column_name: str) -> str:
-        if not column_name or not isinstance(column_name, str):
-            raise ValueError("Nome da coluna deve ser uma string não vazia")
-        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', column_name.lower())
-        if not re.match(r'^[a-zA-Z_]', sanitized):
-            sanitized = f"col_{sanitized}"
-        return sanitized
-
-    def process_ai_results(
-        self, 
-        ai_results: Union[Dict[str, Any], List[Dict[str, Any]]],
-        custom_id_column_name: str = 'id',
-        include_content_text: bool = True
-    ) -> pd.DataFrame:
-        operation_id = self._generate_operation_id()
-        start_time = time.time()
-        custom_id_column_name = self._validate_column_name(custom_id_column_name)
+    def _table_exists(self, table_name: str) -> bool:
         try:
-            if isinstance(ai_results, dict):
-                if 'results' in ai_results:
-                    results_list = ai_results['results']
-                else:
-                    results_list = [ai_results]
-            elif isinstance(ai_results, list):
-                results_list = ai_results
-            else:
-                raise ValueError(f"Tipo de input não suportado: {type(ai_results)}")
-            processed_data = []
-            json_content_count = 0
-            text_content_count = 0
-            failed_count = 0
-            filtered_count = 0
-            for result in results_list:
-                if not isinstance(result, dict):
-                    continue
-                success = result.get('success', False)
-                if not success:
-                    failed_count += 1
-                    continue
-                custom_id = result.get('id')
-                content = result.get('content')
-                row_data = {
-                    custom_id_column_name: custom_id,
-                    'result_processing_time': result.get('processing_time'),
-                    'result_input_tokens': result.get('input_tokens'),
-                    'result_output_tokens': result.get('output_tokens'),
-                    'result_cached_tokens': result.get('cached_tokens'),
-                    'result_total_tokens': result.get('tokens_used'),
-                    'result_cost': result.get('cost')
-                }
-                if content is None:
-                    if include_content_text:
-                        processed_data.append(row_data)
-                elif isinstance(content, dict):
-                    json_content_count += 1
-                    for key, value in content.items():
-                        if isinstance(value, (dict, list)):
-                            row_data[f'result_{key}'] = json.dumps(value, ensure_ascii=False)
-                        else:
-                            row_data[f'result_{key}'] = value
-                    processed_data.append(row_data)
-                elif isinstance(content, str):
-                    try:
-                        parsed_content = json.loads(content)
-                        if isinstance(parsed_content, dict):
-                            json_content_count += 1
-                            for key, value in parsed_content.items():
-                                if isinstance(value, (dict, list)):
-                                    row_data[f'result_{key}'] = json.dumps(value, ensure_ascii=False)
-                                else:
-                                    row_data[f'result_{key}'] = value
-                            processed_data.append(row_data)
-                        else:
-                            text_content_count += 1
-                            if include_content_text:
-                                row_data['result_content_text'] = content
-                                processed_data.append(row_data)
-                            else:
-                                filtered_count += 1
-                    except json.JSONDecodeError:
-                        text_content_count += 1
-                        if include_content_text:
-                            row_data['result_content_text'] = content
-                            processed_data.append(row_data)
-                        else:
-                            filtered_count += 1
-                else:
-                    text_content_count += 1
-                    if include_content_text:
-                        row_data['result_content_text'] = str(content)
-                        processed_data.append(row_data)
-                    else:
-                        filtered_count += 1
-            df = pd.DataFrame(processed_data)
-            if custom_id_column_name in df.columns:
-                cols = [custom_id_column_name] + [col for col in df.columns if col != custom_id_column_name]
-                df = df[cols]
-            processing_time = time.time() - start_time
-            logger.info(
-                f"✅ Processamento concluído - {len(df)} registros válidos, {json_content_count} JSON, {text_content_count} texto, {failed_count} falhas, {filtered_count} filtrados",
-                extra={
-                    'operation_id': operation_id,
-                    'total_records': len(df),
-                    'json_content_count': json_content_count,
-                    'text_content_count': text_content_count,
-                    'failed_count': failed_count,
-                    'filtered_count': filtered_count,
-                    'processing_time': round(processing_time, 2),
-                    'columns_count': len(df.columns),
-                    'custom_id_column_name': custom_id_column_name,
-                    'include_content_text': include_content_text,
-                    'action': 'process_ai_results_complete'
-                }
-            )
-            return df
-        except Exception as e:
-            processing_time = time.time() - start_time
-            logger.error(
-                f"Erro no processamento: {e}",
-                extra={
-                    'operation_id': operation_id,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'processing_time': round(processing_time, 2),
-                    'action': 'process_ai_results_error'
-                }
-            )
+            self.glue_client.get_table(DatabaseName=self.database, Name=table_name)
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'EntityNotFoundException':
+                return False
             raise
+
+    def _upload_parquet_to_s3(self, df: pd.DataFrame, s3_uri: str, filename_prefix: str = None) -> str:
+        # Gera arquivo Parquet local temporário
+        if filename_prefix is None:
+            filename_prefix = f"part-{uuid4().hex}"
+        local_file = f"/tmp/{filename_prefix}.parquet"
+        table = pa.Table.from_pandas(df)
+        pq.write_table(table, local_file)
+        # Extrai bucket e prefixo
+        s3_uri = self._validate_s3_uri(s3_uri)
+        bucket = s3_uri[5:].split('/')[0]
+        prefix = '/'.join(s3_uri[5:].split('/')[1:])
+        s3_key = f"{prefix}{filename_prefix}.parquet"
+        self.s3_client.upload_file(local_file, bucket, s3_key)
+        os.remove(local_file)
+        return f"s3://{bucket}/{s3_key}"
+
+    def create_table_from_dataframe(
+        self, 
+        df: pd.DataFrame, 
+        table_name: str,
+        s3_location: str,
+        file_format: str = 'ICEBERG',
+        overwrite: bool = False,
+        partition_cols: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Cria tabela e grava os dados no S3. Suporta ICEBERG (preferencial), fallback para PARQUET.
+        """
+        operation_id = self._generate_operation_id()
+        table_name = self._validate_table_name(table_name)
+        s3_location = self._validate_s3_uri(s3_location)
+        if file_format.upper() not in ['ICEBERG', 'PARQUET']:
+            raise ValueError("Formato suportado: ICEBERG ou PARQUET")
+        # Apaga tabela se overwrite
+        if overwrite and self._table_exists(table_name):
+            drop_ddl = f"DROP TABLE IF EXISTS `{self.database}`.`{table_name}`"
+            self._execute_athena_query(drop_ddl)
+        # Grava arquivo Parquet no S3 (mesmo para Iceberg, para ingestão inicial)
+        self._upload_parquet_to_s3(df, s3_location)
+        # Monta DDL
+        columns_ddl = []
+        for col_name, dtype in df.dtypes.items():
+            if pd.api.types.is_integer_dtype(dtype):
+                sql_type = 'bigint'
+            elif pd.api.types.is_float_dtype(dtype):
+                sql_type = 'double'
+            elif pd.api.types.is_bool_dtype(dtype):
+                sql_type = 'boolean'
+            else:
+                sql_type = 'string'
+            columns_ddl.append(f"`{col_name}` {sql_type}")
+        if file_format.upper() == 'ICEBERG':
+            tbl_stmt = "CREATE TABLE"
+            tbl_type = "ICEBERG"
+        else:
+            tbl_stmt = "CREATE EXTERNAL TABLE"
+            tbl_type = "PARQUET"
+        partition_stmt = ""
+        if partition_cols:
+            partition_stmt = f"PARTITIONED BY ({', '.join([f'`{col}` string' for col in partition_cols])})"
+        ddl = f"""
+        {tbl_stmt} IF NOT EXISTS `{self.database}`.`{table_name}` (
+            {', '.join(columns_ddl)}
+        )
+        {partition_stmt}
+        STORED AS {tbl_type}
+        LOCATION '{s3_location}'
+        """
+        self._execute_athena_query(ddl)
+        logger.info(f"✅ Tabela {table_name} criada/atualizada em {s3_location}")
+        return {
+            'table_name': table_name,
+            'database': self.database,
+            's3_location': s3_location,
+            'columns_count': len(df.columns),
+            'operation_id': operation_id
+        }
+
+    def append_to_table(
+        self, 
+        df: pd.DataFrame, 
+        table_name: str,
+        s3_location: str
+    ) -> Dict[str, Any]:
+        """
+        Faz append dos dados no S3 da tabela. Para Iceberg, Athena detecta automaticamente.
+        """
+        operation_id = self._generate_operation_id()
+        table_name = self._validate_table_name(table_name)
+        s3_location = self._validate_s3_uri(s3_location)
+        if not self._table_exists(table_name):
+            raise ValueError(f"Tabela {table_name} não existe.")
+        self._upload_parquet_to_s3(df, s3_location)
+        # Para Iceberg, não precisa MSCK REPAIR TABLE; para Parquet sim.
+        logger.info(f"✅ Append realizado em {table_name}")
+        return {
+            'table_name': table_name,
+            'database': self.database,
+            'rows_added': len(df),
+            's3_location': s3_location,
+            'operation_id': operation_id
+        }
+
+    def upsert_table(
+        self, 
+        df: pd.DataFrame, 
+        table_name: str,
+        s3_location: str,
+        custom_id_column: str = 'id',
+        file_format: str = 'ICEBERG'
+    ) -> Dict[str, Any]:
+        """
+        Upsert real: cria se não existe, senão faz merge (apaga linhas antigas com mesmo id e adiciona novas).
+        """
+        operation_id = self._generate_operation_id()
+        table_name = self._validate_table_name(table_name)
+        s3_location = self._validate_s3_uri(s3_location)
+        if not self._table_exists(table_name):
+            return self.create_table_from_dataframe(
+                df, table_name, s3_location, file_format=file_format, overwrite=True
+            )
+        # Para Iceberg: faz merge overwrite pelo id
+        temp_prefix = f"tmp_upsert_{uuid4().hex}/"
+        temp_s3 = s3_location + temp_prefix
+        parquet_uri = self._upload_parquet_to_s3(df, temp_s3)
+        merge_sql = f"""
+        MERGE INTO `{self.database}`.`{table_name}` t
+        USING (SELECT * FROM '{parquet_uri}') s
+        ON t.{custom_id_column} = s.{custom_id_column}
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+        """
+        self._execute_athena_query(merge_sql)
+        logger.info(f"✅ Upsert realizado em {table_name}")
+        return {
+            'table_name': table_name,
+            'database': self.database,
+            'rows_upserted': len(df),
+            's3_location': s3_location,
+            'operation_id': operation_id
+        }
 
     def _execute_athena_query(
         self, 
@@ -213,31 +224,9 @@ class OutputManager:
                 response = self.athena_client.get_query_execution(QueryExecutionId=execution_id)
                 status = response['QueryExecution']['Status']['State']
                 if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-                    execution_time = time.time() - start_time
-                    if status == 'SUCCEEDED':
-                        logger.info(
-                            f"✅ Query concluída em {execution_time:.1f}s",
-                            extra={
-                                'execution_id': execution_id,
-                                'execution_time': round(execution_time, 2),
-                                'action': 'athena_query_succeeded'
-                            }
-                        )
-                    else:
-                        error_reason = response['QueryExecution']['Status'].get('StateChangeReason', 'Erro desconhecido')
-                        logger.error(
-                            f"❌ Query falhou: {error_reason}",
-                            extra={
-                                'execution_id': execution_id,
-                                'status': status,
-                                'error_reason': error_reason,
-                                'action': 'athena_query_failed'
-                            }
-                        )
                     return {
                         'execution_id': execution_id,
                         'status': status,
-                        'execution_time': execution_time,
                         'query': query,
                         'response': response
                     }
@@ -245,258 +234,8 @@ class OutputManager:
             return {
                 'execution_id': execution_id,
                 'status': 'TIMEOUT',
-                'execution_time': max_wait_time,
                 'query': query
             }
         except Exception as e:
-            logger.error(
-                f"Erro na query Athena: {e}",
-                extra={
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'athena_query_error'
-                }
-            )
-            raise
-
-    def _table_exists(self, table_name: str) -> bool:
-        try:
-            self.glue_client.get_table(
-                DatabaseName=self.database,
-                Name=table_name
-            )
-            return True
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'EntityNotFoundException':
-                return False
-            raise
-
-    def create_table_from_dataframe(
-        self, 
-        df: pd.DataFrame, 
-        table_name: str,
-        s3_location: str,
-        file_format: str = 'PARQUET',
-        overwrite: bool = False
-    ) -> Dict[str, Any]:
-        operation_id = self._generate_operation_id()
-        table_name = self._validate_table_name(table_name)
-        s3_location = self._validate_s3_uri(s3_location)
-        logger.info(
-            f"🏗️ Criando tabela {table_name} - {len(df)} registros, {len(df.columns)} colunas",
-            extra={
-                'operation_id': operation_id,
-                'table_name': table_name,
-                'rows_count': len(df),
-                'columns_count': len(df.columns),
-                'file_format': file_format,
-                'overwrite': overwrite,
-                's3_location': s3_location,
-                'action': 'create_table_start'
-            }
-        )
-        try:
-            if self._table_exists(table_name):
-                if not overwrite:
-                    raise ValueError(f"Tabela {table_name} já existe. Use overwrite=True para sobrescrever.")
-            columns_ddl = []
-            for col_name, dtype in df.dtypes.items():
-                if pd.api.types.is_integer_dtype(dtype):
-                    sql_type = 'bigint'
-                elif pd.api.types.is_float_dtype(dtype):
-                    sql_type = 'double'
-                elif pd.api.types.is_bool_dtype(dtype):
-                    sql_type = 'boolean'
-                else:
-                    sql_type = 'string'
-                columns_ddl.append(f"`{col_name}` {sql_type}")
-            ddl = f"""
-            CREATE EXTERNAL TABLE IF NOT EXISTS `{self.database}`.`{table_name}` (
-                {', '.join(columns_ddl)}
-            )
-            STORED AS {file_format}
-            LOCATION '{s3_location}'
-            """
-            if overwrite:
-                drop_ddl = f"DROP TABLE IF EXISTS `{self.database}`.`{table_name}`"
-                self._execute_athena_query(drop_ddl)
-            result = self._execute_athena_query(ddl)
-            logger.info(
-                f"✅ Tabela {table_name} criada",
-                extra={
-                    'operation_id': operation_id,
-                    'table_name': table_name,
-                    'execution_id': result.get('execution_id'),
-                    's3_location': s3_location,
-                    'action': 'create_table_complete'
-                }
-            )
-            return {
-                'table_name': table_name,
-                'database': self.database,
-                's3_location': s3_location,
-                'columns_count': len(df.columns),
-                'athena_execution': result,
-                'operation_id': operation_id
-            }
-        except Exception as e:
-            logger.error(
-                f"Erro ao criar tabela {table_name}: {e}",
-                extra={
-                    'operation_id': operation_id,
-                    'table_name': table_name,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'create_table_error'
-                }
-            )
-            raise
-
-    def append_to_table(
-        self, 
-        df: pd.DataFrame, 
-        table_name: str,
-        s3_staging_location: str
-    ) -> Dict[str, Any]:
-        operation_id = self._generate_operation_id()
-        table_name = self._validate_table_name(table_name)
-        s3_staging_location = self._validate_s3_uri(s3_staging_location)
-        logger.info(
-            f"📝 Adicionando {len(df)} registros à tabela {table_name}",
-            extra={
-                'operation_id': operation_id,
-                'table_name': table_name,
-                'rows_count': len(df),
-                's3_staging_location': s3_staging_location,
-                'action': 'append_to_table_start'
-            }
-        )
-        try:
-            if not self._table_exists(table_name):
-                raise ValueError(f"Tabela {table_name} não existe. Crie a tabela primeiro.")
-            # Implementação de upload e insert deve ser feita conforme necessidade
-            logger.info(
-                f"✅ Dados adicionados à tabela {table_name}",
-                extra={
-                    'operation_id': operation_id,
-                    'table_name': table_name,
-                    'rows_added': len(df),
-                    'action': 'append_to_table_complete'
-                }
-            )
-            return {
-                'table_name': table_name,
-                'database': self.database,
-                'rows_added': len(df),
-                'staging_location': s3_staging_location,
-                'operation_id': operation_id
-            }
-        except Exception as e:
-            logger.error(
-                f"Erro ao adicionar dados à tabela {table_name}: {e}",
-                extra={
-                    'operation_id': operation_id,
-                    'table_name': table_name,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'append_to_table_error'
-                }
-            )
-            raise
-
-    def merge_overwrite_by_custom_id(
-        self, 
-        df: pd.DataFrame, 
-        table_name: str,
-        s3_staging_location: str,
-        custom_id_column: str = 'id'
-    ) -> Dict[str, Any]:
-        operation_id = self._generate_operation_id()
-        table_name = self._validate_table_name(table_name)
-        s3_staging_location = self._validate_s3_uri(s3_staging_location)
-        logger.info(
-            f"🔄 Merge overwrite {table_name} por {custom_id_column} - {len(df)} registros",
-            extra={
-                'operation_id': operation_id,
-                'table_name': table_name,
-                'merge_column': custom_id_column,
-                'rows_count': len(df),
-                's3_staging_location': s3_staging_location,
-                'action': 'merge_overwrite_start'
-            }
-        )
-        try:
-            if not self._table_exists(table_name):
-                raise ValueError(f"Tabela {table_name} não existe. Crie a tabela primeiro.")
-            if custom_id_column not in df.columns:
-                raise ValueError(f"Coluna {custom_id_column} não encontrada no DataFrame")
-            # Implementação de merge deve ser feita conforme necessidade
-            logger.info(
-                f"✅ Merge overwrite concluído na tabela {table_name}",
-                extra={
-                    'operation_id': operation_id,
-                    'table_name': table_name,
-                    'rows_processed': len(df),
-                    'action': 'merge_overwrite_complete'
-                }
-            )
-            return {
-                'table_name': table_name,
-                'database': self.database,
-                'merge_column': custom_id_column,
-                'rows_processed': len(df),
-                'staging_location': s3_staging_location,
-                'operation_id': operation_id
-            }
-        except Exception as e:
-            logger.error(
-                f"Erro no merge overwrite da tabela {table_name}: {e}",
-                extra={
-                    'operation_id': operation_id,
-                    'table_name': table_name,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'merge_overwrite_error'
-                }
-            )
-            raise
-
-    def upsert_table(
-        self, 
-        df: pd.DataFrame, 
-        table_name: str,
-        s3_location: str,
-        custom_id_column: str = 'id'
-    ) -> Dict[str, Any]:
-        operation_id = self._generate_operation_id()
-        table_name = self._validate_table_name(table_name)
-        s3_location = self._validate_s3_uri(s3_location)
-        logger.info(
-            f"🔀 Upsert tabela {table_name} - {len(df)} registros",
-            extra={
-                'operation_id': operation_id,
-                'table_name': table_name,
-                'rows_count': len(df),
-                's3_location': s3_location,
-                'action': 'upsert_table_start'
-            }
-        )
-        try:
-            if self._table_exists(table_name):
-                return self.merge_overwrite_by_custom_id(
-                    df, table_name, s3_location, custom_id_column
-                )
-            else:
-                return self.create_table_from_dataframe(df, table_name, s3_location)
-        except Exception as e:
-            logger.error(
-                f"Erro no upsert da tabela {table_name}: {e}",
-                extra={
-                    'operation_id': operation_id,
-                    'table_name': table_name,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'upsert_table_error'
-                }
-            )
+            logger.error(f"Erro na query Athena: {e}")
             raise
