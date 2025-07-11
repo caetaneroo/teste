@@ -80,14 +80,12 @@ class AIProcessor:
             total_chars = sum(len(str(msg.get('content', ''))) for msg in messages)
             return int(total_chars * 0.3)
 
-    def calculate_cost(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0, model: Optional[str] = None) -> float:
-        from stats_manager import MODEL_PRICING
-        model = model or self.model
-        pricing = MODEL_PRICING.get(model, MODEL_PRICING['gpt-35-turbo-16k'])
-        input_cost = (input_tokens / 1000) * pricing['input']
-        output_cost = (output_tokens / 1000) * pricing['output']
-        cache_cost = (cached_tokens / 1000) * pricing['cache']
-        return input_cost + output_cost + cache_cost
+    def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        input_cost_per_1k = 0.0015
+        output_cost_per_1k = 0.002
+        input_cost = (input_tokens / 1000) * input_cost_per_1k
+        output_cost = (output_tokens / 1000) * output_cost_per_1k
+        return input_cost + output_cost
 
     def _prepare_json_schema(self, json_schema: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(json_schema, dict):
@@ -111,7 +109,7 @@ class AIProcessor:
         error_msg = result.get('error', '')
         patterns = [
             r'retry after (\d+) seconds',
-            r'wait (\d+) seconds',
+            r'wait (\d+) seconds', 
             r'retry.*?(\d+)\s*seconds?',
             r'(\d+)s',
             r'retry.*?(\d+)',
@@ -195,7 +193,7 @@ class AIProcessor:
                                 cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
                             self.rate_limiter.record_tokens(tokens_used)
                             self.rate_limiter.record_token_usage(base_estimate, tokens_used)
-                            cost = self.calculate_cost(input_tokens, output_tokens, cached_tokens, self.model)
+                            cost = self.calculate_cost(input_tokens, output_tokens)
                             content = response.choices[0].message.content
                             parsed_content = content
                             if json_schema and isinstance(json_schema, dict) and content:
@@ -249,8 +247,7 @@ class AIProcessor:
                                 'success': True,
                                 'is_json': json_schema is not None,
                                 'attempts': attempt.retry_state.attempt_number,
-                                'request_id': request_id,
-                                'model': self.model
+                                'request_id': request_id
                             }
                         except Exception as e:
                             end_time = time.time()
@@ -273,8 +270,7 @@ class AIProcessor:
                                 'response_headers': response_headers,
                                 'is_json': False,
                                 'attempts': attempt.retry_state.attempt_number,
-                                'request_id': request_id,
-                                'model': self.model
+                                'request_id': request_id
                             }
                             if is_rate_limit_error(error_result):
                                 wait_time = self._extract_wait_time_from_error_result(error_result)
@@ -324,15 +320,14 @@ class AIProcessor:
                 'error_type': 'RetryError',
                 'is_json': False,
                 'attempts': MAX_RETRY,
-                'request_id': request_id,
-                'model': self.model
+                'request_id': request_id
             }
         finally:
             self.stats_manager.record_concurrent_end()
 
     async def process_single(
-        self,
-        text: str,
+        self, 
+        text: str, 
         prompt_template: str,
         json_schema: Optional[Dict[str, Any]] = None,
         custom_id: Optional[str] = None,
@@ -349,18 +344,20 @@ class AIProcessor:
             result['processing_time'] = processing_time
             result['custom_id'] = custom_id
             api_rate_limit_detected = is_rate_limit_error(result)
-            self.stats_manager.record_request(
-                success=result.get('success', False),
-                tokens_input=result.get('input_tokens', 0),
-                tokens_output=result.get('output_tokens', 0),
-                tokens_cached=result.get('cached_tokens', 0),
-                cost=result.get('cost', 0.0),
-                api_response_time=result.get('api_response_time', 0.0),
-                error_type=result.get('error_type'),
-                retry_count=max(0, result.get('attempts', 1) - 1),
-                api_rate_limit_detected=api_rate_limit_detected,
-                model=result.get('model', self.model)
-            )
+            if not api_rate_limit_detected:
+                self.stats_manager.record_request(
+                    success=result.get('success', False),
+                    tokens_input=result.get('input_tokens', 0),
+                    tokens_output=result.get('output_tokens', 0),
+                    tokens_cached=result.get('cached_tokens', 0),
+                    cost=result.get('cost', 0.0),
+                    api_response_time=result.get('api_response_time', 0.0),
+                    error_type=result.get('error_type'),
+                    retry_count=max(0, result.get('attempts', 1) - 1),
+                    api_rate_limit_detected=False,
+                    coordinated_wait_time=0.0,
+                    model=self.model
+                )
             if result.get('success'):
                 logger.debug(
                     "Processamento individual concluído",
@@ -403,8 +400,7 @@ class AIProcessor:
                 'error_type': type(e).__name__,
                 'processing_time': processing_time,
                 'custom_id': custom_id,
-                'request_id': request_id,
-                'model': self.model
+                'request_id': request_id
             }
 
     def _calculate_progress_intervals(self, total: int) -> List[int]:
@@ -418,8 +414,8 @@ class AIProcessor:
         return sorted(intervals)
 
     async def process_batch(
-        self,
-        texts: List[str],
+        self, 
+        texts: List[str], 
         prompt_template: str,
         json_schema: Optional[Dict[str, Any]] = None,
         batch_id: Optional[str] = None,
@@ -427,8 +423,9 @@ class AIProcessor:
         **kwargs
     ) -> Dict[str, Any]:
         batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
-        if custom_ids and len(custom_ids) != len(texts):
-            raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
+        if custom_ids is not None:
+            if not isinstance(custom_ids, list) or len(custom_ids) != len(texts):
+                raise ValueError(f"custom_ids deve ser uma lista do mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
         total_successful = 0
         logged_progress = set()
         progress_lock = asyncio.Lock()
@@ -475,18 +472,18 @@ class AIProcessor:
         while pending_items:
             task_to_index = {}
             current_tasks = []
-            for i, text in pending_items:
-                custom_id = custom_ids[i] if custom_ids else None
+            for idx, text in pending_items:
+                custom_id = custom_ids[idx] if (custom_ids is not None and len(custom_ids) > idx) else None
                 task = asyncio.create_task(
                     self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
                 )
                 current_tasks.append(task)
-                task_to_index[task] = i
+                task_to_index[task] = idx
             rate_limit_indices = []
             rate_limit_detected = False
             while current_tasks:
                 done, pending = await asyncio.wait(
-                    current_tasks,
+                    current_tasks, 
                     return_when=asyncio.FIRST_COMPLETED
                 )
                 for completed_task in done:
@@ -523,8 +520,7 @@ class AIProcessor:
                             'content': None,
                             'success': False,
                             'error': str(e),
-                            'error_type': type(e).__name__,
-                            'model': self.model
+                            'error_type': type(e).__name__
                         }
                 current_tasks = list(pending)
             if rate_limit_indices:
@@ -556,41 +552,31 @@ class AIProcessor:
             'batch_id': batch_id
         }
 
-    def stats_report(self, batch_result: Optional[Dict] = None) -> str:
-        """
-        Gera um relatório único e completo de stats incluindo:
-        - Batch (se fornecido)
-        - Performance
-        - Rate limiter
-        - Calibração
-        """
-        report = []
-        if batch_result is not None:
-            report.append(self.stats_manager.format_stats(batch_result['batch_stats'], title="BATCH"))
+    # FUNÇÃO ÚNICA DE STATS: Consolida batch, performance, rate limiter, calibração, etc.
+    def show_full_stats(self, batch_result: Optional[Dict[str, Any]] = None):
+        lines = []
+        if batch_result is not None and 'batch_stats' in batch_result:
+            lines.append(self.stats_manager.format_stats(batch_result['batch_stats'], title="Batch"))
         global_stats = self.stats_manager.get_global_stats()
-        report.append(self.stats_manager.format_stats(global_stats, title="TOTAL GLOBAL"))
-        # Rate limiter status
-        rl_status = self.rate_limiter.get_status()
-        rl_lines = [
-            "⚡ STATUS DO RATE LIMITER:",
-            f"   🔢 Tokens usados: {rl_status['tokens_used']:,}",
-            f"   📊 Utilização: {rl_status['utilization_percent']:.1f}%",
-            f"   ⏱️ Tempo no minuto: {rl_status['time_in_minute']:.1f}s",
-            f"   🔄 Total de esperas: {rl_status['total_waits']}",
-            f"   ⏳ Tempo total de espera: {rl_status['total_wait_time']:.1f}s",
-            f"   🌐 Ativo global: {rl_status['global_rate_limit_active']}",
-            f"   🚦 Batch atual: {rl_status['current_batch_id']}"
-        ]
-        report.append('\n'.join(rl_lines))
-        # Calibração
-        calibration_stats = self.rate_limiter.get_calibration_stats()
-        calib_lines = [
-            "🎯 ESTATÍSTICAS DE CALIBRAÇÃO:",
-            f"   📊 Precisão das estimativas: {calibration_stats['accuracy_percentage']:.1f}%",
-            f"   🔧 Fator de calibração atual: {calibration_stats['current_calibration_factor']:.3f}",
-            f"   📈 Total de calibrações: {calibration_stats['total_calibrations']}",
-            f"   🛡️ Rate limits prevenidos: {calibration_stats['prevented_rate_limits']}",
-            f"   🚨 Rate limits detectados: {calibration_stats['api_rate_limits_detected']}"
-        ]
-        report.append('\n'.join(calib_lines))
-        return '\n\n'.join(report)
+        lines.append(self.stats_manager.format_stats(global_stats, title="Total Global"))
+        # Performance detalhada
+        lines.append("\n🔬 MÉTRICAS DE PERFORMANCE:")
+        perf = self.stats_manager.get_efficiency_metrics(global_stats)
+        for k, v in perf.items():
+            lines.append(f"   {k}: {v}")
+        # Breakdown de custos
+        lines.append("\n💰 BREAKDOWN DE CUSTOS:")
+        cost = self.stats_manager.get_cost_breakdown(global_stats)
+        for k, v in cost.items():
+            lines.append(f"   {k}: {v}")
+        # Calibração do rate limiter
+        calib = self.rate_limiter.get_calibration_stats()
+        lines.append("\n🎯 CALIBRAÇÃO RATE LIMITER:")
+        for k, v in calib.items():
+            lines.append(f"   {k}: {v}")
+        # Status do rate limiter
+        status = self.rate_limiter.get_status()
+        lines.append("\n⚡ STATUS RATE LIMITER:")
+        for k, v in status.items():
+            lines.append(f"   {k}: {v}")
+        print("\n".join(lines))
