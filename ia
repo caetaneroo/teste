@@ -24,9 +24,6 @@ def is_rate_limit_error(result: Dict[str, Any]) -> bool:
     return 'token rate limit' in error_msg
 
 class AIProcessor:
-    """
-    Processador de IA com AsyncIaraGenAI, rate limiting adaptativo e logs organizados.
-    """
     def __init__(self, config: Dict[str, Any]):
         self.client_id = config['client_id']
         self.client_secret = config['client_secret']
@@ -46,6 +43,7 @@ class AIProcessor:
         calibration_enabled = config.get('adaptive_calibration', True)
         self.rate_limiter = AdaptiveRateLimiter(max_tpm, calibration_enabled)
         self.stats_manager = StatsManager()
+        self.stats_manager.set_max_concurrent(self.max_concurrent)
         try:
             self.encoder = tiktoken.encoding_for_model(self.model)
         except KeyError:
@@ -168,16 +166,6 @@ class AIProcessor:
                                 api_params["max_tokens"] = self.max_tokens
                             if json_schema and isinstance(json_schema, dict):
                                 api_params["response_format"] = self._prepare_json_schema(json_schema)
-                            logger.debug(
-                                f"Tentativa {attempt.retry_state.attempt_number}/{MAX_RETRY} - Chamada à API",
-                                extra={
-                                    'request_id': request_id,
-                                    'attempt_number': attempt.retry_state.attempt_number,
-                                    'base_estimate': base_estimate,
-                                    'calibrated_estimate': calibrated_estimate,
-                                    'action': 'api_call_attempt'
-                                }
-                            )
                             response = await self.client.chat.completions.create(**api_params)
                             end_time = time.time()
                             api_response_time = end_time - start_time
@@ -194,41 +182,8 @@ class AIProcessor:
                             if json_schema and isinstance(json_schema, dict) and content:
                                 try:
                                     parsed_content = json.loads(content)
-                                    logger.debug(
-                                        "JSON Schema parseado com sucesso",
-                                        extra={
-                                            'request_id': request_id,
-                                            'action': 'json_parse_success'
-                                        }
-                                    )
-                                except json.JSONDecodeError as e:
-                                    logger.warning(
-                                        "Erro ao parsear JSON Schema",
-                                        extra={
-                                            'request_id': request_id,
-                                            'error': str(e),
-                                            'raw_content': content[:200],
-                                            'action': 'json_parse_error'
-                                        }
-                                    )
+                                except json.JSONDecodeError:
                                     parsed_content = content
-                            estimation_accuracy = abs(calibrated_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
-                            logger.debug(
-                                "Chamada à API bem-sucedida",
-                                extra={
-                                    'request_id': request_id,
-                                    'attempt_number': attempt.retry_state.attempt_number,
-                                    'tokens_used': tokens_used,
-                                    'input_tokens': input_tokens,
-                                    'output_tokens': output_tokens,
-                                    'cached_tokens': cached_tokens,
-                                    'base_estimate': base_estimate,
-                                    'calibrated_estimate': calibrated_estimate,
-                                    'estimation_accuracy': round(estimation_accuracy, 1),
-                                    'api_response_time': round(api_response_time, 3),
-                                    'action': 'api_call_success'
-                                }
-                            )
                             return {
                                 'content': parsed_content,
                                 'raw_content': content,
@@ -266,38 +221,10 @@ class AIProcessor:
                             }
                             if is_rate_limit_error(error_result):
                                 wait_time = self._extract_wait_time_from_error_result(error_result)
-                                logger.debug(
-                                    f"Rate limit detectado - request {request_id}",
-                                    extra={
-                                        'request_id': request_id,
-                                        'attempt_number': attempt.retry_state.attempt_number,
-                                        'wait_time': wait_time,
-                                        'action': 'rate_limit_detected'
-                                    }
-                                )
                                 raise
                             else:
-                                logger.error(
-                                    "Erro permanente - sem retry",
-                                    extra={
-                                        'request_id': request_id,
-                                        'attempt_number': attempt.retry_state.attempt_number,
-                                        'error': str(e),
-                                        'error_type': type(e).__name__,
-                                        'action': 'permanent_error'
-                                    }
-                                )
                                 return error_result
         except RetryError as retry_error:
-            logger.error(
-                "Todas as tentativas de retry falharam",
-                extra={
-                    'request_id': request_id,
-                    'total_attempts': MAX_RETRY,
-                    'final_error': str(retry_error.last_attempt.exception()) if retry_error.last_attempt else 'Desconhecido',
-                    'action': 'retry_exhausted'
-                }
-            )
             return {
                 'content': None,
                 'raw_content': None,
@@ -348,41 +275,10 @@ class AIProcessor:
                     coordinated_wait_time=0.0,
                     model=self.model
                 )
-            if result.get('success'):
-                logger.debug(
-                    "Processamento individual concluído",
-                    extra={
-                        'request_id': request_id,
-                        'processing_time': round(processing_time, 3),
-                        'action': 'single_process_success'
-                    }
-                )
-            else:
-                if not api_rate_limit_detected:
-                    logger.warning(
-                        "Processamento individual falhou",
-                        extra={
-                            'request_id': request_id,
-                            'processing_time': round(processing_time, 3),
-                            'error_type': result.get('error_type'),
-                            'action': 'single_process_failed'
-                        }
-                    )
             return result
         except Exception as e:
             end_time = time.time()
             processing_time = end_time - start_time
-            error_str = str(e).lower()
-            if 'token rate limit' not in error_str:
-                logger.error(
-                    f"Erro inesperado no processamento individual: {e}",
-                    extra={
-                        'request_id': request_id,
-                        'processing_time': round(processing_time, 3),
-                        'error': str(e),
-                        'action': 'single_process_unexpected_error'
-                    }
-                )
             return {
                 'content': None,
                 'success': False,
@@ -542,27 +438,3 @@ class AIProcessor:
             'batch_stats': batch_stats,
             'batch_id': batch_id
         }
-
-    def stats_report(self, batch_result: Optional[Dict[str, Any]] = None) -> str:
-        """
-        Gera um relatório único e consolidado de stats do batch, performance, rate limiter e calibração.
-        """
-        lines = []
-        # Batch stats
-        if batch_result and 'batch_stats' in batch_result:
-            lines.append(self.stats_manager.format_stats(batch_result['batch_stats'], title="Batch"))
-        # Global stats
-        lines.append(self.stats_manager.format_stats(self.stats_manager.get_global_stats(), title="Total Global"))
-        # Eficiência detalhada
-        lines.append("\n🔬 Métricas de Eficiência:")
-        lines.append(str(self.stats_manager.get_efficiency_metrics(self.stats_manager.get_global_stats())))
-        # Breakdown de custos
-        lines.append("\n💰 Breakdown de custos detalhado:")
-        lines.append(str(self.stats_manager.get_cost_breakdown(self.stats_manager.get_global_stats())))
-        # Calibração do rate limiter
-        lines.append("\n🎯 Estatísticas de calibração do rate limiter:")
-        lines.append(str(self.rate_limiter.get_calibration_stats()))
-        # Status do rate limiter
-        lines.append("\n⚡ Status do rate limiter:")
-        lines.append(str(self.rate_limiter.get_status()))
-        return "\n".join(lines)
