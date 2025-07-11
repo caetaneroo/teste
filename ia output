@@ -1,17 +1,11 @@
-# core/output_manager.py
-
 import time
 import json
 import logging
 import pandas as pd
+import awswrangler as wr
 import boto3
-import pyarrow as pa
-import pyarrow.parquet as pq
 from typing import List, Dict, Any, Optional, Union
-from botocore.exceptions import ClientError
 import re
-import os
-from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -26,29 +20,15 @@ class OutputManager:
         self.database = config.get('database', DEFAULT_DATABASE)
         self.workgroup = config.get('workgroup', DEFAULT_WORKGROUP)
         self.region = config.get('region', DEFAULT_REGION)
-        try:
-            self.athena_client = boto3.client('athena', region_name=self.region)
-            self.s3_client = boto3.client('s3', region_name=self.region)
-            self.glue_client = boto3.client('glue', region_name=self.region)
-        except Exception as e:
-            logger.error(f"Erro ao inicializar clientes AWS: {e}")
-            raise
-
-    def _generate_operation_id(self) -> str:
-        return f"op_{int(time.time() * 1000)}_{id(self)}"
+        self.session = boto3.Session(region_name=self.region)
 
     def _validate_table_name(self, table_name: str) -> str:
+        if not table_name or not isinstance(table_name, str):
+            raise ValueError("Nome da tabela deve ser uma string não vazia")
         sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', table_name.lower())
         if not re.match(r'^[a-zA-Z_]', sanitized):
             sanitized = f"table_{sanitized}"
         return sanitized
-
-    def _validate_s3_uri(self, s3_uri: str) -> str:
-        if not s3_uri.startswith('s3://'):
-            raise ValueError("URI S3 deve começar com 's3://'")
-        if not s3_uri.endswith('/'):
-            s3_uri += '/'
-        return s3_uri
 
     def _validate_column_name(self, column_name: str) -> str:
         if not column_name or not isinstance(column_name, str):
@@ -65,316 +45,163 @@ class OutputManager:
         include_content_text: bool = True
     ) -> pd.DataFrame:
         """
-        Processa resultados do AIProcessor e converte para DataFrame.
-        Apenas resultados de sucesso são incluídos.
-        Colunas padrão: id, processing_time, input_tokens, output_tokens, cached_tokens, tokens_used, cost.
-        As chaves do JSON de resposta da IA são prefixadas com result_.
+        Processa resultados do AIProcessor e retorna DataFrame.
+        Apenas sucessos. Colunas padrão: id, processing_time, input_tokens, output_tokens, cached_tokens, tokens_used, cost.
+        Chaves do JSON de resposta da IA são prefixadas com result_.
         """
-        operation_id = self._generate_operation_id()
-        start_time = time.time()
         id_column_name = self._validate_column_name(id_column_name)
-        try:
-            if isinstance(ai_results, dict):
-                if 'results' in ai_results:
-                    results_list = ai_results['results']
-                else:
-                    results_list = [ai_results]
-            elif isinstance(ai_results, list):
-                results_list = ai_results
+        if isinstance(ai_results, dict):
+            if 'results' in ai_results:
+                results = ai_results['results']
             else:
-                raise ValueError(f"Tipo de input não suportado: {type(ai_results)}")
-            processed_data = []
-            json_content_count = 0
-            text_content_count = 0
-            failed_count = 0
-            filtered_count = 0
-            for result in results_list:
-                if not isinstance(result, dict):
-                    continue
-                success = result.get('success', False)
-                if not success:
-                    failed_count += 1
-                    continue
-                row_data = {
-                    id_column_name: result.get('id'),
-                    'processing_time': result.get('processing_time'),
-                    'input_tokens': result.get('input_tokens'),
-                    'output_tokens': result.get('output_tokens'),
-                    'cached_tokens': result.get('cached_tokens'),
-                    'tokens_used': result.get('tokens_used'),
-                    'cost': result.get('cost')
-                }
-                content = result.get('content')
-                if content is None:
-                    if include_content_text:
-                        processed_data.append(row_data)
-                elif isinstance(content, dict):
-                    json_content_count += 1
-                    for key, value in content.items():
-                        col = f'result_{key}'
-                        if isinstance(value, (dict, list)):
-                            row_data[col] = json.dumps(value, ensure_ascii=False)
-                        else:
-                            row_data[col] = value
-                    processed_data.append(row_data)
-                elif isinstance(content, str):
-                    try:
-                        parsed_content = json.loads(content)
-                        if isinstance(parsed_content, dict):
-                            json_content_count += 1
-                            for key, value in parsed_content.items():
-                                col = f'result_{key}'
-                                if isinstance(value, (dict, list)):
-                                    row_data[col] = json.dumps(value, ensure_ascii=False)
-                                else:
-                                    row_data[col] = value
-                            processed_data.append(row_data)
-                        else:
-                            text_content_count += 1
-                            if include_content_text:
-                                row_data['content_text'] = content
-                                processed_data.append(row_data)
-                            else:
-                                filtered_count += 1
-                    except json.JSONDecodeError:
-                        text_content_count += 1
-                        if include_content_text:
-                            row_data['content_text'] = content
-                            processed_data.append(row_data)
-                        else:
-                            filtered_count += 1
-                else:
-                    text_content_count += 1
-                    if include_content_text:
-                        row_data['content_text'] = str(content)
-                        processed_data.append(row_data)
+                results = [ai_results]
+        elif isinstance(ai_results, list):
+            results = ai_results
+        else:
+            raise ValueError(f"Tipo de input não suportado: {type(ai_results)}")
+
+        processed = []
+        for r in results:
+            if not r.get('success', False):
+                continue
+            row = {
+                id_column_name: r.get('id'),
+                'processing_time': r.get('processing_time'),
+                'input_tokens': r.get('input_tokens'),
+                'output_tokens': r.get('output_tokens'),
+                'cached_tokens': r.get('cached_tokens'),
+                'tokens_used': r.get('tokens_used'),
+                'cost': r.get('cost')
+            }
+            content = r.get('content')
+            if content is None:
+                if include_content_text:
+                    processed.append(row)
+                continue
+            if isinstance(content, dict):
+                for k, v in content.items():
+                    key = f'result_{k}'
+                    if isinstance(v, (dict, list)):
+                        row[key] = json.dumps(v, ensure_ascii=False)
                     else:
-                        filtered_count += 1
-            df = pd.DataFrame(processed_data)
-            if id_column_name in df.columns:
-                cols = [id_column_name] + [col for col in df.columns if col != id_column_name]
-                df = df[cols]
-            processing_time = time.time() - start_time
-            logger.info(
-                f"✅ Processamento concluído - {len(df)} registros válidos, {json_content_count} JSON, {text_content_count} texto, {failed_count} falhas, {filtered_count} filtrados",
-                extra={
-                    'operation_id': operation_id,
-                    'total_records': len(df),
-                    'json_content_count': json_content_count,
-                    'text_content_count': text_content_count,
-                    'failed_count': failed_count,
-                    'filtered_count': filtered_count,
-                    'processing_time': round(processing_time, 2),
-                    'columns_count': len(df.columns),
-                    'id_column_name': id_column_name,
-                    'include_content_text': include_content_text,
-                    'action': 'process_ai_results_complete'
-                }
-            )
-            return df
-        except Exception as e:
-            processing_time = time.time() - start_time
-            logger.error(
-                f"Erro no processamento: {e}",
-                extra={
-                    'operation_id': operation_id,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'processing_time': round(processing_time, 2),
-                    'action': 'process_ai_results_error'
-                }
-            )
-            raise
+                        row[key] = v
+                processed.append(row)
+            elif isinstance(content, str):
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        for k, v in parsed.items():
+                            key = f'result_{k}'
+                            if isinstance(v, (dict, list)):
+                                row[key] = json.dumps(v, ensure_ascii=False)
+                            else:
+                                row[key] = v
+                        processed.append(row)
+                    else:
+                        if include_content_text:
+                            row['content_text'] = content
+                            processed.append(row)
+                except json.JSONDecodeError:
+                    if include_content_text:
+                        row['content_text'] = content
+                        processed.append(row)
+            else:
+                if include_content_text:
+                    row['content_text'] = str(content)
+                    processed.append(row)
 
-    def _upload_parquet_to_s3(self, df: pd.DataFrame, s3_uri: str, filename_prefix: str = None) -> str:
-        if filename_prefix is None:
-            filename_prefix = f"part-{uuid4().hex}"
-        local_file = f"/tmp/{filename_prefix}.parquet"
-        table = pa.Table.from_pandas(df)
-        pq.write_table(table, local_file)
-        s3_uri = self._validate_s3_uri(s3_uri)
-        bucket = s3_uri[5:].split('/')[0]
-        prefix = '/'.join(s3_uri[5:].split('/')[1:])
-        s3_key = f"{prefix}{filename_prefix}.parquet"
-        self.s3_client.upload_file(local_file, bucket, s3_key)
-        os.remove(local_file)
-        return f"s3://{bucket}/{s3_key}"
+        df = pd.DataFrame(processed)
+        if id_column_name in df.columns:
+            cols = [id_column_name] + [c for c in df.columns if c != id_column_name]
+            df = df[cols]
+        return df
 
-    def _table_exists(self, table_name: str, database: Optional[str] = None) -> bool:
-        if database is None:
-            database = self.database
-        try:
-            self.glue_client.get_table(DatabaseName=database, Name=table_name)
-            return True
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'EntityNotFoundException':
-                return False
-            raise
-
-    def _execute_athena_query(
-        self, 
-        query: str, 
-        database: Optional[str] = None,
-        wait_for_completion: bool = True,
-        max_wait_time: int = 300
-    ) -> Dict[str, Any]:
-        if database is None:
-            database = self.database
-        try:
-            query_params = {
-                'QueryString': query,
-                'WorkGroup': self.workgroup,
-                'QueryExecutionContext': {'Database': database}
-            }
-            response = self.athena_client.start_query_execution(**query_params)
-            execution_id = response['QueryExecutionId']
-            if not wait_for_completion:
-                return {
-                    'execution_id': execution_id,
-                    'status': 'RUNNING',
-                    'query': query
-                }
-            start_time = time.time()
-            while time.time() - start_time < max_wait_time:
-                response = self.athena_client.get_query_execution(QueryExecutionId=execution_id)
-                status = response['QueryExecution']['Status']['State']
-                if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-                    return {
-                        'execution_id': execution_id,
-                        'status': status,
-                        'query': query,
-                        'response': response
-                    }
-                time.sleep(2)
-            return {
-                'execution_id': execution_id,
-                'status': 'TIMEOUT',
-                'query': query
-            }
-        except Exception as e:
-            logger.error(f"Erro na query Athena: {e}")
-            raise
-
-    def create_table_from_dataframe(
-        self, 
-        df: pd.DataFrame, 
+    def create_table(
+        self,
+        df: pd.DataFrame,
         table_name: str,
-        s3_location: str,
+        s3_path: str,
         database: Optional[str] = None,
         partition_cols: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Cria tabela Iceberg (sempre overwrite), grava os dados no S3.
+        Cria tabela Iceberg sobrescrevendo sempre.
         """
-        operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
-        s3_location = self._validate_s3_uri(s3_location)
-        if database is None:
-            database = self.database
-        # Apaga tabela se existe
-        if self._table_exists(table_name, database=database):
-            drop_ddl = f"DROP TABLE IF EXISTS `{database}`.`{table_name}`"
-            self._execute_athena_query(drop_ddl, database=database)
-        # Grava Parquet no S3
-        self._upload_parquet_to_s3(df, s3_location)
-        # Monta DDL Iceberg
-        columns_ddl = []
-        for col_name, dtype in df.dtypes.items():
-            if pd.api.types.is_integer_dtype(dtype):
-                sql_type = 'bigint'
-            elif pd.api.types.is_float_dtype(dtype):
-                sql_type = 'double'
-            elif pd.api.types.is_bool_dtype(dtype):
-                sql_type = 'boolean'
-            else:
-                sql_type = 'string'
-            columns_ddl.append(f"`{col_name}` {sql_type}")
-        partition_stmt = ""
-        if partition_cols:
-            partition_stmt = f"PARTITIONED BY ({', '.join([f'`{col}`' for col in partition_cols])})"
-        ddl = f"""
-        CREATE TABLE IF NOT EXISTS `{database}`.`{table_name}` (
-            {', '.join(columns_ddl)}
+        s3_path = s3_path if s3_path.endswith('/') else s3_path + '/'
+        database = database or self.database
+        wr.catalog.create_database(database, exist_ok=True, boto3_session=self.session)
+        wr.s3.to_parquet(
+            df=df,
+            path=s3_path,
+            dataset=True,
+            database=database,
+            table=table_name,
+            mode='overwrite',
+            partition_cols=partition_cols,
+            table_type='ICEBERG',
+            boto3_session=self.session
         )
-        {partition_stmt}
-        LOCATION '{s3_location}'
-        TBLPROPERTIES ('table_type'='ICEBERG')
-        """
-        self._execute_athena_query(ddl, database=database)
-        logger.info(f"✅ Tabela {table_name} criada/atualizada em {s3_location} (Iceberg, overwrite)")
-        return {
-            'table_name': table_name,
-            'database': database,
-            's3_location': s3_location,
-            'columns_count': len(df.columns),
-            'operation_id': operation_id
-        }
+        logger.info(f"✅ Tabela {table_name} criada/atualizada em {s3_path} (Iceberg, overwrite)")
+        return {'database': database, 'table': table_name, 's3_path': s3_path, 'mode': 'overwrite'}
 
-    def append_to_table(
-        self, 
-        df: pd.DataFrame, 
+    def append_table(
+        self,
+        df: pd.DataFrame,
         table_name: str,
-        s3_location: str,
-        database: Optional[str] = None
+        s3_path: str,
+        database: Optional[str] = None,
+        partition_cols: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Faz append dos dados no S3 da tabela Iceberg.
+        Adiciona dados em tabela Iceberg existente.
         """
-        operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
-        s3_location = self._validate_s3_uri(s3_location)
-        if database is None:
-            database = self.database
-        if not self._table_exists(table_name, database=database):
-            raise ValueError(f"Tabela {table_name} não existe.")
-        self._upload_parquet_to_s3(df, s3_location)
+        s3_path = s3_path if s3_path.endswith('/') else s3_path + '/'
+        database = database or self.database
+        wr.s3.to_parquet(
+            df=df,
+            path=s3_path,
+            dataset=True,
+            database=database,
+            table=table_name,
+            mode='append',
+            partition_cols=partition_cols,
+            table_type='ICEBERG',
+            boto3_session=self.session
+        )
         logger.info(f"✅ Append realizado em {table_name}")
-        return {
-            'table_name': table_name,
-            'database': database,
-            'rows_added': len(df),
-            's3_location': s3_location,
-            'operation_id': operation_id
-        }
+        return {'database': database, 'table': table_name, 's3_path': s3_path, 'mode': 'append'}
 
     def upsert_table(
-        self, 
-        df: pd.DataFrame, 
+        self,
+        df: pd.DataFrame,
         table_name: str,
-        s3_location: str,
+        s3_path: str,
+        database: Optional[str] = None,
         id_column: str = 'id',
-        database: Optional[str] = None
+        partition_cols: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Upsert real: cria se não existe, senão faz merge overwrite pelo id.
+        Upsert real: cria se não existe, senão faz overwrite_partitions (merge pelo particionamento).
         """
-        operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
-        s3_location = self._validate_s3_uri(s3_location)
-        if database is None:
-            database = self.database
-        if not self._table_exists(table_name, database=database):
-            return self.create_table_from_dataframe(
-                df, table_name, s3_location, database=database
-            )
-        # Grava Parquet temporário no S3
-        temp_prefix = f"tmp_upsert_{uuid4().hex}/"
-        temp_s3 = s3_location + temp_prefix
-        parquet_uri = self._upload_parquet_to_s3(df, temp_s3)
-        # Athena Iceberg MERGE INTO
-        merge_sql = f"""
-        MERGE INTO `{database}`.`{table_name}` t
-        USING (SELECT * FROM '{parquet_uri}') s
-        ON t.{id_column} = s.{id_column}
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
-        """
-        self._execute_athena_query(merge_sql, database=database)
+        s3_path = s3_path if s3_path.endswith('/') else s3_path + '/'
+        database = database or self.database
+        if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
+            return self.create_table(df, table_name, s3_path, database, partition_cols)
+        if id_column not in df.columns:
+            raise ValueError(f"id_column '{id_column}' not found in dataframe")
+        wr.s3.to_parquet(
+            df=df,
+            path=s3_path,
+            dataset=True,
+            database=database,
+            table=table_name,
+            mode='overwrite_partitions',
+            partition_cols=partition_cols or [id_column],
+            table_type='ICEBERG',
+            boto3_session=self.session
+        )
         logger.info(f"✅ Upsert realizado em {table_name}")
-        return {
-            'table_name': table_name,
-            'database': database,
-            'rows_upserted': len(df),
-            's3_location': s3_location,
-            'operation_id': operation_id
-        }
+        return {'database': database, 'table': table_name, 's3_path': s3_path, 'mode': 'upsert'}
