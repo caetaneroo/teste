@@ -187,3 +187,56 @@ class InputManager:
                 f"LOAD-TXT | source=Local (txt) | success=False | error={str(e)} | filepath={filepath}"
             )
             return None
+
+    def from_sql(self, filepath: str, **kwargs) -> Optional[str]:
+        """
+        Lê um arquivo .sql e retorna o conteúdo como string para uso com from_athena().
+        """
+        try:
+            with open(filepath, "r", encoding=kwargs.get("encoding", "utf-8")) as f:
+                content = f.read().strip()
+            
+            # Validação básica: verifica se não está vazio
+            if not content:
+                raise ValueError("O arquivo .sql está vazio.")
+            
+            logger.info(
+                f"LOAD-SQL | source=Local (sql) | success=True | n_chars={len(content)} | filepath={filepath}"
+            )
+            return content
+        except Exception as e:
+            logger.error(
+                f"LOAD-SQL | source=Local (sql) | success=False | error={str(e)} | filepath={filepath}"
+            )
+            return None
+
+    def from_athena_file(
+        self,
+        sql_filepath: str,
+        params: Optional[Dict[str, Any]] = None,
+        ctas_database: Optional[str] = None,
+        ctas_workgroup: Optional[str] = None,
+        s3_output: Optional[str] = None,
+        **kwargs
+    ) -> Optional[pd.DataFrame]:
+        """
+        Lê uma query de um arquivo .sql e executa no Athena, retornando um DataFrame.
+        Combina from_sql() + from_athena() em uma única operação.
+        """
+        try:
+            # Carrega a query do arquivo
+            query = self.from_sql(sql_filepath, **kwargs)
+            if query is None:
+                return None
+            
+            # Executa a query no Athena
+            return self.from_athena(
+                query=query,
+                params=params,
+                ctas_database=ctas_database,
+                ctas_workgroup=ctas_workgroup,
+                s3_output=s3_output
+            )
+        except Exception as e:
+            self._log_dataframe_info(None, source=f"Athena (from file: {sql_filepath})", error=str(e))
+            return None
