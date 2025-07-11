@@ -5,6 +5,7 @@ import awswrangler as wr
 import boto3
 from typing import List, Dict, Any, Optional, Union
 import re
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,11 @@ class OutputManager:
             raise ValueError("Caminho S3 deve começar com 's3://'")
         return s3_path.rstrip('/') + '/'
 
+    def _get_temp_path(self, s3_path: str) -> str:
+        """Gera caminho temporário dentro do path da tabela"""
+        base_path = s3_path.rstrip('/')
+        return f"{base_path}/_temp_{int(time.time())}/"
+
     def process_ai_results(
         self, 
         ai_results: Union[Dict[str, Any], List[Dict[str, Any]]],
@@ -55,6 +61,9 @@ class OutputManager:
         Processa resultados do AIProcessor e retorna DataFrame.
         Apenas sucessos são processados.
         """
+        start_time = time.time()
+        logger.info("🔄 Iniciando processamento dos resultados do AI Processor")
+        
         id_column_name = self._validate_column_name(id_column_name)
         
         if isinstance(ai_results, dict):
@@ -131,9 +140,9 @@ class OutputManager:
             cols = [id_column_name] + [c for c in df.columns if c != id_column_name]
             df = df[cols]
         
-        # Log único com informações detalhadas
+        processing_time = time.time() - start_time
         result_cols_str = ', '.join(sorted(result_columns)) if result_columns else 'nenhuma'
-        logger.info(f"AI Results processados: {success_count} sucessos, DataFrame com {len(df)} linhas, colunas de resultado: {result_cols_str}")
+        logger.info(f"✅ AI Results processados | Sucessos: {success_count} | DataFrame: {len(df)} linhas | Colunas resultado: {result_cols_str} | Tempo: {processing_time:.2f}s")
         
         return df
 
@@ -148,9 +157,13 @@ class OutputManager:
         """
         Cria tabela Iceberg usando funções nativas do awswrangler.
         """
+        start_time = time.time()
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        temp_path = self._get_temp_path(s3_path)
+        
+        logger.info(f"🔄 Criando tabela Iceberg | Database: {database} | Tabela: {table_name} | Registros: {len(df)}")
         
         # Garante que o database existe
         wr.catalog.create_database(database, exist_ok=True, boto3_session=self.session)
@@ -161,13 +174,15 @@ class OutputManager:
             database=database,
             table=table_name,
             table_location=s3_path,
+            temp_path=temp_path,
             partition_cols=partition_cols,
             mode='overwrite',
             boto3_session=self.session,
             workgroup=self.workgroup
         )
         
-        logger.info(f"Tabela Iceberg {database}.{table_name} criada com {len(df)} registros em {s3_path}")
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Tabela Iceberg criada | {database}.{table_name} | Registros: {len(df)} | S3: {s3_path} | Tempo: {processing_time:.2f}s")
 
     def append_table(
         self,
@@ -180,9 +195,13 @@ class OutputManager:
         """
         Adiciona dados em tabela Iceberg existente.
         """
+        start_time = time.time()
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        temp_path = self._get_temp_path(s3_path)
+        
+        logger.info(f"🔄 Append em tabela Iceberg | Database: {database} | Tabela: {table_name} | Registros: {len(df)}")
         
         # Verifica se a tabela existe
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
@@ -194,13 +213,15 @@ class OutputManager:
             database=database,
             table=table_name,
             table_location=s3_path,
+            temp_path=temp_path,
             partition_cols=partition_cols,
             mode='append',
             boto3_session=self.session,
             workgroup=self.workgroup
         )
         
-        logger.info(f"Adicionados {len(df)} registros à tabela Iceberg {database}.{table_name}")
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Append realizado | {database}.{table_name} | Registros adicionados: {len(df)} | Tempo: {processing_time:.2f}s")
 
     def upsert_table(
         self,
@@ -214,14 +235,19 @@ class OutputManager:
         """
         Upsert usando merge nativo do Iceberg.
         """
+        start_time = time.time()
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        temp_path = self._get_temp_path(s3_path)
         
         # Se a tabela não existe, cria
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
+            logger.info(f"🔄 Tabela não existe, criando | Database: {database} | Tabela: {table_name} | Registros: {len(df)}")
             self.create_table(df, table_name, s3_path, database, partition_cols)
             return
+        
+        logger.info(f"🔄 Upsert em tabela Iceberg | Database: {database} | Tabela: {table_name} | Registros: {len(df)}")
         
         # Define chaves de merge (usa 'id' como padrão se não especificado)
         if merge_keys is None:
@@ -238,6 +264,7 @@ class OutputManager:
             database=database,
             table=table_name,
             table_location=s3_path,
+            temp_path=temp_path,
             merge_cols=merge_keys,
             partition_cols=partition_cols,
             mode='upsert',
@@ -245,7 +272,9 @@ class OutputManager:
             workgroup=self.workgroup
         )
         
-        logger.info(f"Upsert realizado em tabela Iceberg {database}.{table_name} com {len(df)} registros usando chaves: {merge_keys}")
+        processing_time = time.time() - start_time
+        merge_keys_str = ', '.join(merge_keys)
+        logger.info(f"✅ Upsert realizado | {database}.{table_name} | Registros: {len(df)} | Chaves merge: {merge_keys_str} | Tempo: {processing_time:.2f}s")
 
     def merge_table(
         self,
@@ -259,9 +288,13 @@ class OutputManager:
         """
         Merge usando capacidades nativas do Iceberg.
         """
+        start_time = time.time()
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        temp_path = self._get_temp_path(s3_path)
+        
+        logger.info(f"🔄 Merge em tabela Iceberg | Database: {database} | Tabela: {table_name} | Registros: {len(df)}")
         
         # Verifica se a tabela existe
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
@@ -278,6 +311,7 @@ class OutputManager:
             database=database,
             table=table_name,
             table_location=s3_path,
+            temp_path=temp_path,
             merge_cols=merge_keys,
             partition_cols=partition_cols,
             mode='upsert',
@@ -285,7 +319,9 @@ class OutputManager:
             workgroup=self.workgroup
         )
         
-        logger.info(f"Merge realizado em tabela Iceberg {database}.{table_name} com {len(df)} registros usando chaves: {merge_keys}")
+        processing_time = time.time() - start_time
+        merge_keys_str = ', '.join(merge_keys)
+        logger.info(f"✅ Merge realizado | {database}.{table_name} | Registros: {len(df)} | Chaves merge: {merge_keys_str} | Tempo: {processing_time:.2f}s")
 
     def overwrite_partitions(
         self,
@@ -298,9 +334,13 @@ class OutputManager:
         """
         Sobrescreve partições específicas da tabela Iceberg.
         """
+        start_time = time.time()
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        temp_path = self._get_temp_path(s3_path)
+        
+        logger.info(f"🔄 Overwrite partitions | Database: {database} | Tabela: {table_name} | Registros: {len(df)}")
         
         # Verifica se a tabela existe
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
@@ -312,13 +352,15 @@ class OutputManager:
             database=database,
             table=table_name,
             table_location=s3_path,
+            temp_path=temp_path,
             partition_cols=partition_cols,
             mode='overwrite_partitions',
             boto3_session=self.session,
             workgroup=self.workgroup
         )
         
-        logger.info(f"Partições sobrescritas na tabela Iceberg {database}.{table_name} com {len(df)} registros")
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Partições sobrescritas | {database}.{table_name} | Registros: {len(df)} | Tempo: {processing_time:.2f}s")
 
     def delete_table(
         self,
@@ -329,11 +371,14 @@ class OutputManager:
         """
         Remove tabela Iceberg do catálogo e opcionalmente os dados do S3.
         """
+        start_time = time.time()
         table_name = self._validate_table_name(table_name)
         database = database or self.database
         
+        logger.info(f"🔄 Removendo tabela | Database: {database} | Tabela: {table_name} | Limpar S3: {delete_s3_data}")
+        
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
-            logger.warning(f"Tabela {database}.{table_name} não existe")
+            logger.warning(f"⚠️ Tabela {database}.{table_name} não existe")
             return
         
         # Remove a tabela do catálogo
@@ -342,6 +387,8 @@ class OutputManager:
             table=table_name,
             boto3_session=self.session
         )
+        
+        processing_time = time.time() - start_time
         
         # Opcionalmente remove os dados do S3
         if delete_s3_data:
@@ -352,11 +399,11 @@ class OutputManager:
                     boto3_session=self.session
                 )
                 wr.s3.delete_objects(path=table_location, boto3_session=self.session)
-                logger.info(f"Tabela Iceberg {database}.{table_name} e dados S3 removidos")
+                logger.info(f"✅ Tabela e dados S3 removidos | {database}.{table_name} | Tempo: {processing_time:.2f}s")
             except Exception:
-                logger.info(f"Tabela Iceberg {database}.{table_name} removida do catálogo")
+                logger.info(f"✅ Tabela removida do catálogo | {database}.{table_name} | Tempo: {processing_time:.2f}s")
         else:
-            logger.info(f"Tabela Iceberg {database}.{table_name} removida do catálogo")
+            logger.info(f"✅ Tabela removida do catálogo | {database}.{table_name} | Tempo: {processing_time:.2f}s")
 
     def read_table(
         self,
@@ -368,8 +415,11 @@ class OutputManager:
         """
         Lê dados de uma tabela Iceberg.
         """
+        start_time = time.time()
         table_name = self._validate_table_name(table_name)
         database = database or self.database
+        
+        logger.info(f"🔄 Lendo tabela Iceberg | Database: {database} | Tabela: {table_name}")
         
         # Verifica se a tabela existe
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
@@ -385,5 +435,6 @@ class OutputManager:
             workgroup=self.workgroup
         )
         
-        logger.info(f"Lidos {len(df)} registros da tabela Iceberg {database}.{table_name}")
+        processing_time = time.time() - start_time
+        logger.info(f"✅ Tabela lida | {database}.{table_name} | Registros: {len(df)} | Tempo: {processing_time:.2f}s")
         return df
