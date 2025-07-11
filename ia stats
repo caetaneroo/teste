@@ -1,10 +1,13 @@
 # core/stats_manager.py
+
 import time
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 
-# Tabela de preços por modelo e tipo de token
+logger = logging.getLogger(__name__)
+
+# Configuração de preços centralizada
 MODEL_PRICING = {
     'gpt-35-turbo-16k': {'input': 0.0015, 'output': 0.002, 'cache': 0.00075},
     'gpt-4': {'input': 0.03, 'output': 0.06, 'cache': 0.015},
@@ -27,39 +30,49 @@ MODEL_PRICING = {
 
 @dataclass
 class Stats:
-    """Classe única para qualquer tipo de estatística - batch ou global"""
+    """
+    Classe unificada para todas as estatísticas (batch e global).
+    
+    Centraliza todas as métricas para evitar duplicação e inconsistências.
+    """
+    # Métricas básicas
     total_requests: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
+    
+    # Métricas de tokens
     total_tokens_input: int = 0
     total_tokens_output: int = 0
     total_tokens_cached: int = 0
+    
+    # Métricas de custo
     total_cost: float = 0.0
-    rate_limit_waits: int = 0
+    cost_breakdown: Dict[str, float] = field(default_factory=dict)
+    
+    # Métricas de tempo
     processing_time: float = 0.0
     start_time: float = field(default_factory=time.time)
-    
-    # MÉTRICAS DE PERFORMANCE DETALHADAS
     total_api_response_time: float = 0.0
     min_response_time: float = float('inf')
     max_response_time: float = 0.0
-    total_wait_time: float = 0.0
+    
+    # Métricas de estimativas (nova)
+    total_estimated_tokens: int = 0
+    estimation_errors: List[float] = field(default_factory=list)
+    
+    # Métricas de retry e erro
     retry_attempts: int = 0
-    concurrent_peak: int = 0
     errors_by_type: Dict[str, int] = field(default_factory=dict)
     
-    # MÉTRICAS DE RATE LIMITING COORDENADO
-    api_rate_limits_detected: int = 0
-    global_rate_limit_activations: int = 0
-    coordinated_wait_time: float = 0.0
+    # Métricas de concorrência
+    concurrent_peak: int = 0
     
-    # Breakdown de custos por modelo
-    cost_breakdown: Dict[str, float] = field(default_factory=dict)
+    # Metadados
     model_used: str = ""
     
     @property
     def total_tokens(self) -> int:
-        """Total de tokens (input + output + cached)"""
+        """Total de tokens processados"""
         return self.total_tokens_input + self.total_tokens_output + self.total_tokens_cached
     
     @property
@@ -79,19 +92,15 @@ class Stats:
     
     @property
     def efficiency_rate(self) -> float:
-        """% do tempo gasto processando vs aguardando (incluindo coordenação)"""
-        total_time = self.processing_time
-        if total_time <= 0:
+        """Taxa de eficiência baseada em throughput vs tempo total"""
+        if self.processing_time <= 0:
             return 0.0
         
-        # Incluir AMBOS os tipos de espera
-        total_wait_time = self.total_wait_time + self.coordinated_wait_time
-        processing_time = total_time - total_wait_time
+        # Calcular tempo "útil" baseado em respostas da API
+        useful_time = self.total_api_response_time
         
-        # Garantir que não seja negativo
-        processing_time = max(0, processing_time)
-        
-        return (processing_time / total_time * 100) if total_time > 0 else 0.0
+        # Eficiência = tempo útil / tempo total
+        return (useful_time / self.processing_time * 100) if self.processing_time > 0 else 0.0
     
     @property
     def retry_rate(self) -> float:
@@ -104,54 +113,67 @@ class Stats:
         return (self.total_cost / self.total_tokens) if self.total_tokens > 0 else 0.0
     
     @property
+    def cost_per_request(self) -> float:
+        """Custo médio por requisição"""
+        return (self.total_cost / self.successful_requests) if self.successful_requests > 0 else 0.0
+    
+    @property
     def cache_hit_rate(self) -> float:
         """Taxa de cache hit em percentual"""
         total_input_and_cached = self.total_tokens_input + self.total_tokens_cached
         return (self.total_tokens_cached / total_input_and_cached * 100) if total_input_and_cached > 0 else 0.0
     
     @property
-    def cost_savings_from_cache(self) -> float:
-        """Economia real baseada no modelo usado"""
-        if not self.model_used or self.model_used not in MODEL_PRICING:
-            cache_price = MODEL_PRICING['gpt-35-turbo-16k']['cache']
-            input_price = MODEL_PRICING['gpt-35-turbo-16k']['input']
-        else:
-            pricing = MODEL_PRICING[self.model_used]
-            cache_price = pricing['cache']
-            input_price = pricing['input']
+    def estimation_accuracy(self) -> float:
+        """Precisão das estimativas de tokens"""
+        if not self.estimation_errors:
+            return 0.0
         
-        savings_per_token = input_price - cache_price
-        return (self.total_tokens_cached / 1000) * savings_per_token
+        # Calcular quantas estimativas estão dentro de 20% do real
+        accurate_count = sum(1 for error in self.estimation_errors if abs(error) <= 0.2)
+        return (accurate_count / len(self.estimation_errors)) * 100
     
     @property
-    def coordination_efficiency(self) -> float:
-        """Eficiência da coordenação vs rate limits individuais"""
-        if self.api_rate_limits_detected == 0:
-            return 100.0
-        return (1 - (self.global_rate_limit_activations / self.api_rate_limits_detected)) * 100
+    def cost_savings_from_cache(self) -> float:
+        """Economia real com cache baseada no modelo"""
+        if not self.model_used or self.model_used not in MODEL_PRICING:
+            return 0.0
+        
+        pricing = MODEL_PRICING[self.model_used]
+        savings_per_token = pricing['input'] - pricing['cache']
+        return (self.total_tokens_cached / 1000) * savings_per_token
 
 class StatsManager:
     """
-    Gerenciador único que serve batch e global - com correções de concorrência e rate limits
+    Gerenciador centralizado de todas as estatísticas.
+    
+    Responsável por:
+    - Coletar e organizar todas as métricas
+    - Calcular estatísticas derivadas
+    - Gerar relatórios formatados
+    - Manter consistência entre batch e global
     """
     
-    def __init__(self):
-        self.global_stats = Stats()
+    def __init__(self, model: str = "gpt-4o-mini"):
+        self.model = model
+        self.global_stats = Stats(model_used=model)
         self._batch_snapshots = {}
-        # ✅ CORREÇÃO 1: Track real de concorrência respeitando max_concurrent
+        
+        # Controle de concorrência
         self._current_concurrent = 0
-        self._max_concurrent_limit = 10  # Será definido pelo AIProcessor
-        self._peak_concurrent_ever = 0
-    
-    def set_max_concurrent(self, max_concurrent: int) -> None:
-        """✅ NOVA: Define o limite máximo de concorrência"""
-        self._max_concurrent_limit = max_concurrent
+        self._max_concurrent_ever = 0
+        
+        logger.debug(f"StatsManager inicializado para modelo: {model}")
     
     def start_batch(self, batch_id: str) -> None:
-        """Inicia tracking de um batch"""
+        """
+        Inicia tracking de um batch específico.
+        
+        Cria um snapshot do estado global atual para depois calcular
+        as estatísticas apenas deste batch.
+        """
         self._batch_snapshots[batch_id] = {
             'start_time': time.time(),
-            'batch_peak_concurrent': 0,
             'start_stats': Stats(
                 total_requests=self.global_stats.total_requests,
                 successful_requests=self.global_stats.successful_requests,
@@ -160,26 +182,30 @@ class StatsManager:
                 total_tokens_output=self.global_stats.total_tokens_output,
                 total_tokens_cached=self.global_stats.total_tokens_cached,
                 total_cost=self.global_stats.total_cost,
-                rate_limit_waits=self.global_stats.rate_limit_waits,
                 processing_time=0.0,
                 start_time=time.time(),
                 total_api_response_time=self.global_stats.total_api_response_time,
                 min_response_time=self.global_stats.min_response_time,
                 max_response_time=self.global_stats.max_response_time,
-                total_wait_time=self.global_stats.total_wait_time,
+                total_estimated_tokens=self.global_stats.total_estimated_tokens,
+                estimation_errors=self.global_stats.estimation_errors.copy(),
                 retry_attempts=self.global_stats.retry_attempts,
                 concurrent_peak=0,
                 errors_by_type=self.global_stats.errors_by_type.copy(),
-                api_rate_limits_detected=self.global_stats.api_rate_limits_detected,
-                global_rate_limit_activations=self.global_stats.global_rate_limit_activations,
-                coordinated_wait_time=self.global_stats.coordinated_wait_time,
                 cost_breakdown=self.global_stats.cost_breakdown.copy(),
-                model_used=self.global_stats.model_used
+                model_used=self.model
             )
         }
+        
+        logger.debug(f"Batch {batch_id} iniciado - snapshot criado")
     
     def end_batch(self, batch_id: str) -> Stats:
-        """Finaliza batch e retorna stats apenas desse batch"""
+        """
+        Finaliza batch e retorna estatísticas específicas dele.
+        
+        Calcula a diferença entre o estado atual e o snapshot inicial
+        para obter métricas apenas deste batch.
+        """
         if batch_id not in self._batch_snapshots:
             raise ValueError(f"Batch {batch_id} não foi iniciado")
         
@@ -187,73 +213,97 @@ class StatsManager:
         start_stats = snapshot['start_stats']
         end_time = time.time()
         
-        # Calcular diferença = stats apenas deste batch
+        # Calcular estatísticas apenas deste batch
         batch_stats = Stats(
+            # Métricas básicas (diferença)
             total_requests=self.global_stats.total_requests - start_stats.total_requests,
             successful_requests=self.global_stats.successful_requests - start_stats.successful_requests,
             failed_requests=self.global_stats.failed_requests - start_stats.failed_requests,
+            
+            # Métricas de tokens (diferença)
             total_tokens_input=self.global_stats.total_tokens_input - start_stats.total_tokens_input,
             total_tokens_output=self.global_stats.total_tokens_output - start_stats.total_tokens_output,
             total_tokens_cached=self.global_stats.total_tokens_cached - start_stats.total_tokens_cached,
+            
+            # Métricas de custo (diferença)
             total_cost=self.global_stats.total_cost - start_stats.total_cost,
-            rate_limit_waits=self.global_stats.rate_limit_waits - start_stats.rate_limit_waits,
+            
+            # Métricas de tempo (específicas do batch)
             processing_time=end_time - snapshot['start_time'],
             start_time=snapshot['start_time'],
             total_api_response_time=self.global_stats.total_api_response_time - start_stats.total_api_response_time,
             min_response_time=self.global_stats.min_response_time if self.global_stats.min_response_time != float('inf') else 0.0,
             max_response_time=self.global_stats.max_response_time,
-            total_wait_time=self.global_stats.total_wait_time - start_stats.total_wait_time,
+            
+            # Métricas de estimativas (diferença)
+            total_estimated_tokens=self.global_stats.total_estimated_tokens - start_stats.total_estimated_tokens,
+            estimation_errors=self.global_stats.estimation_errors[len(start_stats.estimation_errors):],
+            
+            # Métricas de retry (diferença)
             retry_attempts=self.global_stats.retry_attempts - start_stats.retry_attempts,
             
-            # ✅ CORREÇÃO 1: Usar pico real respeitando limite
-            concurrent_peak=min(snapshot.get('batch_peak_concurrent', 0), self._max_concurrent_limit),
+            # Métricas de concorrência (máximo do batch)
+            concurrent_peak=self._max_concurrent_ever,
             
-            # ✅ CORREÇÃO 2: Garantir que rate limits sejam propagados
-            api_rate_limits_detected=self.global_stats.api_rate_limits_detected - start_stats.api_rate_limits_detected,
-            global_rate_limit_activations=self.global_stats.global_rate_limit_activations - start_stats.global_rate_limit_activations,
-            coordinated_wait_time=self.global_stats.coordinated_wait_time - start_stats.coordinated_wait_time,
+            # Erros (diferença)
+            errors_by_type={
+                error_type: self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)
+                for error_type in set(list(self.global_stats.errors_by_type.keys()) + list(start_stats.errors_by_type.keys()))
+                if (self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)) > 0
+            },
             
+            # Breakdown de custos (diferença)
             cost_breakdown={
                 model: self.global_stats.cost_breakdown.get(model, 0) - start_stats.cost_breakdown.get(model, 0)
                 for model in set(list(self.global_stats.cost_breakdown.keys()) + list(start_stats.cost_breakdown.keys()))
                 if (self.global_stats.cost_breakdown.get(model, 0) - start_stats.cost_breakdown.get(model, 0)) > 0
             },
-            model_used=self.global_stats.model_used,
             
-            errors_by_type={
-                error_type: self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)
-                for error_type in set(list(self.global_stats.errors_by_type.keys()) + list(start_stats.errors_by_type.keys()))
-                if (self.global_stats.errors_by_type.get(error_type, 0) - start_stats.errors_by_type.get(error_type, 0)) > 0
-            }
+            # Metadados
+            model_used=self.model
         )
         
         # Limpar snapshot
         del self._batch_snapshots[batch_id]
+        
+        logger.debug(f"Batch {batch_id} finalizado - estatísticas calculadas")
+        
         return batch_stats
     
-    def record_request(self, success: bool, tokens_input: int = 0, 
-                      tokens_output: int = 0, tokens_cached: int = 0,
-                      cost: float = 0.0, api_response_time: float = 0.0, 
-                      error_type: Optional[str] = None, retry_count: int = 0,
-                      api_rate_limit_detected: bool = False,
-                      coordinated_wait_time: float = 0.0,
-                      model: str = "") -> None:
-        """Registra requisição com modelo e custos detalhados"""
+    def record_request(
+        self,
+        success: bool,
+        tokens_input: int = 0,
+        tokens_output: int = 0,
+        tokens_cached: int = 0,
+        cost: float = 0.0,
+        api_response_time: float = 0.0,
+        error_type: Optional[str] = None,
+        retry_count: int = 0,
+        estimated_tokens: int = 0,
+        actual_tokens: int = 0
+    ) -> None:
+        """
+        Registra uma requisição com todas as métricas relevantes.
         
+        Este é o ponto central de coleta de dados - todas as métricas
+        passam por aqui para garantir consistência.
+        """
+        # Métricas básicas
         self.global_stats.total_requests += 1
-        
-        # Registrar modelo usado
-        if model and not self.global_stats.model_used:
-            self.global_stats.model_used = model
         
         if success:
             self.global_stats.successful_requests += 1
+            
+            # Métricas de tempo (só para sucessos)
             if api_response_time > 0:
                 self.global_stats.total_api_response_time += api_response_time
                 self.global_stats.min_response_time = min(self.global_stats.min_response_time, api_response_time)
                 self.global_stats.max_response_time = max(self.global_stats.max_response_time, api_response_time)
         else:
             self.global_stats.failed_requests += 1
+            
+            # Registrar tipo de erro
             if error_type:
                 if error_type not in self.global_stats.errors_by_type:
                     self.global_stats.errors_by_type[error_type] = 0
@@ -263,275 +313,81 @@ class StatsManager:
         self.global_stats.total_tokens_input += tokens_input
         self.global_stats.total_tokens_output += tokens_output
         self.global_stats.total_tokens_cached += tokens_cached
+        
+        # Métricas de estimativas
+        if estimated_tokens > 0 and actual_tokens > 0:
+            self.global_stats.total_estimated_tokens += estimated_tokens
+            
+            # Calcular erro relativo da estimativa
+            error_ratio = (actual_tokens - estimated_tokens) / estimated_tokens
+            self.global_stats.estimation_errors.append(error_ratio)
+            
+            # Manter apenas os últimos 1000 erros para eficiência
+            if len(self.global_stats.estimation_errors) > 1000:
+                self.global_stats.estimation_errors = self.global_stats.estimation_errors[-1000:]
+        
+        # Métricas de retry
         self.global_stats.retry_attempts += retry_count
         
-        # Calcular custo detalhado por modelo
-        if model and model in MODEL_PRICING:
-            pricing = MODEL_PRICING[model]
-            detailed_cost = (
-                (tokens_input / 1000) * pricing['input'] +
-                (tokens_output / 1000) * pricing['output'] +
-                (tokens_cached / 1000) * pricing['cache']
-            )
-            self.global_stats.total_cost += detailed_cost
-            
-            # Registrar breakdown por modelo
-            if model not in self.global_stats.cost_breakdown:
-                self.global_stats.cost_breakdown[model] = 0
-            self.global_stats.cost_breakdown[model] += detailed_cost
-        else:
-            # Fallback para custo fornecido
+        # Métricas de custo
+        if cost > 0:
             self.global_stats.total_cost += cost
+            
+            # Breakdown por modelo
+            if self.model not in self.global_stats.cost_breakdown:
+                self.global_stats.cost_breakdown[self.model] = 0
+            self.global_stats.cost_breakdown[self.model] += cost
+        elif tokens_input > 0 or tokens_output > 0:  # Calcular custo se não fornecido
+            calculated_cost = self._calculate_cost(tokens_input, tokens_output, tokens_cached)
+            self.global_stats.total_cost += calculated_cost
+            
+            if self.model not in self.global_stats.cost_breakdown:
+                self.global_stats.cost_breakdown[self.model] = 0
+            self.global_stats.cost_breakdown[self.model] += calculated_cost
         
-        # ✅ CORREÇÃO 2: Métricas de coordenação corrigidas
-        if api_rate_limit_detected:
-            self.global_stats.api_rate_limits_detected += 1
-        if coordinated_wait_time > 0:
-            self.global_stats.coordinated_wait_time += coordinated_wait_time
+        # Atualizar pico de concorrência
+        self.global_stats.concurrent_peak = max(self.global_stats.concurrent_peak, self._current_concurrent)
     
-    def record_rate_limit(self) -> None:
-        """Registra uma espera por rate limit (compatibilidade)"""
-        self.global_stats.rate_limit_waits += 1
-    
-    def record_rate_limit_wait(self, wait_time: float) -> None:
-        """Registra espera por rate limit com tempo"""
-        self.global_stats.rate_limit_waits += 1
-        self.global_stats.total_wait_time += wait_time
-    
-    def record_global_rate_limit_activation(self, wait_time: float, requests_affected: int = 0) -> None:
-        """Registra ativação de rate limit global coordenado"""
-        self.global_stats.global_rate_limit_activations += 1
-        self.global_stats.coordinated_wait_time += wait_time
+    def _calculate_cost(self, input_tokens: int, output_tokens: int, cached_tokens: int) -> float:
+        """Calcula custo baseado no modelo atual"""
+        if self.model not in MODEL_PRICING:
+            return 0.0
         
-        logger = logging.getLogger(__name__)
-        logger.debug(
-            f"Rate limit global registrado: {wait_time:.1f}s de pausa",
-            extra={
-                'wait_time': wait_time,
-                'requests_affected': requests_affected,
-                'total_activations': self.global_stats.global_rate_limit_activations,
-                'total_coordinated_wait': self.global_stats.coordinated_wait_time,
-                'action': 'global_rate_limit_stats'
-            }
-        )
+        pricing = MODEL_PRICING[self.model]
+        
+        regular_input_tokens = max(0, input_tokens - cached_tokens)
+        regular_input_cost = (regular_input_tokens / 1000) * pricing['input']
+        cached_cost = (cached_tokens / 1000) * pricing['cache']
+        output_cost = (output_tokens / 1000) * pricing['output']
+        
+        return regular_input_cost + cached_cost + output_cost
     
     def record_concurrent_start(self) -> None:
-        """✅ CORREÇÃO 1: Registra início respeitando max_concurrent"""
-        # ✅ CORREÇÃO: Só incrementar se não exceder o limite
-        if self._current_concurrent < self._max_concurrent_limit:
-            self._current_concurrent += 1
-            
-            # Track do pico real respeitando limite
-            self._peak_concurrent_ever = max(self._peak_concurrent_ever, self._current_concurrent)
-            self.global_stats.concurrent_peak = self._peak_concurrent_ever
-            
-            # Track do pico real por batch
-            for batch_id, snapshot in self._batch_snapshots.items():
-                snapshot['batch_peak_concurrent'] = max(
-                    snapshot.get('batch_peak_concurrent', 0), 
-                    self._current_concurrent
-                )
+        """Registra início de requisição concorrente"""
+        self._current_concurrent += 1
+        self._max_concurrent_ever = max(self._max_concurrent_ever, self._current_concurrent)
+        self.global_stats.concurrent_peak = self._max_concurrent_ever
     
     def record_concurrent_end(self) -> None:
         """Registra fim de requisição concorrente"""
         self._current_concurrent = max(0, self._current_concurrent - 1)
     
     def get_global_stats(self) -> Stats:
-        """Retorna stats globais atualizadas"""
+        """Retorna estatísticas globais atualizadas"""
+        # Atualizar tempo de processamento
         self.global_stats.processing_time = time.time() - self.global_stats.start_time
         return self.global_stats
     
-    def format_stats(self, stats: Stats, title: str = "Stats") -> str:
-        """Formata qualquer stats de forma consistente com todas as métricas"""
+    def format_stats(self, stats: Stats, title: str = "Estatísticas") -> str:
+        """
+        Formata estatísticas de forma consistente e legível.
         
-        # Preparar erros por tipo
-        errors_summary = ""
-        if stats.errors_by_type:
-            error_list = [f"{error_type}: {count}" for error_type, count in stats.errors_by_type.items()]
-            errors_summary = f"\n   🚨 Erros: {', '.join(error_list)}"
-        
-        # Formatação básica com tokens detalhados
-        basic_stats = f"""📊 {title.upper()}:
-   ✅ Sucessos: {stats.successful_requests}
-   ❌ Falhas: {stats.failed_requests}
-   🔢 Tokens total: {stats.total_tokens:,}
-   📥 Tokens input: {stats.total_tokens_input:,}
-   📤 Tokens output: {stats.total_tokens_output:,}
-   💾 Tokens cached: {stats.total_tokens_cached:,}
-   💰 Custo: ${stats.total_cost:.4f}
-   ⏱️ Tempo total: {stats.processing_time:.2f}s
-   📈 Taxa: {stats.avg_rate:.2f} req/s
-   📊 Sucesso: {stats.success_rate:.1f}%"""
-        
-        # Seção de custo detalhado
-        cost_stats = ""
-        if stats.cost_breakdown:
-            cost_lines = [f"   💰 {model}: ${cost:.4f}" for model, cost in stats.cost_breakdown.items()]
-            cost_stats = f"""
-   
-   💰 BREAKDOWN DE CUSTOS:
-{chr(10).join(cost_lines)}
-   💵 Custo por token: ${stats.cost_per_token:.6f}"""
-        
-        # Adicionar métricas de cache se houver dados
-        cache_stats = ""
-        if stats.total_tokens_cached > 0:
-            cache_stats = f"""
-   
-   💾 CACHE PERFORMANCE:
-   🎯 Cache hit rate: {stats.cache_hit_rate:.1f}%
-   💵 Economia estimada: ${stats.cost_savings_from_cache:.4f}"""
-        
-        # Performance com eficiência e concorrência corrigidas
-        performance_stats = ""
-        if stats.successful_requests > 0 and stats.avg_response_time > 0:
-            total_wait = stats.total_wait_time + stats.coordinated_wait_time
-            performance_stats = f"""
-   
-   🚀 PERFORMANCE:
-   ⚡ Response time médio: {stats.avg_response_time:.3f}s
-   ⚡ Response time min/max: {stats.min_response_time:.3f}s / {stats.max_response_time:.3f}s
-   🔄 Taxa de retry: {stats.retry_rate:.2f} retries/req
-   ⏳ Eficiência: {stats.efficiency_rate:.1f}% (processando vs aguardando)
-   🔗 Pico concorrente: {stats.concurrent_peak} requisições simultâneas
-   ⏱️ Tempo total espera: {total_wait:.1f}s"""
-        
-        # Adicionar seção de coordenação se houver dados
-        coordination_stats = ""
-        if stats.api_rate_limits_detected > 0:
-            coordination_stats = f"""
-   
-   🤝 COORDENAÇÃO DE RATE LIMITS:
-   🚨 Rate limits detectados: {stats.api_rate_limits_detected}
-   🌐 Ativações globais: {stats.global_rate_limit_activations}
-   ⏱️ Tempo coordenado: {stats.coordinated_wait_time:.1f}s
-   📈 Eficiência coordenação: {stats.coordination_efficiency:.1f}%"""
-        
-        # Adicionar rate limits se houver
-        rate_limit_stats = ""
-        if stats.rate_limit_waits > 0:
-            rate_limit_stats = f"\n   ⏳ Rate limits proativos: {stats.rate_limit_waits} ({stats.total_wait_time:.1f}s)"
-        
-        return basic_stats + cost_stats + cache_stats + performance_stats + coordination_stats + rate_limit_stats + errors_summary
-    
-    def reset_global(self) -> None:
-        """Reset stats globais"""
-        self.global_stats = Stats()
-        self._batch_snapshots.clear()
-        self._current_concurrent = 0
-        self._peak_concurrent_ever = 0
-    
-    def compare_batches(self, *batch_results) -> str:
-        """Compara múltiplos batches sem repetição"""
-        output = ["📊 COMPARAÇÃO DE BATCHES:", "=" * 80]
-        
-        for i, result in enumerate(batch_results, 1):
-            batch_stats = result['batch_stats']
-            batch_id = result.get('batch_id', f'batch_{i}')
-            
-            output.append(f"\n🔍 Batch {i} ({batch_id}):")
-            batch_formatted = self.format_stats(batch_stats, title="").replace("📊 :", "").strip()
-            
-            # Indentar as linhas
-            for line in batch_formatted.split('\n'):
-                if line.strip():
-                    output.append(f"   {line.strip()}")
-        
-        return "\n".join(output)
-    
-    def summary_report(self, batch_results: List[Dict], global_stats: Stats) -> str:
-        """Relatório completo sem repetição"""
-        output = ["🎯 RELATÓRIO COMPLETO", "=" * 80]
-        
-        # Batches individuais
-        for i, result in enumerate(batch_results, 1):
-            batch_stats = result['batch_stats']
-            batch_id = result.get('batch_id', f'batch_{i}')
-            formatted = self.format_stats(batch_stats, title=f"Batch {i} ({batch_id})")
-            output.append(f"\n{formatted}")
-        
-        # Global
-        formatted_global = self.format_stats(global_stats, title="TOTAL GERAL")
-        output.append(f"\n{formatted_global}")
-        
-        return "\n".join(output)
-    
-    def get_efficiency_metrics(self, stats: Stats) -> Dict[str, Any]:
-        """Retorna métricas de eficiência calculadas"""
-        return {
-            'throughput_per_minute': stats.successful_requests / (stats.processing_time / 60) if stats.processing_time > 0 else 0,
-            'cost_efficiency': stats.total_cost / stats.successful_requests if stats.successful_requests > 0 else 0,
-            'time_efficiency': stats.efficiency_rate,
-            'cache_efficiency': stats.cache_hit_rate,
-            'coordination_efficiency': stats.coordination_efficiency,
-            'error_rate': (stats.failed_requests / stats.total_requests * 100) if stats.total_requests > 0 else 0,
-            'avg_tokens_per_request': stats.total_tokens / stats.total_requests if stats.total_requests > 0 else 0
-        }
-    
-    def get_cost_breakdown(self, stats: Stats) -> Dict[str, Any]:
-        """Retorna breakdown detalhado de custos por modelo"""
-        model_costs = {}
-        if stats.model_used and stats.model_used in MODEL_PRICING:
-            pricing = MODEL_PRICING[stats.model_used]
-            model_costs = {
-                'input_tokens_cost': (stats.total_tokens_input / 1000) * pricing['input'],
-                'output_tokens_cost': (stats.total_tokens_output / 1000) * pricing['output'],
-                'cached_tokens_cost': (stats.total_tokens_cached / 1000) * pricing['cache'],
-                'cached_tokens_savings': stats.cost_savings_from_cache
-            }
-        
-        return {
-            'total_cost': stats.total_cost,
-            'cost_per_request': stats.total_cost / stats.successful_requests if stats.successful_requests > 0 else 0,
-            'cost_per_token': stats.cost_per_token,
-            'estimated_savings_from_cache': stats.cost_savings_from_cache,
-            'model_breakdown': stats.cost_breakdown,
-            'detailed_breakdown': model_costs
-        }
-    
-    def export_stats_json(self, stats: Stats) -> Dict[str, Any]:
-        """Exporta stats em formato JSON para análise externa"""
-        return {
-            'basic_metrics': {
-                'total_requests': stats.total_requests,
-                'successful_requests': stats.successful_requests,
-                'failed_requests': stats.failed_requests,
-                'success_rate': stats.success_rate
-            },
-            'token_metrics': {
-                'total_tokens': stats.total_tokens,
-                'input_tokens': stats.total_tokens_input,
-                'output_tokens': stats.total_tokens_output,
-                'cached_tokens': stats.total_tokens_cached,
-                'cache_hit_rate': stats.cache_hit_rate
-            },
-            'performance_metrics': {
-                'processing_time': stats.processing_time,
-                'avg_response_time': stats.avg_response_time,
-                'min_response_time': stats.min_response_time,
-                'max_response_time': stats.max_response_time,
-                'avg_rate': stats.avg_rate,
-                'efficiency_rate': stats.efficiency_rate,
-                'concurrent_peak': stats.concurrent_peak
-            },
-            'cost_metrics': {
-                'total_cost': stats.total_cost,
-                'cost_per_token': stats.cost_per_token,
-                'cost_savings_from_cache': stats.cost_savings_from_cache,
-                'cost_breakdown': stats.cost_breakdown,
-                'model_used': stats.model_used
-            },
-            'reliability_metrics': {
-                'rate_limit_waits': stats.rate_limit_waits,
-                'total_wait_time': stats.total_wait_time,
-                'retry_attempts': stats.retry_attempts,
-                'retry_rate': stats.retry_rate,
-                'errors_by_type': stats.errors_by_type
-            },
-            'coordination_metrics': {
-                'api_rate_limits_detected': stats.api_rate_limits_detected,
-                'global_rate_limit_activations': stats.global_rate_limit_activations,
-                'coordinated_wait_time': stats.coordinated_wait_time,
-                'coordination_efficiency': stats.coordination_efficiency
-            }
-        }
+        Inclui todas as métricas relevantes organizadas por categoria.
+        """
+        # Seção básica
+        basic_section = f"""📊 {title.upper()}:
+✅ Sucessos: {stats.successful_requests:,}
+❌ Falhas: {stats.failed_requests:,}
+📊 Taxa de sucesso: {stats.success_rate:.1f}%
+⏱️ Tempo total: {stats.processing_time:.2f}s
+🚀 Taxa: {stats.avg
