@@ -10,32 +10,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TokenUsageRecord:
-    """Registro de uso de tokens para calibração adaptativa"""
     estimated_tokens: int
     actual_tokens: int
     timestamp: float
     accuracy_ratio: float
 
 class AdaptiveRateLimiter:
-    """
-    Rate limiter com calibração adaptativa e logs organizados por responsabilidade
-
-    Características:
-    - Calibra estimativas com base em dados históricos reais
-    - Auto-ajuste estatístico para otimizar precisão
-    - Rate limiting global coordenado com logs centralizados
-    - Prevenção proativa de rate limits
-    - Máximo aproveitamento da quota disponível
-    - Logs organizados por eventos (não por requests individuais)
-    - SEM redução automática de capacidade
-    """
-
     def __init__(self, max_tokens_per_minute: int = 180000, calibration_enabled: bool = True):
         self.max_tpm = max_tokens_per_minute
-        self.tokens_used_this_minute = 0
-        self.minute_start = time.time()
-        self._lock = asyncio.Lock()
-
         self.calibration_enabled = calibration_enabled
         self.usage_history = deque(maxlen=1000)
         self.calibration_factor = 1.0
@@ -46,8 +28,6 @@ class AdaptiveRateLimiter:
         self.accurate_estimates = 0
         self.last_recalibration = time.time()
         self.recalibration_interval = 300
-        self.total_waits = 0
-        self.total_wait_time = 0.0
 
         self._global_rate_limit_active = False
         self._global_wait_until = 0.0
@@ -91,12 +71,14 @@ class AdaptiveRateLimiter:
             return
 
         accuracy_ratio = actual_tokens / estimated_tokens
+
         usage_record = TokenUsageRecord(
             estimated_tokens=estimated_tokens,
             actual_tokens=actual_tokens,
             timestamp=time.time(),
             accuracy_ratio=accuracy_ratio
         )
+
         self.usage_history.append(usage_record)
         self.total_calibrations += 1
         if 0.8 <= accuracy_ratio <= 1.2:
@@ -159,6 +141,7 @@ class AdaptiveRateLimiter:
         return int(base_estimate * self.calibration_factor)
 
     async def wait_for_tokens(self, estimated_tokens: int) -> int:
+        # ✅ Apenas aguardar se houver rate limit global ativo
         async with self._rate_limit_lock:
             current_time = time.time()
             if self._global_rate_limit_active and current_time < self._global_wait_until:
@@ -185,40 +168,8 @@ class AdaptiveRateLimiter:
                         'action': 'rate_limit_pause_end_and_resolved'
                     }
                 )
-
-        calibrated_tokens = self.get_calibrated_estimate(estimated_tokens)
-        async with self._lock:
-            current_time = time.time()
-            if current_time - self.minute_start >= 60:
-                if self.tokens_used_this_minute > 0:
-                    utilization = (self.tokens_used_this_minute / self.max_tpm) * 100
-                    logger.debug(
-                        "Reset de minuto - utilização",
-                        extra={
-                            'tokens_used': self.tokens_used_this_minute,
-                            'max_tpm': self.max_tpm,
-                            'utilization_percent': round(utilization, 1),
-                            'action': 'minute_reset'
-                        }
-                    )
-                self.tokens_used_this_minute = 0
-                self.minute_start = current_time
-
-            if self.tokens_used_this_minute + calibrated_tokens > self.max_tpm:
-                wait_time = 60 - (current_time - self.minute_start)
-                if wait_time > 0:
-                    logger.debug(
-                        f"Rate limiting proativo - aguardando {wait_time:.1f}s",
-                        extra={
-                            'wait_time': wait_time,
-                            'max_tpm': self.max_tpm,
-                            'action': 'proactive_rate_limit'
-                        }
-                    )
-                    await asyncio.sleep(wait_time)
-                    self.tokens_used_this_minute = 0
-                    self.minute_start = time.time()
-        return calibrated_tokens
+        # Não há mais lógica de pausa proativa!
+        return self.get_calibrated_estimate(estimated_tokens)
 
     async def _activate_global_rate_limit(self, wait_time: float, source: str = 'api'):
         async with self._rate_limit_lock:
@@ -228,9 +179,6 @@ class AdaptiveRateLimiter:
                 self._global_rate_limit_active = True
                 self._global_wait_until = new_wait_until
                 self._rate_limit_logged = False
-                self.total_waits += 1
-                self.total_wait_time += wait_time
-                self.prevented_rate_limits += 1
                 logger.debug(
                     f"Rate limit global ativado - fonte: {source}",
                     extra={
@@ -270,36 +218,10 @@ class AdaptiveRateLimiter:
             self._rate_limit_event_active = False
 
     def record_tokens(self, tokens_used: int) -> None:
-        self.tokens_used_this_minute += tokens_used
-        if self.tokens_used_this_minute > self.max_tpm * 0.9:
-            logger.warning(
-                "Alta utilização de tokens detectada",
-                extra={
-                    'tokens_used': self.tokens_used_this_minute,
-                    'max_tpm': self.max_tpm,
-                    'utilization_percent': round((self.tokens_used_this_minute / self.max_tpm) * 100, 1),
-                    'action': 'high_utilization'
-                }
-            )
+        pass  # Não é mais necessário controlar tokens/minuto localmente
 
     def get_status(self) -> Dict[str, Any]:
-        current_time = time.time()
-        time_in_minute = current_time - self.minute_start
-        tokens_remaining = max(0, self.max_tpm - self.tokens_used_this_minute)
-        utilization = (self.tokens_used_this_minute / self.max_tpm) * 100
-        accuracy_percentage = (self.accurate_estimates / self.total_calibrations * 100) if self.total_calibrations > 0 else 0
         return {
-            'tokens_used': self.tokens_used_this_minute,
-            'tokens_limit': self.max_tpm,
-            'tokens_remaining': tokens_remaining,
-            'utilization_percent': round(utilization, 2),
-            'time_in_minute': round(time_in_minute, 2),
-            'total_waits': self.total_waits,
-            'total_wait_time': round(self.total_wait_time, 2),
-            'calibration_factor': round(self.calibration_factor, 3),
-            'calibration_accuracy': round(accuracy_percentage, 1),
-            'total_calibrations': self.total_calibrations,
-            'prevented_rate_limits': self.prevented_rate_limits,
             'api_rate_limits_detected': self.api_rate_limits_detected,
             'rate_limit_events': self._rate_limit_events,
             'global_rate_limit_active': self._global_rate_limit_active,
@@ -318,66 +240,5 @@ class AdaptiveRateLimiter:
             'last_recalibration': self.last_recalibration,
             'prevented_rate_limits': self.prevented_rate_limits,
             'api_rate_limits_detected': self.api_rate_limits_detected,
-            'rate_limit_events': self._rate_limit_events,
-            'efficiency_metrics': {
-                'avg_wait_time': round(self.total_wait_time / self.total_waits, 2) if self.total_waits > 0 else 0,
-                'wait_frequency': round(self.total_waits / self.total_calibrations, 3) if self.total_calibrations > 0 else 0
-            },
-            'global_coordination': {
-                'global_rate_limit_active': self._global_rate_limit_active,
-                'current_batch_id': self._current_batch_id,
-                'rate_limit_logged': self._rate_limit_logged
-            }
+            'rate_limit_events': self._rate_limit_events
         }
-
-    def reset_calibration(self) -> None:
-        logger.info("Resetando sistema de calibração do RateLimiter")
-        self.usage_history.clear()
-        self.calibration_factor = 1.0
-        self.total_calibrations = 0
-        self.accurate_estimates = 0
-        self.last_recalibration = time.time()
-        self.prevented_rate_limits = 0
-        self.api_rate_limits_detected = 0
-        self._rate_limit_events = 0
-        self._global_rate_limit_active = False
-        self._global_wait_until = 0.0
-        self._rate_limit_logged = False
-        self._rate_limit_event_active = False
-
-    def disable_calibration(self) -> None:
-        logger.info("Desabilitando sistema de calibração do RateLimiter")
-        self.calibration_enabled = False
-        self.calibration_factor = 1.0
-
-    def enable_calibration(self) -> None:
-        logger.info("Habilitando sistema de calibração do RateLimiter")
-        self.calibration_enabled = True
-
-    def log_performance_summary(self) -> None:
-        if self.total_calibrations > 0:
-            avg_wait_time = self.total_wait_time / self.total_waits if self.total_waits > 0 else 0
-            accuracy_percentage = (self.accurate_estimates / self.total_calibrations) * 100
-            logger.info(
-                "Resumo de performance do RateLimiter",
-                extra={
-                    'total_calibrations': self.total_calibrations,
-                    'calibration_accuracy': round(accuracy_percentage, 2),
-                    'calibration_factor': round(self.calibration_factor, 3),
-                    'total_waits': self.total_waits,
-                    'total_wait_time': round(self.total_wait_time, 2),
-                    'average_wait_time': round(avg_wait_time, 2),
-                    'prevented_rate_limits': self.prevented_rate_limits,
-                    'api_rate_limits_detected': self.api_rate_limits_detected,
-                    'rate_limit_events': self._rate_limit_events,
-                    'max_tpm': self.max_tpm,
-                    'efficiency_percent': round(100 - (self.total_wait_time / 60 * 100), 2) if self.total_wait_time < 60 else 0,
-                    'action': 'performance_summary'
-                }
-            )
-
-    def __del__(self):
-        try:
-            self.log_performance_summary()
-        except:
-            pass
