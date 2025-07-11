@@ -141,9 +141,9 @@ class InputManager:
             self._log_dataframe_info(None, source=f"Local ({filetype})", error=str(e))
             return None
 
-    def from_txt_prompt(self, filepath: str, **kwargs) -> Optional[pd.DataFrame]:
+    def from_txt_prompt(self, filepath: str, **kwargs) -> Optional[str]:
         """
-        Lê um arquivo .txt de prompt, valida a presença de {text} e retorna DataFrame com coluna 'prompt'.
+        Lê um arquivo .txt de prompt, valida a presença de {text} e retorna o conteúdo como string.
         """
         try:
             with open(filepath, "r", encoding=kwargs.get("encoding", "utf-8")) as f:
@@ -161,12 +161,14 @@ class InputManager:
                     "Isso pode causar erro no ai_processor.py, pois ele só substitui {text}."
                 )
             
-            # Retorna DataFrame com uma coluna 'prompt'
-            df = pd.DataFrame({"prompt": [content]})
-            self._log_dataframe_info(df, source="Local (txt-prompt)")
-            return df
+            logger.info(
+                f"LOAD-TXT-PROMPT | source=Local (txt-prompt) | success=True | n_chars={len(content)} | filepath={filepath}"
+            )
+            return content
         except Exception as e:
-            self._log_dataframe_info(None, source="Local (txt-prompt)", error=str(e))
+            logger.error(
+                f"LOAD-TXT-PROMPT | source=Local (txt-prompt) | success=False | error={str(e)} | filepath={filepath}"
+            )
             return None
 
     def from_txt(self, filepath: str, **kwargs) -> Optional[str]:
