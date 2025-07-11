@@ -1,0 +1,163 @@
+# input_manager.py
+
+import logging
+import pandas as pd
+import awswrangler as wr
+from typing import Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_ATHENA_DATABASE = "workspace_db"
+DEFAULT_ATHENA_WORKGROUP = "analytics-workgroup-v3"
+
+class InputManager:
+    def __init__(
+        self,
+        athena_database: str = DEFAULT_ATHENA_DATABASE,
+        athena_workgroup: str = DEFAULT_ATHENA_WORKGROUP,
+        boto3_session: Optional[Any] = None
+    ):
+        self.athena_database = athena_database
+        self.athena_workgroup = athena_workgroup
+        self.boto3_session = boto3_session
+        logger.info(
+            "InputManager inicializado",
+            extra={
+                "athena_database": self.athena_database,
+                "athena_workgroup": self.athena_workgroup,
+                "action": "input_manager_init"
+            }
+        )
+
+    def _log_dataframe_info(self, df: Optional[pd.DataFrame], source: str, error: Optional[str] = None):
+        if df is not None and error is None:
+            logger.info(
+                f"✅ DataFrame carregado com sucesso de {source}.\n"
+                f"Registros: {len(df)}\n"
+                f"Colunas: {len(df.columns)}\n"
+                f"Nomes das colunas: {list(df.columns)}",
+                extra={
+                    "source": source,
+                    "n_rows": len(df),
+                    "n_cols": len(df.columns),
+                    "columns": list(df.columns),
+                    "success": True,
+                    "action": "load_dataframe"
+                }
+            )
+        else:
+            logger.error(
+                f"❌ Falha ao carregar DataFrame de {source}.\n"
+                f"Motivo: {error}",
+                extra={
+                    "source": source,
+                    "error": error,
+                    "success": False,
+                    "action": "load_dataframe"
+                }
+            )
+
+    def from_athena(
+        self,
+        query: str,
+        params: Optional[Dict[str, Any]] = None,
+        ctas_database: Optional[str] = None,
+        ctas_workgroup: Optional[str] = None,
+        s3_output: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        """
+        Executa uma query no Athena (modo CTAS) e retorna um DataFrame.
+        """
+        ctas_database = ctas_database or self.athena_database
+        ctas_workgroup = ctas_workgroup or self.athena_workgroup
+        try:
+            df = wr.athena.read_sql_query(
+                sql=query,
+                database=ctas_database,
+                workgroup=ctas_workgroup,
+                ctas_approach=True,
+                params=params,
+                boto3_session=self.boto3_session,
+                s3_output=s3_output
+            )
+            self._log_dataframe_info(df, source="Athena")
+            return df
+        except Exception as e:
+            self._log_dataframe_info(None, source="Athena", error=str(e))
+            return None
+
+    def from_s3(
+        self,
+        s3_path: str,
+        filetype: Optional[str] = None,
+        **kwargs
+    ) -> Optional[pd.DataFrame]:
+        """
+        Lê um arquivo do S3 e retorna um DataFrame.
+        Suporta filetype: 'csv', 'parquet', 'json', 'excel'.
+        """
+        try:
+            if not filetype:
+                if s3_path.endswith(".parquet"):
+                    filetype = "parquet"
+                elif s3_path.endswith(".csv"):
+                    filetype = "csv"
+                elif s3_path.endswith(".json"):
+                    filetype = "json"
+                elif s3_path.endswith(".xls") or s3_path.endswith(".xlsx"):
+                    filetype = "excel"
+                else:
+                    raise ValueError("Não foi possível inferir o tipo do arquivo pelo sufixo. Informe o parâmetro 'filetype'.")
+            if filetype == "parquet":
+                df = wr.s3.read_parquet(path=s3_path, boto3_session=self.boto3_session, **kwargs)
+            elif filetype == "csv":
+                df = wr.s3.read_csv(path=s3_path, boto3_session=self.boto3_session, **kwargs)
+            elif filetype == "json":
+                df = wr.s3.read_json(path=s3_path, boto3_session=self.boto3_session, **kwargs)
+            elif filetype == "excel":
+                df = wr.s3.read_excel(path=s3_path, boto3_session=self.boto3_session, **kwargs)
+            else:
+                raise ValueError(f"Tipo de arquivo não suportado: {filetype}")
+            self._log_dataframe_info(df, source=f"S3 ({filetype})")
+            return df
+        except Exception as e:
+            self._log_dataframe_info(None, source=f"S3 ({filetype})", error=str(e))
+            return None
+
+    def from_local(
+        self,
+        filepath: str,
+        filetype: Optional[str] = None,
+        **kwargs
+    ) -> Optional[pd.DataFrame]:
+        """
+        Lê um arquivo local e retorna um DataFrame.
+        Suporta filetype: 'csv', 'parquet', 'json', 'excel'.
+        """
+        try:
+            if not filetype:
+                if filepath.endswith(".parquet"):
+                    filetype = "parquet"
+                elif filepath.endswith(".csv"):
+                    filetype = "csv"
+                elif filepath.endswith(".json"):
+                    filetype = "json"
+                elif filepath.endswith(".xls") or filepath.endswith(".xlsx"):
+                    filetype = "excel"
+                else:
+                    raise ValueError("Não foi possível inferir o tipo do arquivo pelo sufixo. Informe o parâmetro 'filetype'.")
+            if filetype == "parquet":
+                df = pd.read_parquet(filepath, **kwargs)
+            elif filetype == "csv":
+                df = pd.read_csv(filepath, **kwargs)
+            elif filetype == "json":
+                df = pd.read_json(filepath, **kwargs)
+            elif filetype == "excel":
+                df = pd.read_excel(filepath, **kwargs)
+            else:
+                raise ValueError(f"Tipo de arquivo não suportado: {filetype}")
+            self._log_dataframe_info(df, source=f"Local ({filetype})")
+            return df
+        except Exception as e:
+            self._log_dataframe_info(None, source=f"Local ({filetype})", error=str(e))
+            return None
