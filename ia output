@@ -48,7 +48,7 @@ class OutputManager:
             raise
             
         logger.info(
-            "OutputManager inicializado com sucesso",
+            "OutputManager inicializado",
             extra={
                 'database': self.database,
                 'workgroup': self.workgroup,
@@ -89,40 +89,24 @@ class OutputManager:
             
         return s3_uri
 
-    def _extract_json_columns(self, json_data: Dict[str, Any]) -> Dict[str, str]:
-        """
-        Extrai colunas de um objeto JSON e infere tipos básicos
+    def _validate_column_name(self, column_name: str) -> str:
+        """Valida e sanitiza nome da coluna"""
+        if not column_name or not isinstance(column_name, str):
+            raise ValueError("Nome da coluna deve ser uma string não vazia")
         
-        Returns:
-            Dict com nome_coluna: tipo_sql
-        """
-        columns = {}
+        # Remove caracteres especiais e converte para lowercase
+        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', column_name.lower())
         
-        for key, value in json_data.items():
-            # Sanitiza nome da coluna
-            col_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(key).lower())
+        # Garante que começa com letra ou underscore
+        if not re.match(r'^[a-zA-Z_]', sanitized):
+            sanitized = f"col_{sanitized}"
             
-            # Infere tipo baseado no valor
-            if value is None:
-                col_type = 'string'
-            elif isinstance(value, bool):
-                col_type = 'boolean'
-            elif isinstance(value, int):
-                col_type = 'bigint'
-            elif isinstance(value, float):
-                col_type = 'double'
-            elif isinstance(value, (list, dict)):
-                col_type = 'string'  # Será serializado como JSON
-            else:
-                col_type = 'string'
-                
-            columns[col_name] = col_type
-            
-        return columns
+        return sanitized
 
     def process_ai_results(
         self, 
-        ai_results: Union[Dict[str, Any], List[Dict[str, Any]]]
+        ai_results: Union[Dict[str, Any], List[Dict[str, Any]]],
+        custom_id_column_name: str = 'custom_id'
     ) -> pd.DataFrame:
         """
         Processa resultados do AIProcessor e converte para DataFrame
@@ -132,21 +116,16 @@ class OutputManager:
                 - Resultado único (dict)
                 - Lista de resultados (list)
                 - Resultado de batch com 'results' (dict com key 'results')
+            custom_id_column_name: Nome personalizado para a coluna de ID (default: 'custom_id')
         
         Returns:
-            DataFrame com custom_id e colunas extraídas do content JSON
+            DataFrame com custom_id (ou nome personalizado) e colunas extraídas do content JSON
         """
         operation_id = self._generate_operation_id()
         start_time = time.time()
         
-        logger.info(
-            "🔄 Iniciando processamento de resultados AI",
-            extra={
-                'operation_id': operation_id,
-                'input_type': type(ai_results).__name__,
-                'action': 'process_ai_results_start'
-            }
-        )
+        # Valida e sanitiza nome da coluna personalizada
+        custom_id_column_name = self._validate_column_name(custom_id_column_name)
         
         try:
             # Normaliza input para lista de resultados
@@ -169,10 +148,6 @@ class OutputManager:
             
             for i, result in enumerate(results_list):
                 if not isinstance(result, dict):
-                    logger.warning(
-                        f"Resultado {i} não é um dict, pulando",
-                        extra={'operation_id': operation_id, 'index': i}
-                    )
                     continue
                 
                 # Extrai informações básicas
@@ -180,8 +155,9 @@ class OutputManager:
                 content = result.get('content')
                 success = result.get('success', False)
                 
+                # Usa o nome personalizado para a coluna de ID
                 row_data = {
-                    'custom_id': custom_id,
+                    custom_id_column_name: custom_id,
                     'success': success,
                     'processing_time': result.get('processing_time'),
                     'tokens_used': result.get('tokens_used'),
@@ -236,15 +212,15 @@ class OutputManager:
             # Cria DataFrame
             df = pd.DataFrame(processed_data)
             
-            # Reordena colunas colocando custom_id primeiro
-            if 'custom_id' in df.columns:
-                cols = ['custom_id'] + [col for col in df.columns if col != 'custom_id']
+            # Reordena colunas colocando a coluna de ID primeiro
+            if custom_id_column_name in df.columns:
+                cols = [custom_id_column_name] + [col for col in df.columns if col != custom_id_column_name]
                 df = df[cols]
             
             processing_time = time.time() - start_time
             
             logger.info(
-                f"✅ Processamento concluído - {len(df)} registros processados",
+                f"✅ Processamento concluído - {len(df)} registros, {json_content_count} JSON, {text_content_count} texto, {failed_count} falhas",
                 extra={
                     'operation_id': operation_id,
                     'total_records': len(df),
@@ -253,6 +229,7 @@ class OutputManager:
                     'failed_count': failed_count,
                     'processing_time': round(processing_time, 2),
                     'columns_count': len(df.columns),
+                    'custom_id_column_name': custom_id_column_name,
                     'action': 'process_ai_results_complete'
                 }
             )
@@ -262,7 +239,7 @@ class OutputManager:
         except Exception as e:
             processing_time = time.time() - start_time
             logger.error(
-                f"Erro no processamento de resultados AI: {e}",
+                f"Erro no processamento: {e}",
                 extra={
                     'operation_id': operation_id,
                     'error': str(e),
@@ -279,17 +256,7 @@ class OutputManager:
         wait_for_completion: bool = True,
         max_wait_time: int = 300
     ) -> Dict[str, Any]:
-        """
-        Executa query no Athena
-        
-        Args:
-            query: Query SQL para executar
-            wait_for_completion: Se deve aguardar conclusão
-            max_wait_time: Tempo máximo de espera em segundos
-        
-        Returns:
-            Dict com informações da execução
-        """
+        """Executa query no Athena"""
         try:
             # Configura parâmetros da query
             query_params = {
@@ -300,15 +267,6 @@ class OutputManager:
             # Inicia execução
             response = self.athena_client.start_query_execution(**query_params)
             execution_id = response['QueryExecutionId']
-            
-            logger.info(
-                f"Query Athena iniciada: {execution_id}",
-                extra={
-                    'execution_id': execution_id,
-                    'workgroup': self.workgroup,
-                    'action': 'athena_query_started'
-                }
-            )
             
             if not wait_for_completion:
                 return {
@@ -328,7 +286,7 @@ class OutputManager:
                     
                     if status == 'SUCCEEDED':
                         logger.info(
-                            f"✅ Query Athena concluída com sucesso em {execution_time:.1f}s",
+                            f"✅ Query concluída em {execution_time:.1f}s",
                             extra={
                                 'execution_id': execution_id,
                                 'execution_time': round(execution_time, 2),
@@ -338,7 +296,7 @@ class OutputManager:
                     else:
                         error_reason = response['QueryExecution']['Status'].get('StateChangeReason', 'Erro desconhecido')
                         logger.error(
-                            f"❌ Query Athena falhou: {error_reason}",
+                            f"❌ Query falhou: {error_reason}",
                             extra={
                                 'execution_id': execution_id,
                                 'status': status,
@@ -358,15 +316,6 @@ class OutputManager:
                 time.sleep(2)
             
             # Timeout
-            logger.warning(
-                f"⏰ Timeout na query Athena após {max_wait_time}s",
-                extra={
-                    'execution_id': execution_id,
-                    'max_wait_time': max_wait_time,
-                    'action': 'athena_query_timeout'
-                }
-            )
-            
             return {
                 'execution_id': execution_id,
                 'status': 'TIMEOUT',
@@ -376,11 +325,10 @@ class OutputManager:
             
         except Exception as e:
             logger.error(
-                f"Erro na execução da query Athena: {e}",
+                f"Erro na query Athena: {e}",
                 extra={
                     'error': str(e),
                     'error_type': type(e).__name__,
-                    'query': query[:200] + '...' if len(query) > 200 else query,
                     'action': 'athena_query_error'
                 }
             )
@@ -397,26 +345,6 @@ class OutputManager:
         except ClientError as e:
             if e.response['Error']['Code'] == 'EntityNotFoundException':
                 return False
-            raise
-
-    def _get_table_schema(self, table_name: str) -> Dict[str, str]:
-        """Obtém schema da tabela existente"""
-        try:
-            response = self.glue_client.get_table(
-                DatabaseName=self.database,
-                Name=table_name
-            )
-            
-            schema = {}
-            for column in response['Table']['StorageDescriptor']['Columns']:
-                schema[column['Name']] = column['Type']
-                
-            return schema
-        except Exception as e:
-            logger.error(
-                f"Erro ao obter schema da tabela {table_name}: {e}",
-                extra={'table_name': table_name, 'error': str(e)}
-            )
             raise
 
     def create_table_from_dataframe(
@@ -442,7 +370,7 @@ class OutputManager:
         s3_location = self._validate_s3_uri(s3_location)
         
         logger.info(
-            f"🏗️ Criando tabela {table_name} a partir de DataFrame",
+            f"🏗️ Criando tabela {table_name} - {len(df)} registros, {len(df.columns)} colunas",
             extra={
                 'operation_id': operation_id,
                 'table_name': table_name,
@@ -460,8 +388,6 @@ class OutputManager:
             if self._table_exists(table_name):
                 if not overwrite:
                     raise ValueError(f"Tabela {table_name} já existe. Use overwrite=True para sobrescrever.")
-                else:
-                    logger.info(f"Tabela {table_name} será sobrescrita")
             
             # Gera schema baseado no DataFrame
             columns_ddl = []
@@ -495,7 +421,7 @@ class OutputManager:
             result = self._execute_athena_query(ddl)
             
             logger.info(
-                f"✅ Tabela {table_name} criada com sucesso",
+                f"✅ Tabela {table_name} criada",
                 extra={
                     'operation_id': operation_id,
                     'table_name': table_name,
@@ -546,7 +472,7 @@ class OutputManager:
         s3_staging_location = self._validate_s3_uri(s3_staging_location)
         
         logger.info(
-            f"📝 Adicionando dados à tabela {table_name}",
+            f"📝 Adicionando {len(df)} registros à tabela {table_name}",
             extra={
                 'operation_id': operation_id,
                 'table_name': table_name,
@@ -609,14 +535,14 @@ class OutputManager:
             df: DataFrame com os dados
             table_name: Nome da tabela existente
             s3_staging_location: URI S3 completa para staging dos dados
-            custom_id_column: Nome da coluna para fazer o merge
+            custom_id_column: Nome da coluna para fazer o merge (deve existir no DataFrame)
         """
         operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
         s3_staging_location = self._validate_s3_uri(s3_staging_location)
         
         logger.info(
-            f"🔄 Fazendo merge overwrite na tabela {table_name} por {custom_id_column}",
+            f"🔄 Merge overwrite {table_name} por {custom_id_column} - {len(df)} registros",
             extra={
                 'operation_id': operation_id,
                 'table_name': table_name,
@@ -684,14 +610,14 @@ class OutputManager:
             df: DataFrame com os dados
             table_name: Nome da tabela
             s3_location: URI S3 completa para os dados da tabela
-            custom_id_column: Nome da coluna para fazer o merge (se tabela existir)
+            custom_id_column: Nome da coluna para fazer o merge (deve existir no DataFrame se tabela existir)
         """
         operation_id = self._generate_operation_id()
         table_name = self._validate_table_name(table_name)
         s3_location = self._validate_s3_uri(s3_location)
         
         logger.info(
-            f"🔀 Fazendo upsert na tabela {table_name}",
+            f"🔀 Upsert tabela {table_name} - {len(df)} registros",
             extra={
                 'operation_id': operation_id,
                 'table_name': table_name,
@@ -704,13 +630,11 @@ class OutputManager:
         try:
             if self._table_exists(table_name):
                 # Tabela existe - faz merge
-                logger.info(f"Tabela {table_name} existe, fazendo merge")
                 return self.merge_overwrite_by_custom_id(
                     df, table_name, s3_location, custom_id_column
                 )
             else:
                 # Tabela não existe - cria nova
-                logger.info(f"Tabela {table_name} não existe, criando nova")
                 return self.create_table_from_dataframe(df, table_name, s3_location)
                 
         except Exception as e:
@@ -722,190 +646,6 @@ class OutputManager:
                     'error': str(e),
                     'error_type': type(e).__name__,
                     'action': 'upsert_table_error'
-                }
-            )
-            raise
-
-    def get_table_info(self, table_name: str) -> Dict[str, Any]:
-        """
-        Obtém informações detalhadas sobre uma tabela
-        
-        Args:
-            table_name: Nome da tabela
-        """
-        table_name = self._validate_table_name(table_name)
-        
-        try:
-            if not self._table_exists(table_name):
-                return {
-                    'exists': False,
-                    'table_name': table_name,
-                    'database': self.database
-                }
-            
-            # Obtém metadados da tabela
-            response = self.glue_client.get_table(
-                DatabaseName=self.database,
-                Name=table_name
-            )
-            
-            table_info = response['Table']
-            
-            # Conta registros (query simples)
-            count_query = f"SELECT COUNT(*) as row_count FROM `{self.database}`.`{table_name}`"
-            count_result = self._execute_athena_query(count_query)
-            
-            return {
-                'exists': True,
-                'table_name': table_name,
-                'database': self.database,
-                'location': table_info['StorageDescriptor'].get('Location'),
-                'input_format': table_info['StorageDescriptor'].get('InputFormat'),
-                'output_format': table_info['StorageDescriptor'].get('OutputFormat'),
-                'columns': [
-                    {
-                        'name': col['Name'],
-                        'type': col['Type'],
-                        'comment': col.get('Comment', '')
-                    }
-                    for col in table_info['StorageDescriptor']['Columns']
-                ],
-                'columns_count': len(table_info['StorageDescriptor']['Columns']),
-                'created_time': table_info.get('CreateTime'),
-                'updated_time': table_info.get('UpdateTime'),
-                'count_query_execution': count_result
-            }
-            
-        except Exception as e:
-            logger.error(
-                f"Erro ao obter informações da tabela {table_name}: {e}",
-                extra={
-                    'table_name': table_name,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'get_table_info_error'
-                }
-            )
-            raise
-
-    def show_table_info(self, table_name: str):
-        """Exibe informações da tabela de forma formatada"""
-        info = self.get_table_info(table_name)
-        
-        print("=" * 60)
-        print(f"📊 INFORMAÇÕES DA TABELA: {table_name}")
-        print("=" * 60)
-        
-        if not info['exists']:
-            print("❌ Tabela não existe")
-            return
-        
-        print(f"✅ Tabela existe")
-        print(f"🗄️ Database: {info['database']}")
-        print(f"📍 Localização: {info['location']}")
-        print(f"📁 Formato: {info['input_format']}")
-        print(f"🗓️ Criada em: {info['created_time']}")
-        print(f"🔄 Atualizada em: {info['updated_time']}")
-        print(f"📊 Colunas ({info['columns_count']}):")
-        
-        for col in info['columns']:
-            comment = f" - {col['comment']}" if col['comment'] else ""
-            print(f"   • {col['name']} ({col['type']}){comment}")
-        
-        print("=" * 60)
-
-    def list_tables(self, pattern: Optional[str] = None) -> List[str]:
-        """Lista tabelas no database"""
-        try:
-            response = self.glue_client.get_tables(DatabaseName=self.database)
-            tables = [table['Name'] for table in response['TableList']]
-            
-            if pattern:
-                import fnmatch
-                tables = [t for t in tables if fnmatch.fnmatch(t, pattern)]
-            
-            return sorted(tables)
-            
-        except Exception as e:
-            logger.error(
-                f"Erro ao listar tabelas: {e}",
-                extra={
-                    'database': self.database,
-                    'pattern': pattern,
-                    'error': str(e),
-                    'action': 'list_tables_error'
-                }
-            )
-            raise
-
-    def show_tables(self, pattern: Optional[str] = None):
-        """Exibe lista de tabelas de forma formatada"""
-        tables = self.list_tables(pattern)
-        
-        print("=" * 60)
-        print(f"📋 TABELAS NO DATABASE: {self.database}")
-        if pattern:
-            print(f"🔍 Filtro: {pattern}")
-        print("=" * 60)
-        
-        if not tables:
-            print("❌ Nenhuma tabela encontrada")
-        else:
-            for i, table in enumerate(tables, 1):
-                print(f"{i:3d}. {table}")
-        
-        print(f"\n📊 Total: {len(tables)} tabelas")
-        print("=" * 60)
-
-    def execute_query(
-        self, 
-        query: str,
-        wait_for_completion: bool = True,
-        max_wait_time: int = 300
-    ) -> Dict[str, Any]:
-        """
-        Executa uma query SQL customizada no Athena
-        
-        Args:
-            query: Query SQL para executar
-            wait_for_completion: Se deve aguardar conclusão
-            max_wait_time: Tempo máximo de espera em segundos
-        """
-        operation_id = self._generate_operation_id()
-        
-        logger.info(
-            f"🔍 Executando query customizada",
-            extra={
-                'operation_id': operation_id,
-                'query_preview': query[:100] + '...' if len(query) > 100 else query,
-                'action': 'execute_custom_query_start'
-            }
-        )
-        
-        try:
-            result = self._execute_athena_query(query, wait_for_completion, max_wait_time)
-            result['operation_id'] = operation_id
-            
-            logger.info(
-                f"✅ Query customizada executada",
-                extra={
-                    'operation_id': operation_id,
-                    'execution_id': result.get('execution_id'),
-                    'status': result.get('status'),
-                    'action': 'execute_custom_query_complete'
-                }
-            )
-            
-            return result
-            
-        except Exception as e:
-            logger.error(
-                f"Erro na execução da query customizada: {e}",
-                extra={
-                    'operation_id': operation_id,
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'action': 'execute_custom_query_error'
                 }
             )
             raise
