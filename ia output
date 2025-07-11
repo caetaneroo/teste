@@ -1,4 +1,3 @@
-import time
 import json
 import logging
 import pandas as pd
@@ -38,6 +37,14 @@ class OutputManager:
             sanitized = f"col_{sanitized}"
         return sanitized
 
+    def _validate_s3_path(self, s3_path: str) -> str:
+        """Valida e normaliza o caminho S3"""
+        if not s3_path or not isinstance(s3_path, str):
+            raise ValueError("Caminho S3 deve ser uma string não vazia")
+        if not s3_path.startswith('s3://'):
+            raise ValueError("Caminho S3 deve começar com 's3://'")
+        return s3_path.rstrip('/') + '/'
+
     def process_ai_results(
         self, 
         ai_results: Union[Dict[str, Any], List[Dict[str, Any]]],
@@ -46,10 +53,12 @@ class OutputManager:
     ) -> pd.DataFrame:
         """
         Processa resultados do AIProcessor e retorna DataFrame.
-        Apenas sucessos. Colunas padrão: id, processing_time, input_tokens, output_tokens, cached_tokens, tokens_used, cost.
-        Chaves do JSON de resposta da IA são prefixadas com result_.
+        Apenas sucessos são processados.
         """
+        logger.info(f"Processando resultados do AI Processor")
+        
         id_column_name = self._validate_column_name(id_column_name)
+        
         if isinstance(ai_results, dict):
             if 'results' in ai_results:
                 results = ai_results['results']
@@ -61,9 +70,13 @@ class OutputManager:
             raise ValueError(f"Tipo de input não suportado: {type(ai_results)}")
 
         processed = []
+        success_count = 0
+        
         for r in results:
             if not r.get('success', False):
                 continue
+                
+            success_count += 1
             row = {
                 id_column_name: r.get('id'),
                 'processing_time': r.get('processing_time'),
@@ -73,11 +86,13 @@ class OutputManager:
                 'tokens_used': r.get('tokens_used'),
                 'cost': r.get('cost')
             }
+            
             content = r.get('content')
             if content is None:
                 if include_content_text:
                     processed.append(row)
                 continue
+                
             if isinstance(content, dict):
                 for k, v in content.items():
                     key = f'result_{k}'
@@ -114,6 +129,8 @@ class OutputManager:
         if id_column_name in df.columns:
             cols = [id_column_name] + [c for c in df.columns if c != id_column_name]
             df = df[cols]
+            
+        logger.info(f"Processados {success_count} resultados com sucesso, DataFrame com {len(df)} linhas")
         return df
 
     def create_table(
@@ -123,14 +140,18 @@ class OutputManager:
         s3_path: str,
         database: Optional[str] = None,
         partition_cols: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+    ) -> None:
         """
         Cria tabela Iceberg sobrescrevendo sempre.
         """
         table_name = self._validate_table_name(table_name)
-        s3_path = s3_path if s3_path.endswith('/') else s3_path + '/'
+        s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        
+        # Garante que o database existe
         wr.catalog.create_database(database, exist_ok=True, boto3_session=self.session)
+        
+        # Cria/sobrescreve a tabela
         wr.s3.to_parquet(
             df=df,
             path=s3_path,
@@ -142,8 +163,8 @@ class OutputManager:
             table_type='ICEBERG',
             boto3_session=self.session
         )
-        logger.info(f"✅ Tabela {table_name} criada/atualizada em {s3_path} (Iceberg, overwrite)")
-        return {'database': database, 'table': table_name, 's3_path': s3_path, 'mode': 'overwrite'}
+        
+        logger.info(f"Tabela {database}.{table_name} criada com {len(df)} registros em {s3_path}")
 
     def append_table(
         self,
@@ -152,13 +173,18 @@ class OutputManager:
         s3_path: str,
         database: Optional[str] = None,
         partition_cols: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+    ) -> None:
         """
         Adiciona dados em tabela Iceberg existente.
         """
         table_name = self._validate_table_name(table_name)
-        s3_path = s3_path if s3_path.endswith('/') else s3_path + '/'
+        s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        
+        # Verifica se a tabela existe
+        if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
+            raise ValueError(f"Tabela {database}.{table_name} não existe. Use create_table primeiro.")
+        
         wr.s3.to_parquet(
             df=df,
             path=s3_path,
@@ -170,8 +196,8 @@ class OutputManager:
             table_type='ICEBERG',
             boto3_session=self.session
         )
-        logger.info(f"✅ Append realizado em {table_name}")
-        return {'database': database, 'table': table_name, 's3_path': s3_path, 'mode': 'append'}
+        
+        logger.info(f"Adicionados {len(df)} registros à tabela {database}.{table_name}")
 
     def upsert_table(
         self,
@@ -181,17 +207,24 @@ class OutputManager:
         database: Optional[str] = None,
         id_column: str = 'id',
         partition_cols: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+    ) -> None:
         """
-        Upsert real: cria se não existe, senão faz overwrite_partitions (merge pelo particionamento).
+        Upsert: cria se não existe, senão faz merge baseado nas partições.
         """
         table_name = self._validate_table_name(table_name)
-        s3_path = s3_path if s3_path.endswith('/') else s3_path + '/'
+        s3_path = self._validate_s3_path(s3_path)
         database = database or self.database
+        
+        # Se a tabela não existe, cria
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
-            return self.create_table(df, table_name, s3_path, database, partition_cols)
+            self.create_table(df, table_name, s3_path, database, partition_cols)
+            return
+        
+        # Verifica se a coluna de ID existe
         if id_column not in df.columns:
-            raise ValueError(f"id_column '{id_column}' not found in dataframe")
+            raise ValueError(f"Coluna '{id_column}' não encontrada no DataFrame")
+        
+        # Faz o upsert usando overwrite_partitions
         wr.s3.to_parquet(
             df=df,
             path=s3_path,
@@ -203,5 +236,88 @@ class OutputManager:
             table_type='ICEBERG',
             boto3_session=self.session
         )
-        logger.info(f"✅ Upsert realizado em {table_name}")
-        return {'database': database, 'table': table_name, 's3_path': s3_path, 'mode': 'upsert'}
+        
+        logger.info(f"Upsert realizado em {database}.{table_name} com {len(df)} registros")
+
+    def merge_table(
+        self,
+        df: pd.DataFrame,
+        table_name: str,
+        s3_path: str,
+        merge_keys: List[str],
+        database: Optional[str] = None,
+        partition_cols: Optional[List[str]] = None
+    ) -> None:
+        """
+        Merge avançado usando Iceberg merge capabilities.
+        """
+        table_name = self._validate_table_name(table_name)
+        s3_path = self._validate_s3_path(s3_path)
+        database = database or self.database
+        
+        # Verifica se a tabela existe
+        if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
+            raise ValueError(f"Tabela {database}.{table_name} não existe. Use create_table primeiro.")
+        
+        # Verifica se as chaves de merge existem
+        for key in merge_keys:
+            if key not in df.columns:
+                raise ValueError(f"Chave de merge '{key}' não encontrada no DataFrame")
+        
+        try:
+            # Usa a funcionalidade de merge do Iceberg via awswrangler
+            wr.athena.to_iceberg(
+                df=df,
+                database=database,
+                table=table_name,
+                table_location=s3_path,
+                merge_cols=merge_keys,
+                partition_cols=partition_cols,
+                boto3_session=self.session,
+                workgroup=self.workgroup
+            )
+            
+            logger.info(f"Merge realizado em {database}.{table_name} com {len(df)} registros usando chaves: {merge_keys}")
+            
+        except Exception as e:
+            # Fallback para overwrite_partitions se merge não funcionar
+            logger.warning(f"Merge falhou, usando overwrite_partitions como fallback: {str(e)}")
+            self.upsert_table(df, table_name, s3_path, database, merge_keys[0], partition_cols)
+
+    def delete_table(
+        self,
+        table_name: str,
+        database: Optional[str] = None,
+        delete_s3_data: bool = False
+    ) -> None:
+        """
+        Remove tabela do catálogo e opcionalmente os dados do S3.
+        """
+        table_name = self._validate_table_name(table_name)
+        database = database or self.database
+        
+        if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
+            logger.warning(f"Tabela {database}.{table_name} não existe")
+            return
+        
+        # Remove a tabela do catálogo
+        wr.catalog.delete_table_if_exists(
+            database=database,
+            table=table_name,
+            boto3_session=self.session
+        )
+        
+        # Opcionalmente remove os dados do S3
+        if delete_s3_data:
+            try:
+                table_location = wr.catalog.get_table_location(
+                    database=database,
+                    table=table_name,
+                    boto3_session=self.session
+                )
+                wr.s3.delete_objects(path=table_location, boto3_session=self.session)
+                logger.info(f"Tabela {database}.{table_name} e dados S3 removidos")
+            except Exception as e:
+                logger.info(f"Tabela {database}.{table_name} removida do catálogo")
+        else:
+            logger.info(f"Tabela {database}.{table_name} removida do catálogo")
