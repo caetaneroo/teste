@@ -92,7 +92,7 @@ class AIProcessor:
         if not isinstance(json_schema, dict):
             return None
         return {
-            "type": "json_schema",
+            "type": "json_object",
             "json_schema": {
                 "name": json_schema.get("name", "response_schema"),
                 "description": json_schema.get("description", "Schema for structured response"),
@@ -271,7 +271,16 @@ class AIProcessor:
             end_time = time.time()
             processing_time = end_time - start_time
             result['processing_time'] = processing_time
-            result['custom_id'] = custom_id
+            # Set single 'id' field
+            if custom_id is not None:
+                result['id'] = custom_id
+            else:
+                result['id'] = request_id
+            # Remove separate ids
+            if 'custom_id' in result:
+                del result['custom_id']
+            if 'request_id' in result:
+                del result['request_id']
             api_rate_limit_detected = is_rate_limit_error(result)
             if not api_rate_limit_detected:
                 self.stats_manager.record_request(
@@ -297,8 +306,7 @@ class AIProcessor:
                 'error': str(e),
                 'error_type': type(e).__name__,
                 'processing_time': processing_time,
-                'custom_id': custom_id,
-                'request_id': request_id
+                'id': custom_id if custom_id is not None else request_id
             }
 
     def _calculate_progress_intervals(self, total: int) -> List[int]:
@@ -332,6 +340,7 @@ class AIProcessor:
                 raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
             custom_ids = [str(cid) if cid is not None else None for cid in custom_ids]
         total_successful = 0
+        total_failed = 0
         logged_progress = set()
         progress_lock = asyncio.Lock()
         self.rate_limiter.start_batch(batch_id)
@@ -347,34 +356,38 @@ class AIProcessor:
                 'action': 'batch_start'
             }
         )
-        async def log_progress(current_successful: int):
+
+        async def log_progress(current_completed: int, current_failed: int):
             async with progress_lock:
                 progress_intervals = self._calculate_progress_intervals(len(texts))
-                if current_successful in progress_intervals and current_successful not in logged_progress:
-                    logged_progress.add(current_successful)
+                current_total = current_completed + current_failed
+                if current_total in progress_intervals and current_total not in logged_progress:
+                    logged_progress.add(current_total)
                     elapsed = time.time() - start_time
-                    rate = current_successful / elapsed if elapsed > 0 else 0
-                    eta = (len(texts) - current_successful) / rate if rate > 0 else 0
+                    rate = current_total / elapsed if elapsed > 0 else 0
+                    eta = (len(texts) - current_total) / rate if rate > 0 else 0
                     logger.info(
-                        f"📊 Progresso: {current_successful}/{len(texts)} ({current_successful/len(texts)*100:.1f}%) | "
-                        f"✅{current_successful} ❌0 | "
+                        f"📊 Progresso: {current_total}/{len(texts)} ({(current_total)/len(texts)*100:.1f}%) | "
+                        f"✅{current_completed} ❌{current_failed} | "
                         f"⏱️ETA: {eta/60:.1f}min",
                         extra={
                             'batch_id': batch_id,
-                            'completed': current_successful,
+                            'completed': current_total,
                             'total': len(texts),
-                            'successful_so_far': current_successful,
-                            'failed_so_far': 0,
+                            'successful_so_far': current_completed,
+                            'failed_so_far': current_failed,
                             'processing_rate': round(rate, 2),
                             'eta_minutes': round(eta / 60, 1),
-                            'progress_percent': round((current_successful / len(texts)) * 100, 1),
+                            'progress_percent': round((current_total / len(texts)) * 100, 1),
                             'action': 'batch_progress'
                         }
                     )
+
         all_results = [None] * len(texts)
         pending_items = list(enumerate(texts))
         start_time = time.time()
         pause_due_to_rate_limit = False
+
         while pending_items:
             task_to_index = {}
             current_tasks = []
@@ -412,8 +425,10 @@ class AIProcessor:
                             all_results[original_index] = result
                             if result.get('success', False):
                                 total_successful += 1
-                                # ✅ Sempre logar progresso, inclusive após pausas
-                                await log_progress(total_successful)
+                            else:
+                                total_failed += 1
+                            # Log progress every 5 completions (success + failure), excluding rate limit errors
+                            await log_progress(total_successful, total_failed)
                             if result.get('success', False):
                                 self.rate_limiter.record_successful_request()
                     except Exception as e:
@@ -433,6 +448,8 @@ class AIProcessor:
                             'error': str(e),
                             'error_type': type(e).__name__
                         }
+                        total_failed += 1
+                        await log_progress(total_successful, total_failed)
                 current_tasks = list(pending)
             if rate_limit_indices:
                 pending_items = [(i, texts[i]) for i in rate_limit_indices]
@@ -440,7 +457,21 @@ class AIProcessor:
                 pause_due_to_rate_limit = False
             else:
                 pending_items = []
+
         final_results = [r for r in all_results if r is not None]
+
+        # Adjust results to have a single 'id' field instead of 'request_id' and 'custom_id'
+        for res in final_results:
+            if 'id' not in res:
+                if 'custom_id' in res and res['custom_id'] is not None:
+                    res['id'] = res['custom_id']
+                else:
+                    res['id'] = res.get('request_id')
+            if 'custom_id' in res:
+                del res['custom_id']
+            if 'request_id' in res:
+                del res['request_id']
+
         batch_stats = self.stats_manager.end_batch(batch_id)
         logger.info(
             f"✅ Batch concluído - {batch_stats.successful_requests} sucessos, "
