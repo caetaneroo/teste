@@ -55,8 +55,6 @@ class OutputManager:
         Processa resultados do AIProcessor e retorna DataFrame.
         Apenas sucessos são processados.
         """
-        logger.info(f"Processando resultados do AI Processor")
-        
         id_column_name = self._validate_column_name(id_column_name)
         
         if isinstance(ai_results, dict):
@@ -71,6 +69,7 @@ class OutputManager:
 
         processed = []
         success_count = 0
+        result_columns = set()
         
         for r in results:
             if not r.get('success', False):
@@ -95,6 +94,7 @@ class OutputManager:
                 
             if isinstance(content, dict):
                 for k, v in content.items():
+                    result_columns.add(k)
                     key = f'result_{k}'
                     if isinstance(v, (dict, list)):
                         row[key] = json.dumps(v, ensure_ascii=False)
@@ -106,6 +106,7 @@ class OutputManager:
                     parsed = json.loads(content)
                     if isinstance(parsed, dict):
                         for k, v in parsed.items():
+                            result_columns.add(k)
                             key = f'result_{k}'
                             if isinstance(v, (dict, list)):
                                 row[key] = json.dumps(v, ensure_ascii=False)
@@ -129,8 +130,11 @@ class OutputManager:
         if id_column_name in df.columns:
             cols = [id_column_name] + [c for c in df.columns if c != id_column_name]
             df = df[cols]
-            
-        logger.info(f"Processados {success_count} resultados com sucesso, DataFrame com {len(df)} linhas")
+        
+        # Log único com informações detalhadas
+        result_cols_str = ', '.join(sorted(result_columns)) if result_columns else 'nenhuma'
+        logger.info(f"AI Results processados: {success_count} sucessos, DataFrame com {len(df)} linhas, colunas de resultado: {result_cols_str}")
+        
         return df
 
     def create_table(
@@ -142,7 +146,7 @@ class OutputManager:
         partition_cols: Optional[List[str]] = None
     ) -> None:
         """
-        Cria tabela Iceberg sobrescrevendo sempre.
+        Cria tabela Iceberg usando funções nativas do awswrangler.
         """
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
@@ -151,20 +155,19 @@ class OutputManager:
         # Garante que o database existe
         wr.catalog.create_database(database, exist_ok=True, boto3_session=self.session)
         
-        # Cria/sobrescreve a tabela
-        wr.s3.to_parquet(
+        # Cria tabela Iceberg usando função específica
+        wr.athena.to_iceberg(
             df=df,
-            path=s3_path,
-            dataset=True,
             database=database,
             table=table_name,
-            mode='overwrite',
+            table_location=s3_path,
             partition_cols=partition_cols,
-            table_type='ICEBERG',
-            boto3_session=self.session
+            mode='overwrite',
+            boto3_session=self.session,
+            workgroup=self.workgroup
         )
         
-        logger.info(f"Tabela {database}.{table_name} criada com {len(df)} registros em {s3_path}")
+        logger.info(f"Tabela Iceberg {database}.{table_name} criada com {len(df)} registros em {s3_path}")
 
     def append_table(
         self,
@@ -185,19 +188,19 @@ class OutputManager:
         if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
             raise ValueError(f"Tabela {database}.{table_name} não existe. Use create_table primeiro.")
         
-        wr.s3.to_parquet(
+        # Append usando função Iceberg
+        wr.athena.to_iceberg(
             df=df,
-            path=s3_path,
-            dataset=True,
             database=database,
             table=table_name,
-            mode='append',
+            table_location=s3_path,
             partition_cols=partition_cols,
-            table_type='ICEBERG',
-            boto3_session=self.session
+            mode='append',
+            boto3_session=self.session,
+            workgroup=self.workgroup
         )
         
-        logger.info(f"Adicionados {len(df)} registros à tabela {database}.{table_name}")
+        logger.info(f"Adicionados {len(df)} registros à tabela Iceberg {database}.{table_name}")
 
     def upsert_table(
         self,
@@ -205,11 +208,11 @@ class OutputManager:
         table_name: str,
         s3_path: str,
         database: Optional[str] = None,
-        id_column: str = 'id',
+        merge_keys: Optional[List[str]] = None,
         partition_cols: Optional[List[str]] = None
     ) -> None:
         """
-        Upsert: cria se não existe, senão faz merge baseado nas partições.
+        Upsert usando merge nativo do Iceberg.
         """
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
@@ -220,24 +223,29 @@ class OutputManager:
             self.create_table(df, table_name, s3_path, database, partition_cols)
             return
         
-        # Verifica se a coluna de ID existe
-        if id_column not in df.columns:
-            raise ValueError(f"Coluna '{id_column}' não encontrada no DataFrame")
+        # Define chaves de merge (usa 'id' como padrão se não especificado)
+        if merge_keys is None:
+            merge_keys = ['id']
         
-        # Faz o upsert usando overwrite_partitions
-        wr.s3.to_parquet(
+        # Verifica se as chaves de merge existem
+        for key in merge_keys:
+            if key not in df.columns:
+                raise ValueError(f"Chave de merge '{key}' não encontrada no DataFrame")
+        
+        # Upsert usando merge do Iceberg
+        wr.athena.to_iceberg(
             df=df,
-            path=s3_path,
-            dataset=True,
             database=database,
             table=table_name,
-            mode='overwrite_partitions',
-            partition_cols=partition_cols or [id_column],
-            table_type='ICEBERG',
-            boto3_session=self.session
+            table_location=s3_path,
+            merge_cols=merge_keys,
+            partition_cols=partition_cols,
+            mode='upsert',
+            boto3_session=self.session,
+            workgroup=self.workgroup
         )
         
-        logger.info(f"Upsert realizado em {database}.{table_name} com {len(df)} registros")
+        logger.info(f"Upsert realizado em tabela Iceberg {database}.{table_name} com {len(df)} registros usando chaves: {merge_keys}")
 
     def merge_table(
         self,
@@ -249,7 +257,7 @@ class OutputManager:
         partition_cols: Optional[List[str]] = None
     ) -> None:
         """
-        Merge avançado usando Iceberg merge capabilities.
+        Merge usando capacidades nativas do Iceberg.
         """
         table_name = self._validate_table_name(table_name)
         s3_path = self._validate_s3_path(s3_path)
@@ -264,25 +272,53 @@ class OutputManager:
             if key not in df.columns:
                 raise ValueError(f"Chave de merge '{key}' não encontrada no DataFrame")
         
-        try:
-            # Usa a funcionalidade de merge do Iceberg via awswrangler
-            wr.athena.to_iceberg(
-                df=df,
-                database=database,
-                table=table_name,
-                table_location=s3_path,
-                merge_cols=merge_keys,
-                partition_cols=partition_cols,
-                boto3_session=self.session,
-                workgroup=self.workgroup
-            )
-            
-            logger.info(f"Merge realizado em {database}.{table_name} com {len(df)} registros usando chaves: {merge_keys}")
-            
-        except Exception as e:
-            # Fallback para overwrite_partitions se merge não funcionar
-            logger.warning(f"Merge falhou, usando overwrite_partitions como fallback: {str(e)}")
-            self.upsert_table(df, table_name, s3_path, database, merge_keys[0], partition_cols)
+        # Merge usando função Iceberg
+        wr.athena.to_iceberg(
+            df=df,
+            database=database,
+            table=table_name,
+            table_location=s3_path,
+            merge_cols=merge_keys,
+            partition_cols=partition_cols,
+            mode='upsert',
+            boto3_session=self.session,
+            workgroup=self.workgroup
+        )
+        
+        logger.info(f"Merge realizado em tabela Iceberg {database}.{table_name} com {len(df)} registros usando chaves: {merge_keys}")
+
+    def overwrite_partitions(
+        self,
+        df: pd.DataFrame,
+        table_name: str,
+        s3_path: str,
+        database: Optional[str] = None,
+        partition_cols: Optional[List[str]] = None
+    ) -> None:
+        """
+        Sobrescreve partições específicas da tabela Iceberg.
+        """
+        table_name = self._validate_table_name(table_name)
+        s3_path = self._validate_s3_path(s3_path)
+        database = database or self.database
+        
+        # Verifica se a tabela existe
+        if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
+            raise ValueError(f"Tabela {database}.{table_name} não existe. Use create_table primeiro.")
+        
+        # Sobrescreve partições usando função Iceberg
+        wr.athena.to_iceberg(
+            df=df,
+            database=database,
+            table=table_name,
+            table_location=s3_path,
+            partition_cols=partition_cols,
+            mode='overwrite_partitions',
+            boto3_session=self.session,
+            workgroup=self.workgroup
+        )
+        
+        logger.info(f"Partições sobrescritas na tabela Iceberg {database}.{table_name} com {len(df)} registros")
 
     def delete_table(
         self,
@@ -291,7 +327,7 @@ class OutputManager:
         delete_s3_data: bool = False
     ) -> None:
         """
-        Remove tabela do catálogo e opcionalmente os dados do S3.
+        Remove tabela Iceberg do catálogo e opcionalmente os dados do S3.
         """
         table_name = self._validate_table_name(table_name)
         database = database or self.database
@@ -316,8 +352,38 @@ class OutputManager:
                     boto3_session=self.session
                 )
                 wr.s3.delete_objects(path=table_location, boto3_session=self.session)
-                logger.info(f"Tabela {database}.{table_name} e dados S3 removidos")
-            except Exception as e:
-                logger.info(f"Tabela {database}.{table_name} removida do catálogo")
+                logger.info(f"Tabela Iceberg {database}.{table_name} e dados S3 removidos")
+            except Exception:
+                logger.info(f"Tabela Iceberg {database}.{table_name} removida do catálogo")
         else:
-            logger.info(f"Tabela {database}.{table_name} removida do catálogo")
+            logger.info(f"Tabela Iceberg {database}.{table_name} removida do catálogo")
+
+    def read_table(
+        self,
+        table_name: str,
+        database: Optional[str] = None,
+        columns: Optional[List[str]] = None,
+        filters: Optional[List[List[str]]] = None
+    ) -> pd.DataFrame:
+        """
+        Lê dados de uma tabela Iceberg.
+        """
+        table_name = self._validate_table_name(table_name)
+        database = database or self.database
+        
+        # Verifica se a tabela existe
+        if not wr.catalog.does_table_exist(database=database, table=table_name, boto3_session=self.session):
+            raise ValueError(f"Tabela {database}.{table_name} não existe")
+        
+        # Lê a tabela usando função Iceberg
+        df = wr.athena.read_sql_table(
+            table=table_name,
+            database=database,
+            columns=columns,
+            filters=filters,
+            boto3_session=self.session,
+            workgroup=self.workgroup
+        )
+        
+        logger.info(f"Lidos {len(df)} registros da tabela Iceberg {database}.{table_name}")
+        return df
