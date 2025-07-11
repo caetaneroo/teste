@@ -1,4 +1,5 @@
 # core/ai_processor.py
+
 import asyncio
 import time
 import json
@@ -9,13 +10,11 @@ import os
 from typing import List, Dict, Any, Optional
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
 from iaragenai import AsyncIaraGenAI
-
-from rate_limiter import AdaptiveRateLimiter
+from adaptive_throughput_controller import AdaptiveThroughputController
 from stats_manager import StatsManager
 
 logger = logging.getLogger(__name__)
 
-MAX_TPM = 180000
 MAX_RETRY = 2
 
 def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
@@ -26,10 +25,8 @@ def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             models_config = json.load(f)
-        
         if not models_config:
             raise ValueError(f"Arquivo {config_path} está vazio ou inválido.")
-        
         return models_config
     except json.JSONDecodeError as e:
         raise ValueError(f"Erro ao decodificar JSON em {config_path}: {e}")
@@ -38,21 +35,22 @@ def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
 
 # Carrega configuração dos modelos
 MODELS_CONFIG = load_models_config()
-
-# Extrai modelos suportados da configuração
 SUPPORTED_MODELS = set(MODELS_CONFIG.keys())
 
 def is_rate_limit_error(result: Dict[str, Any]) -> bool:
+    """Detecta se o erro é relacionado a rate limit"""
     if not isinstance(result, dict):
         return False
     error_msg = result.get('error', '').lower()
-    return 'token rate limit' in error_msg
+    return any(phrase in error_msg for phrase in [
+        'token rate limit', 'rate limit', 'too many requests',
+        'quota exceeded', 'rate_limit_exceeded'
+    ])
 
 def supports_json_schema(model: str) -> bool:
     """Verifica se o modelo suporta json_schema no response_format"""
     if model not in MODELS_CONFIG:
         raise ValueError(f"Modelo '{model}' não encontrado na configuração. Modelos disponíveis: {', '.join(sorted(SUPPORTED_MODELS))}")
-    
     return MODELS_CONFIG[model].get('json_schema', False)
 
 def get_model_pricing(model: str) -> Dict[str, float]:
@@ -72,134 +70,122 @@ class JSONSchemaNotSupportedError(Exception):
     pass
 
 class AIProcessor:
+    """
+    Processador AI otimizado com controle adaptativo de throughput.
+    
+    Principais características:
+    - Auto-ajuste de concorrência baseado em performance real
+    - Prevenção inteligente de rate limits
+    - Logs contextuais e não-invasivos
+    - Stats centralizados e precisos
+    """
+    
     def __init__(self, config: Dict[str, Any]):
         self.client_id = config['client_id']
         self.client_secret = config['client_secret']
-        # Modelo padrão alterado para gpt-4o-mini (suporta json_schema)
         self.model = config.get('model', 'gpt-4o-mini')
         
-        # Validação se o modelo é suportado pela biblioteca
+        # Validação do modelo
         if self.model not in SUPPORTED_MODELS:
             raise ValueError(
-                f"Modelo '{self.model}' não é suportado pela biblioteca. "
+                f"Modelo '{self.model}' não é suportado. "
                 f"Modelos suportados: {', '.join(sorted(SUPPORTED_MODELS))}"
             )
         
         self.temperature = config.get('temperature', 0.1)
         self.max_tokens = config.get('max_tokens')
+        
+        # Cliente da API
         self.client = AsyncIaraGenAI(
             client_id=self.client_id,
             client_secret=self.client_secret,
             environment=config.get('environment', 'dev'),
             provider=config.get('provider', 'azure_openai'),
-            correlation_id=config.get('correlation_id', 'teste-ia-biatendimento')
+            correlation_id=config.get('correlation_id', 'ai-processor')
         )
-        self.max_concurrent = config.get('max_concurrent', 10)
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-        max_tpm = config.get('max_tpm', MAX_TPM)
-        calibration_enabled = config.get('adaptive_calibration', True)
-        self.rate_limiter = AdaptiveRateLimiter(max_tpm, calibration_enabled)
-        self.stats_manager = StatsManager()
-        self.stats_manager.set_max_concurrent(self.max_concurrent)
         
-        # Carrega preços do modelo
-        self.model_pricing = get_model_pricing(self.model)
+        # Inicialização do controlador adaptativo
+        initial_max_tpm = config.get('max_tpm', 125000)  # OpenAI típico
+        initial_concurrency = config.get('max_concurrent', 10)
         
+        self.throughput_controller = AdaptiveThroughputController(
+            initial_max_tpm=initial_max_tpm,
+            initial_concurrency=initial_concurrency,
+            model=self.model
+        )
+        
+        # Stats manager centralizado
+        self.stats_manager = StatsManager(model=self.model)
+        
+        # Tokenizer para estimativas
         try:
             self.encoder = tiktoken.encoding_for_model(self.model)
         except KeyError:
             self.encoder = tiktoken.get_encoding("cl100k_base")
+        
+        # Preços do modelo
+        self.model_pricing = get_model_pricing(self.model)
+        
         logger.info(
-            "AIProcessor inicializado com AsyncIaraGenAI",
+            f"AIProcessor inicializado - Modelo: {self.model} | "
+            f"TPM inicial: {initial_max_tpm:,} | "
+            f"Concorrência inicial: {initial_concurrency}",
             extra={
                 'model': self.model,
-                'max_concurrent': self.max_concurrent,
-                'max_tpm': max_tpm,
-                'calibration_enabled': calibration_enabled,
-                'provider': config.get('provider', 'azure_openai'),
-                'environment': config.get('environment', 'dev'),
+                'max_tpm': initial_max_tpm,
+                'max_concurrent': initial_concurrency,
                 'json_schema_supported': supports_json_schema(self.model),
-                'model_pricing': self.model_pricing,
                 'action': 'ai_processor_init'
             }
         )
-
+    
     def _validate_json_schema_compatibility(self, json_schema: Optional[Dict[str, Any]]) -> None:
         """Valida se o modelo atual suporta json_schema"""
         if json_schema is not None and not supports_json_schema(self.model):
-            # Obtém lista de modelos que suportam JSON Schema
-            supported_models = [model for model in SUPPORTED_MODELS if MODELS_CONFIG[model].get('json_schema', False)]
-            supported_models_str = ', '.join(sorted(supported_models))
+            supported_models = [
+                model for model in SUPPORTED_MODELS 
+                if MODELS_CONFIG[model].get('json_schema', False)
+            ]
             raise JSONSchemaNotSupportedError(
-                f"O modelo '{self.model}' não suporta json_schema no response_format. "
-                f"Modelos compatíveis com json_schema: {supported_models_str}. "
-                f"Considere usar um modelo compatível ou remover o json_schema."
+                f"O modelo '{self.model}' não suporta json_schema. "
+                f"Modelos compatíveis: {', '.join(sorted(supported_models))}"
             )
-
+    
     def _generate_request_id(self) -> str:
+        """Gera ID único para requisição"""
         return f"req_{int(time.time() * 1000)}_{id(self)}"
-
+    
     def estimate_tokens(self, messages: List[Dict[str, str]]) -> int:
+        """Estima tokens de forma mais precisa"""
         try:
             total_tokens = 0
             for message in messages:
                 role_tokens = len(self.encoder.encode(message.get('role', '')))
                 content_tokens = len(self.encoder.encode(message.get('content', '')))
-                total_tokens += role_tokens + content_tokens + 4
-            total_tokens += 50
+                total_tokens += role_tokens + content_tokens + 4  # overhead por mensagem
+            total_tokens += 50  # overhead da requisição
             return total_tokens
         except Exception as e:
-            logger.warning(
-                f"Erro na estimativa de tokens: {e}. Usando estimativa conservadora.",
-                extra={'action': 'token_estimation_error'}
-            )
+            logger.warning(f"Erro na estimativa de tokens: {e}. Usando estimativa conservadora.")
+            # Fallback conservador
             total_chars = sum(len(str(msg.get('content', ''))) for msg in messages)
             return int(total_chars * 0.3)
-
+    
     def calculate_cost(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
-        """
-        Calcula o custo total considerando input, output e cached tokens.
-        Cached tokens são mais baratos que input tokens regulares.
-        Usa preços do arquivo models.json.
-        """
-        # Calcula custo dos tokens não-cached (input_tokens - cached_tokens)
+        """Calcula custo total considerando todos os tipos de tokens"""
         regular_input_tokens = max(0, input_tokens - cached_tokens)
+        
         regular_input_cost = (regular_input_tokens / 1000) * self.model_pricing['input']
-        
-        # Calcula custo dos cached tokens (mais baratos)
         cached_cost = (cached_tokens / 1000) * self.model_pricing['cache']
-        
-        # Calcula custo dos output tokens
         output_cost = (output_tokens / 1000) * self.model_pricing['output']
         
-        total_cost = regular_input_cost + cached_cost + output_cost
-        
-        # Log detalhado do cálculo de custo quando há cached tokens
-        if cached_tokens > 0:
-            logger.debug(
-                f"Cálculo de custo detalhado - Modelo: {self.model} | "
-                f"Input regular: {regular_input_tokens} tokens (${regular_input_cost:.6f}) | "
-                f"Cached: {cached_tokens} tokens (${cached_cost:.6f}) | "
-                f"Output: {output_tokens} tokens (${output_cost:.6f}) | "
-                f"Total: ${total_cost:.6f}",
-                extra={
-                    'model': self.model,
-                    'regular_input_tokens': regular_input_tokens,
-                    'cached_tokens': cached_tokens,
-                    'output_tokens': output_tokens,
-                    'regular_input_cost': regular_input_cost,
-                    'cached_cost': cached_cost,
-                    'output_cost': output_cost,
-                    'total_cost': total_cost,
-                    'action': 'cost_calculation_detailed'
-                }
-            )
-        
-        return total_cost
-
+        return regular_input_cost + cached_cost + output_cost
+    
     def _prepare_json_schema(self, json_schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepara schema JSON para a API"""
         if not isinstance(json_schema, dict):
             return None
+        
         return {
             "type": "json_schema",
             "json_schema": {
@@ -209,22 +195,23 @@ class AIProcessor:
                 "strict": json_schema.get("strict", True)
             }
         }
-
-    def _extract_wait_time_from_error_result(self, result: Dict[str, Any]) -> float:
+    
+    def _extract_wait_time_from_error(self, result: Dict[str, Any]) -> float:
+        """Extrai tempo de espera do erro de rate limit"""
         if 'retry_after' in result:
             try:
                 return float(result['retry_after'])
             except (ValueError, TypeError):
                 pass
+        
         error_msg = result.get('error', '')
         patterns = [
             r'retry after (\d+) seconds',
             r'wait (\d+) seconds',
             r'retry.*?(\d+)\s*seconds?',
-            r'(\d+)s',
-            r'retry.*?(\d+)',
-            r'wait.*?(\d+)'
+            r'(\d+)s'
         ]
+        
         for pattern in patterns:
             match = re.search(pattern, error_msg, re.IGNORECASE)
             if match:
@@ -232,6 +219,8 @@ class AIProcessor:
                     return float(match.group(1))
                 except (ValueError, IndexError):
                     continue
+        
+        # Verificar headers HTTP
         if 'response_headers' in result:
             headers = result['response_headers']
             if 'retry-after' in headers:
@@ -239,19 +228,26 @@ class AIProcessor:
                     return float(headers['retry-after'])
                 except (ValueError, TypeError):
                     pass
-        return 60.0
-
+        
+        return 60.0  # Fallback conservador
+    
     async def _make_api_call(
         self,
         messages: List[Dict[str, str]],
         json_schema: Optional[Dict[str, Any]] = None,
         request_id: str = None
     ) -> Dict[str, Any]:
-        # Validação de compatibilidade do json_schema
+        """
+        Faz chamada à API com controle adaptativo de throughput.
+        
+        O controlador decide quando e como fazer a requisição baseado
+        na performance atual e limites aprendidos.
+        """
         self._validate_json_schema_compatibility(json_schema)
         
         if not request_id:
             request_id = self._generate_request_id()
+        
         if not messages or not isinstance(messages, list):
             return {
                 'content': None,
@@ -261,93 +257,153 @@ class AIProcessor:
                 'error_type': 'ValidationError',
                 'request_id': request_id
             }
-        base_estimate = self.estimate_tokens(messages)
-        calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
-        self.stats_manager.record_concurrent_start()
+        
+        # Estimar tokens e aguardar aprovação do controlador
+        estimated_tokens = self.estimate_tokens(messages)
+        
+        # O controlador decide se pode processar agora ou precisa aguardar
+        await self.throughput_controller.acquire_permission(estimated_tokens)
+        
         try:
-            async with self.semaphore:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(MAX_RETRY),
-                    wait=wait_fixed(0.1),
-                    reraise=True
-                ):
-                    with attempt:
-                        if attempt.retry_state.attempt_number > 1:
-                            await self.rate_limiter.wait_for_tokens(base_estimate)
-                        start_time = time.time()
-                        try:
-                            api_params = {
-                                "model": self.model,
-                                "messages": messages,
-                                "temperature": self.temperature
-                            }
-                            if self.max_tokens is not None:
-                                api_params["max_tokens"] = self.max_tokens
-                            if json_schema and isinstance(json_schema, dict):
-                                api_params["response_format"] = self._prepare_json_schema(json_schema)
-                            response = await self.client.chat.completions.create(**api_params)
-                            end_time = time.time()
-                            api_response_time = end_time - start_time
-                            tokens_used = response.usage.total_tokens
-                            input_tokens = response.usage.prompt_tokens
-                            output_tokens = response.usage.completion_tokens
-                            cached_tokens = 0
-                            if hasattr(response.usage, 'prompt_tokens_details'):
-                                cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
-                            self.rate_limiter.record_tokens(tokens_used)
-                            self.rate_limiter.record_token_usage(base_estimate, tokens_used)
-                            # Atualizado para incluir cached_tokens no cálculo
-                            cost = self.calculate_cost(input_tokens, output_tokens, cached_tokens)
-                            content = response.choices[0].message.content
-                            parsed_content = content
-                            if json_schema and isinstance(json_schema, dict) and content:
-                                try:
-                                    parsed_content = json.loads(content)
-                                except json.JSONDecodeError:
-                                    parsed_content = content
-                            return {
-                                'content': parsed_content,
-                                'raw_content': content,
-                                'tokens_used': tokens_used,
-                                'input_tokens': input_tokens,
-                                'output_tokens': output_tokens,
-                                'cached_tokens': cached_tokens,
-                                'cost': cost,
-                                'api_response_time': api_response_time,
-                                'success': True,
-                                'is_json': json_schema is not None,
-                                'attempts': attempt.retry_state.attempt_number,
-                                'request_id': request_id
-                            }
-                        except Exception as e:
-                            end_time = time.time()
-                            api_response_time = end_time - start_time
-                            response_headers = {}
-                            if hasattr(e, 'response') and hasattr(e.response, 'headers'):
-                                response_headers = dict(e.response.headers)
-                            error_result = {
-                                'content': None,
-                                'raw_content': None,
-                                'tokens_used': 0,
-                                'input_tokens': 0,
-                                'output_tokens': 0,
-                                'cached_tokens': 0,
-                                'cost': 0.0,
-                                'api_response_time': api_response_time,
-                                'success': False,
-                                'error': str(e),
-                                'error_type': type(e).__name__,
-                                'response_headers': response_headers,
-                                'is_json': False,
-                                'attempts': attempt.retry_state.attempt_number,
-                                'request_id': request_id
-                            }
-                            if is_rate_limit_error(error_result):
-                                wait_time = self._extract_wait_time_from_error_result(error_result)
-                                raise
-                            else:
-                                return error_result
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(MAX_RETRY),
+                wait=wait_fixed(0.1),
+                reraise=True
+            ):
+                with attempt:
+                    if attempt.retry_state.attempt_number > 1:
+                        # Em retry, aguardar nova aprovação
+                        await self.throughput_controller.acquire_permission(estimated_tokens)
+                    
+                    start_time = time.time()
+                    
+                    try:
+                        # Preparar parâmetros da API
+                        api_params = {
+                            "model": self.model,
+                            "messages": messages,
+                            "temperature": self.temperature
+                        }
+                        
+                        if self.max_tokens is not None:
+                            api_params["max_tokens"] = self.max_tokens
+                        
+                        if json_schema and isinstance(json_schema, dict):
+                            api_params["response_format"] = self._prepare_json_schema(json_schema)
+                        
+                        # Fazer chamada à API
+                        response = await self.client.chat.completions.create(**api_params)
+                        
+                        end_time = time.time()
+                        api_response_time = end_time - start_time
+                        
+                        # Extrair informações de uso
+                        tokens_used = response.usage.total_tokens
+                        input_tokens = response.usage.prompt_tokens
+                        output_tokens = response.usage.completion_tokens
+                        
+                        cached_tokens = 0
+                        if hasattr(response.usage, 'prompt_tokens_details'):
+                            cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
+                        
+                        # Informar o controlador sobre o sucesso
+                        self.throughput_controller.record_success(
+                            estimated_tokens=estimated_tokens,
+                            actual_tokens=tokens_used,
+                            response_time=api_response_time
+                        )
+                        
+                        # Calcular custo
+                        cost = self.calculate_cost(input_tokens, output_tokens, cached_tokens)
+                        
+                        # Processar resposta
+                        content = response.choices[0].message.content
+                        parsed_content = content
+                        
+                        if json_schema and isinstance(json_schema, dict) and content:
+                            try:
+                                parsed_content = json.loads(content)
+                            except json.JSONDecodeError:
+                                parsed_content = content
+                        
+                        # Registrar stats
+                        self.stats_manager.record_request(
+                            success=True,
+                            tokens_input=input_tokens,
+                            tokens_output=output_tokens,
+                            tokens_cached=cached_tokens,
+                            cost=cost,
+                            api_response_time=api_response_time,
+                            estimated_tokens=estimated_tokens,
+                            actual_tokens=tokens_used,
+                            retry_count=attempt.retry_state.attempt_number - 1
+                        )
+                        
+                        return {
+                            'content': parsed_content,
+                            'raw_content': content,
+                            'tokens_used': tokens_used,
+                            'input_tokens': input_tokens,
+                            'output_tokens': output_tokens,
+                            'cached_tokens': cached_tokens,
+                            'cost': cost,
+                            'api_response_time': api_response_time,
+                            'success': True,
+                            'is_json': json_schema is not None,
+                            'attempts': attempt.retry_state.attempt_number,
+                            'request_id': request_id
+                        }
+                    
+                    except Exception as e:
+                        end_time = time.time()
+                        api_response_time = end_time - start_time
+                        
+                        # Extrair headers da resposta se disponível
+                        response_headers = {}
+                        if hasattr(e, 'response') and hasattr(e.response, 'headers'):
+                            response_headers = dict(e.response.headers)
+                        
+                        error_result = {
+                            'content': None,
+                            'raw_content': None,
+                            'tokens_used': 0,
+                            'input_tokens': 0,
+                            'output_tokens': 0,
+                            'cached_tokens': 0,
+                            'cost': 0.0,
+                            'api_response_time': api_response_time,
+                            'success': False,
+                            'error': str(e),
+                            'error_type': type(e).__name__,
+                            'response_headers': response_headers,
+                            'is_json': False,
+                            'attempts': attempt.retry_state.attempt_number,
+                            'request_id': request_id
+                        }
+                        
+                        # Se for rate limit, informar o controlador
+                        if is_rate_limit_error(error_result):
+                            wait_time = self._extract_wait_time_from_error(error_result)
+                            self.throughput_controller.record_rate_limit(wait_time)
+                            raise  # Re-raise para retry
+                        else:
+                            # Erro não relacionado a rate limit
+                            self.stats_manager.record_request(
+                                success=False,
+                                error_type=error_result['error_type'],
+                                api_response_time=api_response_time,
+                                retry_count=attempt.retry_state.attempt_number - 1
+                            )
+                            return error_result
+        
         except RetryError as retry_error:
+            # Máximo de tentativas excedido
+            self.stats_manager.record_request(
+                success=False,
+                error_type='RetryError',
+                retry_count=MAX_RETRY
+            )
+            
             return {
                 'content': None,
                 'raw_content': None,
@@ -364,93 +420,99 @@ class AIProcessor:
                 'attempts': MAX_RETRY,
                 'request_id': request_id
             }
-        finally:
-            self.stats_manager.record_concurrent_end()
-
+    
     async def process_single(
-        self, 
-        text: str, 
+        self,
+        text: str,
         prompt_template: str,
         json_schema: Optional[Dict[str, Any]] = None,
         custom_id: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        # Validação de compatibilidade do json_schema
+        """Processa um único texto com controle adaptativo"""
         self._validate_json_schema_compatibility(json_schema)
         
         request_id = custom_id if custom_id else self._generate_request_id()
         start_time = time.time()
+        
         try:
             prompt = prompt_template.format(text=text, **kwargs)
             messages = [{"role": "user", "content": prompt}]
+            
             result = await self._make_api_call(messages, json_schema, request_id)
+            
             end_time = time.time()
             processing_time = end_time - start_time
+            
             result['processing_time'] = processing_time
-            # Set single 'id' field
-            if custom_id is not None:
-                result['id'] = custom_id
-            else:
-                result['id'] = request_id
-            # Remove separate ids
+            result['id'] = request_id
+            
+            # Remover IDs duplicados
             if 'custom_id' in result:
                 del result['custom_id']
             if 'request_id' in result:
                 del result['request_id']
-            api_rate_limit_detected = is_rate_limit_error(result)
-            if not api_rate_limit_detected:
-                self.stats_manager.record_request(
-                    success=result.get('success', False),
-                    tokens_input=result.get('input_tokens', 0),
-                    tokens_output=result.get('output_tokens', 0),
-                    tokens_cached=result.get('cached_tokens', 0),
-                    cost=result.get('cost', 0.0),
-                    api_response_time=result.get('api_response_time', 0.0),
-                    error_type=result.get('error_type'),
-                    retry_count=max(0, result.get('attempts', 1) - 1),
-                    api_rate_limit_detected=False,
-                    coordinated_wait_time=0.0,
-                    model=self.model
-                )
+            
             return result
+        
         except JSONSchemaNotSupportedError:
-            # Re-raise a exceção de compatibilidade
             raise
         except Exception as e:
             end_time = time.time()
             processing_time = end_time - start_time
+            
             return {
                 'content': None,
                 'success': False,
                 'error': str(e),
                 'error_type': type(e).__name__,
                 'processing_time': processing_time,
-                'id': custom_id if custom_id is not None else request_id
+                'id': request_id
             }
-
+    
     def _calculate_progress_intervals(self, total: int) -> List[int]:
+        """Calcula intervalos inteligentes para logs de progresso"""
         if total <= 5:
             return list(range(1, total + 1))
-        intervals = list(range(5, total + 1, 5))
+        
+        # Intervalos que fazem sentido para o usuário
+        intervals = []
+        
+        # Primeiros marcos
+        intervals.extend([1, 5, 10])
+        
+        # Marcos baseados em percentual
+        for percent in [25, 50, 75, 90, 95]:
+            milestone = int(total * percent / 100)
+            if milestone not in intervals and milestone <= total:
+                intervals.append(milestone)
+        
+        # Sempre incluir o final
         if total not in intervals:
             intervals.append(total)
-        if 1 not in intervals:
-            intervals.insert(0, 1)
-        return sorted(intervals)
-
+        
+        return sorted([i for i in intervals if i <= total])
+    
     async def process_batch(
-        self, 
-        texts: List[str], 
+        self,
+        texts: List[str],
         prompt_template: str,
         json_schema: Optional[Dict[str, Any]] = None,
         batch_id: Optional[str] = None,
         custom_ids: Optional[List[str]] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        # Validação de compatibilidade do json_schema
+        """
+        Processa lote com controle adaptativo e logs inteligentes.
+        
+        O sistema se auto-ajusta durante a execução para maximizar
+        throughput sem atingir rate limits.
+        """
         self._validate_json_schema_compatibility(json_schema)
         
         batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
+        
+        # Validar custom_ids se fornecidos
         if custom_ids is not None:
             if hasattr(custom_ids, 'tolist'):
                 custom_ids = custom_ids.tolist()
@@ -458,274 +520,248 @@ class AIProcessor:
                 custom_ids = list(custom_ids.values)
             elif not isinstance(custom_ids, list):
                 custom_ids = list(custom_ids)
+            
             if len(custom_ids) != len(texts):
                 raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
+            
             custom_ids = [str(cid) if cid is not None else None for cid in custom_ids]
-        total_successful = 0
-        total_failed = 0
+        
+        # Inicializar batch
+        self.throughput_controller.start_batch(batch_id)
+        self.stats_manager.start_batch(batch_id)
+        
+        total_texts = len(texts)
+        completed = 0
+        failed = 0
+        
+        # Intervalos de progresso inteligentes
+        progress_intervals = self._calculate_progress_intervals(total_texts)
         logged_progress = set()
         progress_lock = asyncio.Lock()
-        self.rate_limiter.start_batch(batch_id)
-        self.stats_manager.start_batch(batch_id)
+        
         logger.info(
-            f"🚀 Iniciando processamento em lote - {len(texts)} textos",
+            f"🚀 Iniciando batch {batch_id} - {total_texts} textos | "
+            f"Modelo: {self.model} | Controle adaptativo ativo",
             extra={
                 'batch_id': batch_id,
-                'total_texts': len(texts),
+                'total_texts': total_texts,
+                'model': self.model,
                 'has_custom_ids': custom_ids is not None,
                 'has_json_schema': json_schema is not None,
-                'max_concurrent': self.max_concurrent,
-                'model': self.model,
-                'json_schema_supported': supports_json_schema(self.model),
                 'action': 'batch_start'
             }
         )
-
+        
+        start_time = time.time()
+        
         async def log_progress(current_completed: int, current_failed: int):
+            """Log de progresso inteligente"""
             async with progress_lock:
-                progress_intervals = self._calculate_progress_intervals(len(texts))
                 current_total = current_completed + current_failed
+                
                 if current_total in progress_intervals and current_total not in logged_progress:
                     logged_progress.add(current_total)
+                    
                     elapsed = time.time() - start_time
                     rate = current_total / elapsed if elapsed > 0 else 0
-                    eta = (len(texts) - current_total) / rate if rate > 0 else 0
+                    
+                    remaining = total_texts - current_total
+                    eta_seconds = remaining / rate if rate > 0 else 0
+                    eta_minutes = eta_seconds / 60
+                    
+                    # Stats do controlador
+                    controller_stats = self.throughput_controller.get_current_stats()
+                    
                     logger.info(
-                        f"📊 Progresso: {current_total}/{len(texts)} ({(current_total)/len(texts)*100:.1f}%) | "
+                        f"📊 Progresso: {current_total}/{total_texts} ({current_total/total_texts*100:.1f}%) | "
                         f"✅{current_completed} ❌{current_failed} | "
-                        f"⏱️ETA: {eta/60:.1f}min",
+                        f"🚀{rate:.1f} req/s | ⏱️ETA: {eta_minutes:.1f}min | "
+                        f"🔄{controller_stats['current_concurrency']} threads | "
+                        f"📈{controller_stats['current_tpm']:,} TPM",
                         extra={
                             'batch_id': batch_id,
                             'completed': current_total,
-                            'total': len(texts),
-                            'successful_so_far': current_completed,
-                            'failed_so_far': current_failed,
-                            'processing_rate': round(rate, 2),
-                            'eta_minutes': round(eta / 60, 1),
-                            'progress_percent': round((current_total / len(texts)) * 100, 1),
+                            'total': total_texts,
+                            'successful': current_completed,
+                            'failed': current_failed,
+                            'rate': round(rate, 2),
+                            'eta_minutes': round(eta_minutes, 1),
+                            'progress_percent': round(current_total / total_texts * 100, 1),
+                            'current_concurrency': controller_stats['current_concurrency'],
+                            'current_tpm': controller_stats['current_tpm'],
                             'action': 'batch_progress'
                         }
                     )
-
-        all_results = [None] * len(texts)
-        pending_items = list(enumerate(texts))
-        start_time = time.time()
-        pause_due_to_rate_limit = False
-
-        while pending_items:
-            task_to_index = {}
-            current_tasks = []
-            for i, text in pending_items:
-                custom_id = None
-                if custom_ids is not None and i < len(custom_ids):
-                    custom_id = custom_ids[i]
-                task = asyncio.create_task(
-                    self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
-                )
-                current_tasks.append(task)
-                task_to_index[task] = i
-            rate_limit_indices = []
-            rate_limit_detected = False
-            while current_tasks:
-                done, pending = await asyncio.wait(
-                    current_tasks,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                for completed_task in done:
-                    try:
-                        result = await completed_task
-                        original_index = task_to_index[completed_task]
-                        if not result.get('success', False) and is_rate_limit_error(result):
-                            rate_limit_indices.append(original_index)
-                            if not rate_limit_detected:
-                                rate_limit_detected = True
-                                wait_time = self._extract_wait_time_from_error_result(result)
-                                self.stats_manager.record_global_rate_limit_activation(wait_time, len(rate_limit_indices))
-                                self.rate_limiter.record_api_rate_limit_with_context(
-                                    wait_time, total_successful, len(texts), total_successful, 0
-                                )
-                                pause_due_to_rate_limit = True
-                        else:
-                            all_results[original_index] = result
-                            if result.get('success', False):
-                                total_successful += 1
-                            else:
-                                total_failed += 1
-                            # Log progress every 5 completions (success + failure), excluding rate limit errors
-                            await log_progress(total_successful, total_failed)
-                            if result.get('success', False):
-                                self.rate_limiter.record_successful_request()
-                    except Exception as e:
-                        logger.error(
-                            f"Erro em task do lote: {e}",
-                            extra={
-                                'batch_id': batch_id,
-                                'error': str(e),
-                                'error_type': type(e).__name__,
-                                'action': 'batch_task_error'
-                            }
-                        )
-                        original_index = task_to_index.get(completed_task, 0)
-                        all_results[original_index] = {
-                            'content': None,
-                            'success': False,
-                            'error': str(e),
-                            'error_type': type(e).__name__
-                        }
-                        total_failed += 1
-                        await log_progress(total_successful, total_failed)
-                current_tasks = list(pending)
-            if rate_limit_indices:
-                pending_items = [(i, texts[i]) for i in rate_limit_indices]
-                await asyncio.sleep(0.1)
-                pause_due_to_rate_limit = False
-            else:
-                pending_items = []
-
+        
+        # Processar todos os textos
+        all_results = [None] * total_texts
+        
+        # Criar tarefas para processamento
+        async def process_item(index: int, text: str):
+            custom_id = None
+            if custom_ids is not None and index < len(custom_ids):
+                custom_id = custom_ids[index]
+            
+            return await self.process_single(
+                text, prompt_template, json_schema, custom_id, **kwargs
+            )
+        
+        # Executar com controle de concorrência adaptativo
+        semaphore = asyncio.Semaphore(self.throughput_controller.get_max_concurrency())
+        
+        async def process_with_semaphore(index: int, text: str):
+            async with semaphore:
+                return index, await process_item(index, text)
+        
+        # Criar todas as tarefas
+        tasks = [
+            asyncio.create_task(process_with_semaphore(i, text))
+            for i, text in enumerate(texts)
+        ]
+        
+        # Processar conforme completam
+        for task in asyncio.as_completed(tasks):
+            try:
+                index, result = await task
+                all_results[index] = result
+                
+                if result.get('success', False):
+                    completed += 1
+                else:
+                    failed += 1
+                
+                await log_progress(completed, failed)
+                
+            except Exception as e:
+                failed += 1
+                logger.error(f"Erro em task do batch: {e}", extra={'batch_id': batch_id})
+                await log_progress(completed, failed)
+        
+        # Finalizar batch
         final_results = [r for r in all_results if r is not None]
-
-        # Adjust results to have a single 'id' field instead of 'request_id' and 'custom_id'
+        
+        # Ajustar IDs nos resultados
         for res in final_results:
             if 'id' not in res:
                 if 'custom_id' in res and res['custom_id'] is not None:
                     res['id'] = res['custom_id']
                 else:
                     res['id'] = res.get('request_id')
+            
+            # Limpar IDs duplicados
             if 'custom_id' in res:
                 del res['custom_id']
             if 'request_id' in res:
                 del res['request_id']
-
+        
+        # Finalizar stats
         batch_stats = self.stats_manager.end_batch(batch_id)
+        controller_final_stats = self.throughput_controller.end_batch(batch_id)
+        
         logger.info(
-            f"✅ Batch concluído - {batch_stats.successful_requests} sucessos, "
-            f"{batch_stats.failed_requests} falhas em {batch_stats.processing_time:.1f}s",
+            f"✅ Batch {batch_id} concluído - {completed} sucessos, {failed} falhas | "
+            f"⏱️{batch_stats.processing_time:.1f}s | "
+            f"🚀{batch_stats.avg_rate:.1f} req/s | "
+            f"💰${batch_stats.total_cost:.4f} | "
+            f"📊Eficiência: {batch_stats.efficiency_rate:.1f}%",
             extra={
                 'batch_id': batch_id,
-                'total_requests': batch_stats.total_requests,
-                'successful_requests': batch_stats.successful_requests,
-                'failed_requests': batch_stats.failed_requests,
+                'successful_requests': completed,
+                'failed_requests': failed,
                 'processing_time': round(batch_stats.processing_time, 2),
-                'total_tokens': batch_stats.total_tokens,
-                'total_cost': round(batch_stats.total_cost, 4),
                 'avg_rate': round(batch_stats.avg_rate, 2),
-                'success_rate': round(batch_stats.success_rate, 1),
+                'total_cost': round(batch_stats.total_cost, 4),
+                'efficiency_rate': round(batch_stats.efficiency_rate, 1),
                 'action': 'batch_complete'
             }
         )
+        
         return {
             'results': final_results,
             'batch_stats': batch_stats,
+            'controller_stats': controller_final_stats,
             'batch_id': batch_id
         }
-
+    
     def get_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True) -> Dict[str, Any]:
+        """Retorna stats completos centralizados"""
         complete_stats = {}
+        
         if include_global:
             global_stats = self.stats_manager.get_global_stats()
-            rate_limiter_status = self.rate_limiter.get_status()
-            calibration_stats = self.rate_limiter.get_calibration_stats()
+            controller_stats = self.throughput_controller.get_global_stats()
+            
             complete_stats['global'] = {
-                'summary': self.stats_manager.format_stats(global_stats, "ESTATÍSTICAS GLOBAIS"),
-                'metrics': self.stats_manager.export_stats_json(global_stats),
-                'efficiency': self.stats_manager.get_efficiency_metrics(global_stats),
-                'cost_breakdown': self.stats_manager.get_cost_breakdown(global_stats),
-                'rate_limiter': {
-                    'status': rate_limiter_status,
-                    'calibration': calibration_stats,
-                    'summary': f"""⚡ RATE LIMITER GLOBAL:
-   🔢 Tokens usados: {rate_limiter_status['tokens_used']:,}
-   📊 Utilização: {rate_limiter_status['utilization_percent']:.1f}%
-   ⏱️ Tempo no minuto: {rate_limiter_status['time_in_minute']:.1f}s
-   🔄 Total de esperas: {rate_limiter_status['total_waits']}
-   ⏳ Tempo total de espera: {rate_limiter_status['total_wait_time']:.1f}s
-   
-🎯 CALIBRAÇÃO GLOBAL:
-   📊 Precisão: {calibration_stats['accuracy_percentage']:.1f}%
-   🔧 Fator atual: {calibration_stats['current_calibration_factor']:.3f}
-   📈 Total calibrações: {calibration_stats['total_calibrations']}
-   🛡️ Rate limits prevenidos: {calibration_stats['prevented_rate_limits']}
-   🚨 Rate limits detectados: {calibration_stats['api_rate_limits_detected']}"""
-                }
+                'processing_stats': self.stats_manager.format_stats(global_stats, "ESTATÍSTICAS GLOBAIS"),
+                'controller_stats': controller_stats,
+                'summary': f"""🎯 RESUMO GLOBAL:
+📊 Requests: {global_stats.total_requests} (✅{global_stats.successful_requests} ❌{global_stats.failed_requests})
+🔢 Tokens: {global_stats.total_tokens:,} (💾{global_stats.total_tokens_cached:,} cached)
+💰 Custo: ${global_stats.total_cost:.4f}
+🚀 Performance: {global_stats.avg_rate:.1f} req/s | {global_stats.efficiency_rate:.1f}% eficiência
+🎯 Precisão estimativa: {controller_stats.get('estimation_accuracy', 0):.1f}%
+📈 TPM máximo atingido: {controller_stats.get('max_tpm_reached', 0):,}"""
             }
+        
         if batch_result and 'batch_stats' in batch_result:
             batch_stats = batch_result['batch_stats']
             batch_id = batch_result.get('batch_id', 'unknown')
+            controller_stats = batch_result.get('controller_stats', {})
+            
             complete_stats['batch'] = {
                 'id': batch_id,
-                'summary': self.stats_manager.format_stats(batch_stats, f"BATCH {batch_id}"),
-                'metrics': self.stats_manager.export_stats_json(batch_stats),
-                'efficiency': self.stats_manager.get_efficiency_metrics(batch_stats),
-                'cost_breakdown': self.stats_manager.get_cost_breakdown(batch_stats),
-                'rate_limiter': {
-                    'batch_specific': {
-                        'api_rate_limits_detected': batch_stats.api_rate_limits_detected,
-                        'global_rate_limit_activations': batch_stats.global_rate_limit_activations,
-                        'coordinated_wait_time': batch_stats.coordinated_wait_time,
-                        'coordination_efficiency': batch_stats.coordination_efficiency
-                    },
-                    'summary': f"""⚡ RATE LIMITER BATCH {batch_id}:
-   🚨 Rate limits detectados: {batch_stats.api_rate_limits_detected}
-   🌐 Ativações globais: {batch_stats.global_rate_limit_activations}
-   ⏱️ Tempo coordenado: {batch_stats.coordinated_wait_time:.1f}s
-   📈 Eficiência coordenação: {batch_stats.coordination_efficiency:.1f}%
-   🔗 Pico concorrente: {batch_stats.concurrent_peak} requisições"""
-                }
+                'processing_stats': self.stats_manager.format_stats(batch_stats, f"BATCH {batch_id}"),
+                'controller_stats': controller_stats,
+                'summary': f"""🎯 RESUMO BATCH {batch_id}:
+📊 Requests: {batch_stats.total_requests} (✅{batch_stats.successful_requests} ❌{batch_stats.failed_requests})
+🔢 Tokens: {batch_stats.total_tokens:,} (💾{batch_stats.total_tokens_cached:,} cached)
+💰 Custo: ${batch_stats.total_cost:.4f}
+🚀 Performance: {batch_stats.avg_rate:.1f} req/s | {batch_stats.efficiency_rate:.1f}% eficiência
+🔄 Concorrência máxima: {controller_stats.get('max_concurrency_used', 0)}
+⏱️ Tempo total: {batch_stats.processing_time:.1f}s"""
             }
+        
         return complete_stats
-
+    
+    # Métodos de conveniência para compatibilidade
     def get_global_stats(self):
+        """Retorna stats globais"""
         return self.stats_manager.get_global_stats()
-
+    
     def show_stats(self, result_or_stats, title: str = "Stats"):
+        """Exibe stats formatados"""
         if isinstance(result_or_stats, dict) and 'batch_stats' in result_or_stats:
             stats = result_or_stats['batch_stats']
         else:
             stats = result_or_stats
+        
         formatted_stats = self.stats_manager.format_stats(stats, title)
         print(formatted_stats)
-
-    def show_calibration_stats(self):
-        calibration_stats = self.rate_limiter.get_calibration_stats()
-        print("🎯 ESTATÍSTICAS DE CALIBRAÇÃO:")
-        print(f"   📊 Precisão das estimativas: {calibration_stats['accuracy_percentage']:.1f}%")
-        print(f"   🔧 Fator de calibração atual: {calibration_stats['current_calibration_factor']:.3f}")
-        print(f"   📈 Total de calibrações: {calibration_stats['total_calibrations']}")
-        print(f"   🛡️ Rate limits prevenidos: {calibration_stats['prevented_rate_limits']}")
-        print(f"   🚨 Rate limits detectados: {calibration_stats['api_rate_limits_detected']}")
-
-    def show_rate_limiter_status(self):
-        status = self.rate_limiter.get_status()
-        print("⚡ STATUS DO RATE LIMITER:")
-        print(f"   🔢 Tokens usados: {status['tokens_used']:,}")
-        print(f"   📊 Utilização: {status['utilization_percent']:.1f}%")
-        print(f"   ⏱️ Tempo no minuto: {status['time_in_minute']:.1f}s")
-        print(f"   🔄 Total de esperas: {status['total_waits']}")
-        print(f"   ⏳ Tempo total de espera: {status['total_wait_time']:.1f}s")
-
+    
     def show_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True):
+        """Exibe stats completos"""
         complete_stats = self.get_complete_stats(batch_result, include_global)
+        
         print("=" * 80)
         print("🎯 RELATÓRIO COMPLETO DE ESTATÍSTICAS")
         print("=" * 80)
+        
         if 'global' in complete_stats:
             print(complete_stats['global']['summary'])
             print()
-            print(complete_stats['global']['rate_limiter']['summary'])
-            print()
+        
         if 'batch' in complete_stats:
             print(complete_stats['batch']['summary'])
             print()
-            print(complete_stats['batch']['rate_limiter']['summary'])
-            print()
+        
         print("=" * 80)
-
+    
     def show_cost_breakdown(self, result: Dict[str, Any]):
-        """Mostra breakdown detalhado dos custos incluindo cached tokens"""
+        """Mostra breakdown detalhado dos custos"""
         if not result.get('success', False):
             print("❌ Não é possível mostrar breakdown de custo para requisição sem sucesso")
             return
-            
+        
         input_tokens = result.get('input_tokens', 0)
         output_tokens = result.get('output_tokens', 0)
         cached_tokens = result.get('cached_tokens', 0)
@@ -737,13 +773,15 @@ class AIProcessor:
         output_cost = (output_tokens / 1000) * self.model_pricing['output']
         
         print("💰 BREAKDOWN DETALHADO DE CUSTOS:")
-        print(f"   🤖 Modelo: {self.model}")
-        print(f"   📊 Total de tokens: {input_tokens + output_tokens:,}")
-        print(f"   📥 Input tokens regulares: {regular_input_tokens:,} × ${self.model_pricing['input']:.6f}/1k = ${regular_input_cost:.6f}")
+        print(f"  🤖 Modelo: {self.model}")
+        print(f"  📊 Total de tokens: {input_tokens + output_tokens:,}")
+        print(f"  📥 Input regulares: {regular_input_tokens:,} × ${self.model_pricing['input']:.6f}/1k = ${regular_input_cost:.6f}")
+        
         if cached_tokens > 0:
-            print(f"   🗄️ Cached tokens: {cached_tokens:,} × ${self.model_pricing['cache']:.6f}/1k = ${cached_cost:.6f}")
+            print(f"  🗄️ Cached tokens: {cached_tokens:,} × ${self.model_pricing['cache']:.6f}/1k = ${cached_cost:.6f}")
             savings = (cached_tokens / 1000) * (self.model_pricing['input'] - self.model_pricing['cache'])
             discount_percent = ((self.model_pricing['input'] - self.model_pricing['cache'])/self.model_pricing['input']*100)
-            print(f"   💡 Economia com cache: ${savings:.6f} ({discount_percent:.1f}% desconto)")
-        print(f"   📤 Output tokens: {output_tokens:,} × ${self.model_pricing['output']:.6f}/1k = ${output_cost:.6f}")
-        print(f"   💵 Custo total: ${total_cost:.6f}")
+            print(f"  💡 Economia com cache: ${savings:.6f} ({discount_percent:.1f}% desconto)")
+        
+        print(f"  📤 Output tokens: {output_tokens:,} × ${self.model_pricing['output']:.6f}/1k = ${output_cost:.6f}")
+        print(f"  💵 Custo total: ${total_cost:.6f}")
