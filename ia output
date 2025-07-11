@@ -106,7 +106,8 @@ class OutputManager:
     def process_ai_results(
         self, 
         ai_results: Union[Dict[str, Any], List[Dict[str, Any]]],
-        custom_id_column_name: str = 'custom_id'
+        custom_id_column_name: str = 'custom_id',
+        include_content_text: bool = True
     ) -> pd.DataFrame:
         """
         Processa resultados do AIProcessor e converte para DataFrame
@@ -117,9 +118,10 @@ class OutputManager:
                 - Lista de resultados (list)
                 - Resultado de batch com 'results' (dict com key 'results')
             custom_id_column_name: Nome personalizado para a coluna de ID (default: 'custom_id')
+            include_content_text: Se True, inclui coluna content_text. Se False, filtra apenas JSON válido
         
         Returns:
-            DataFrame com custom_id (ou nome personalizado) e colunas extraídas do content JSON
+            DataFrame com apenas resultados bem-sucedidos, custom_id e colunas extraídas do content JSON
         """
         operation_id = self._generate_operation_id()
         start_time = time.time()
@@ -145,44 +147,46 @@ class OutputManager:
             json_content_count = 0
             text_content_count = 0
             failed_count = 0
+            filtered_count = 0
             
             for i, result in enumerate(results_list):
                 if not isinstance(result, dict):
                     continue
                 
+                # Filtra apenas resultados bem-sucedidos
+                success = result.get('success', False)
+                if not success:
+                    failed_count += 1
+                    continue
+                
                 # Extrai informações básicas
                 custom_id = result.get('custom_id')
                 content = result.get('content')
-                success = result.get('success', False)
                 
                 # Usa o nome personalizado para a coluna de ID
                 row_data = {
                     custom_id_column_name: custom_id,
-                    'success': success,
-                    'processing_time': result.get('processing_time'),
-                    'tokens_used': result.get('tokens_used'),
-                    'cost': result.get('cost'),
-                    'error': result.get('error'),
-                    'error_type': result.get('error_type')
+                    'result_processing_time': result.get('processing_time'),
+                    'result_input_tokens': result.get('input_tokens'),
+                    'result_output_tokens': result.get('output_tokens'),
+                    'result_cached_tokens': result.get('cached_tokens'),
+                    'result_total_tokens': result.get('tokens_used'),
+                    'result_cost': result.get('cost')
                 }
-                
-                if not success:
-                    failed_count += 1
-                    processed_data.append(row_data)
-                    continue
                 
                 # Processa content baseado no tipo
                 if content is None:
-                    processed_data.append(row_data)
+                    if include_content_text:
+                        processed_data.append(row_data)
                 elif isinstance(content, dict):
-                    # Content é JSON - expande as chaves como colunas
+                    # Content é JSON - expande as chaves como colunas com prefixo result_
                     json_content_count += 1
                     for key, value in content.items():
                         # Serializa objetos complexos como JSON string
                         if isinstance(value, (dict, list)):
-                            row_data[key] = json.dumps(value, ensure_ascii=False)
+                            row_data[f'result_{key}'] = json.dumps(value, ensure_ascii=False)
                         else:
-                            row_data[key] = value
+                            row_data[f'result_{key}'] = value
                     processed_data.append(row_data)
                 elif isinstance(content, str):
                     # Tenta fazer parse como JSON
@@ -192,22 +196,34 @@ class OutputManager:
                             json_content_count += 1
                             for key, value in parsed_content.items():
                                 if isinstance(value, (dict, list)):
-                                    row_data[key] = json.dumps(value, ensure_ascii=False)
+                                    row_data[f'result_{key}'] = json.dumps(value, ensure_ascii=False)
                                 else:
-                                    row_data[key] = value
+                                    row_data[f'result_{key}'] = value
+                            processed_data.append(row_data)
                         else:
+                            # Content é texto simples
                             text_content_count += 1
-                            row_data['content_text'] = content
+                            if include_content_text:
+                                row_data['result_content_text'] = content
+                                processed_data.append(row_data)
+                            else:
+                                filtered_count += 1
                     except json.JSONDecodeError:
                         # Content é texto simples
                         text_content_count += 1
-                        row_data['content_text'] = content
-                    processed_data.append(row_data)
+                        if include_content_text:
+                            row_data['result_content_text'] = content
+                            processed_data.append(row_data)
+                        else:
+                            filtered_count += 1
                 else:
                     # Outros tipos - converte para string
                     text_content_count += 1
-                    row_data['content_text'] = str(content)
-                    processed_data.append(row_data)
+                    if include_content_text:
+                        row_data['result_content_text'] = str(content)
+                        processed_data.append(row_data)
+                    else:
+                        filtered_count += 1
             
             # Cria DataFrame
             df = pd.DataFrame(processed_data)
@@ -220,16 +236,18 @@ class OutputManager:
             processing_time = time.time() - start_time
             
             logger.info(
-                f"✅ Processamento concluído - {len(df)} registros, {json_content_count} JSON, {text_content_count} texto, {failed_count} falhas",
+                f"✅ Processamento concluído - {len(df)} registros válidos, {json_content_count} JSON, {text_content_count} texto, {failed_count} falhas, {filtered_count} filtrados",
                 extra={
                     'operation_id': operation_id,
                     'total_records': len(df),
                     'json_content_count': json_content_count,
                     'text_content_count': text_content_count,
                     'failed_count': failed_count,
+                    'filtered_count': filtered_count,
                     'processing_time': round(processing_time, 2),
                     'columns_count': len(df.columns),
                     'custom_id_column_name': custom_id_column_name,
+                    'include_content_text': include_content_text,
                     'action': 'process_ai_results_complete'
                 }
             )
