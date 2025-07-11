@@ -20,27 +20,27 @@ MAX_RETRY = 2
 
 def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
     """Carrega configuração dos modelos a partir do arquivo JSON"""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Arquivo {config_path} não encontrado. Este arquivo é obrigatório.")
+    
     try:
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        else:
-            logger.warning(f"Arquivo {config_path} não encontrado. Usando configuração padrão.")
-            return {}
+        with open(config_path, 'r', encoding='utf-8') as f:
+            models_config = json.load(f)
+        
+        if not models_config:
+            raise ValueError(f"Arquivo {config_path} está vazio ou inválido.")
+        
+        return models_config
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Erro ao decodificar JSON em {config_path}: {e}")
     except Exception as e:
-        logger.error(f"Erro ao carregar {config_path}: {e}. Usando configuração padrão.")
-        return {}
+        raise RuntimeError(f"Erro ao carregar {config_path}: {e}")
 
 # Carrega configuração dos modelos
 MODELS_CONFIG = load_models_config()
 
 # Extrai modelos suportados da configuração
-SUPPORTED_MODELS = set(MODELS_CONFIG.keys()) if MODELS_CONFIG else {
-    'gpt-35-turbo-16k', 'gpt-4', 'gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini',
-    'o1-mini', 'o1', 'text-embedding-ada-002', 'o3-mini', 'gpt-4.5',
-    'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'o4-mini', 'o3',
-    'text-embedding-3-large', 'text-embedding-3-small'
-}
+SUPPORTED_MODELS = set(MODELS_CONFIG.keys())
 
 def is_rate_limit_error(result: Dict[str, Any]) -> bool:
     if not isinstance(result, dict):
@@ -50,38 +50,22 @@ def is_rate_limit_error(result: Dict[str, Any]) -> bool:
 
 def supports_json_schema(model: str) -> bool:
     """Verifica se o modelo suporta json_schema no response_format"""
-    # Primeiro verifica se o modelo é suportado pela biblioteca
-    if model not in SUPPORTED_MODELS:
-        return False
+    if model not in MODELS_CONFIG:
+        raise ValueError(f"Modelo '{model}' não encontrado na configuração. Modelos disponíveis: {', '.join(sorted(SUPPORTED_MODELS))}")
     
-    # Consulta o arquivo models.json
-    if MODELS_CONFIG and model in MODELS_CONFIG:
-        return MODELS_CONFIG[model].get('json_schema', False)
-    
-    # Fallback para modelos conhecidos se não estiver no arquivo
-    fallback_supported = {'gpt-4o-mini', 'gpt-4o'}
-    return model in fallback_supported
+    return MODELS_CONFIG[model].get('json_schema', False)
 
 def get_model_pricing(model: str) -> Dict[str, float]:
     """Obtém preços do modelo a partir do arquivo models.json"""
-    if MODELS_CONFIG and model in MODELS_CONFIG:
-        model_data = MODELS_CONFIG[model]
-        return {
-            'input': model_data.get('input', 0.0015),
-            'output': model_data.get('output', 0.002),
-            'cache': model_data.get('cache', 0.00075)
-        }
+    if model not in MODELS_CONFIG:
+        raise ValueError(f"Modelo '{model}' não encontrado na configuração. Modelos disponíveis: {', '.join(sorted(SUPPORTED_MODELS))}")
     
-    # Fallback para preços padrão se não estiver no arquivo
-    fallback_pricing = {
-        'gpt-35-turbo-16k': {'input': 0.0015, 'output': 0.002, 'cache': 0.00075},
-        'gpt-4': {'input': 0.03, 'output': 0.06, 'cache': 0.015},
-        'gpt-4-turbo': {'input': 0.01, 'output': 0.03, 'cache': 0.005},
-        'gpt-4o': {'input': 0.005, 'output': 0.015, 'cache': 0.0025},
-        'gpt-4o-mini': {'input': 0.00015, 'output': 0.0006, 'cache': 0.000075}
+    model_data = MODELS_CONFIG[model]
+    return {
+        'input': model_data['input'],
+        'output': model_data['output'],
+        'cache': model_data['cache']
     }
-    
-    return fallback_pricing.get(model, {'input': 0.0015, 'output': 0.002, 'cache': 0.00075})
 
 class JSONSchemaNotSupportedError(Exception):
     """Exceção levantada quando json_schema é usado com modelo incompatível"""
@@ -144,7 +128,7 @@ class AIProcessor:
         """Valida se o modelo atual suporta json_schema"""
         if json_schema is not None and not supports_json_schema(self.model):
             # Obtém lista de modelos que suportam JSON Schema
-            supported_models = [model for model in SUPPORTED_MODELS if supports_json_schema(model)]
+            supported_models = [model for model in SUPPORTED_MODELS if MODELS_CONFIG[model].get('json_schema', False)]
             supported_models_str = ', '.join(sorted(supported_models))
             raise JSONSchemaNotSupportedError(
                 f"O modelo '{self.model}' não suporta json_schema no response_format. "
@@ -736,29 +720,6 @@ class AIProcessor:
             print()
         print("=" * 80)
 
-    def show_model_info(self):
-        """Mostra informações sobre o modelo atual e suporte a JSON Schema"""
-        # Obtém lista de modelos que suportam JSON Schema
-        json_schema_supported = [model for model in SUPPORTED_MODELS if supports_json_schema(model)]
-        json_schema_unsupported = [model for model in SUPPORTED_MODELS if not supports_json_schema(model)]
-        
-        print("🤖 INFORMAÇÕES DO MODELO:")
-        print(f"   📋 Modelo atual: {self.model}")
-        print(f"   ✅ Suportado pela biblioteca: {'Sim' if self.model in SUPPORTED_MODELS else 'Não'}")
-        print(f"   🔧 Suporte JSON Schema: {'Sim' if supports_json_schema(self.model) else 'Não'}")
-        print(f"   💰 Preços (por 1k tokens):")
-        print(f"      📥 Input: ${self.model_pricing['input']:.6f}")
-        print(f"      📤 Output: ${self.model_pricing['output']:.6f}")
-        print(f"      🗄️ Cache: ${self.model_pricing['cache']:.6f}")
-        print()
-        print("📊 MODELOS SUPORTADOS COM JSON SCHEMA:")
-        for model in sorted(json_schema_supported):
-            print(f"   ✅ {model}")
-        print()
-        print("❌ MODELOS SEM SUPORTE JSON SCHEMA:")
-        for model in sorted(json_schema_unsupported):
-            print(f"   ❌ {model}")
-
     def show_cost_breakdown(self, result: Dict[str, Any]):
         """Mostra breakdown detalhado dos custos incluindo cached tokens"""
         if not result.get('success', False):
@@ -786,24 +747,3 @@ class AIProcessor:
             print(f"   💡 Economia com cache: ${savings:.6f} ({discount_percent:.1f}% desconto)")
         print(f"   📤 Output tokens: {output_tokens:,} × ${self.model_pricing['output']:.6f}/1k = ${output_cost:.6f}")
         print(f"   💵 Custo total: ${total_cost:.6f}")
-
-    def reload_models_config(self, config_path: str = "models.json"):
-        """Recarrega configuração dos modelos do arquivo JSON"""
-        global MODELS_CONFIG, SUPPORTED_MODELS
-        MODELS_CONFIG = load_models_config(config_path)
-        SUPPORTED_MODELS = set(MODELS_CONFIG.keys()) if MODELS_CONFIG else SUPPORTED_MODELS
-        
-        # Atualiza preços do modelo atual
-        self.model_pricing = get_model_pricing(self.model)
-        
-        logger.info(
-            f"Configuração de modelos recarregada de {config_path}",
-            extra={
-                'models_loaded': len(MODELS_CONFIG),
-                'current_model': self.model,
-                'model_pricing': self.model_pricing,
-                'json_schema_supported': supports_json_schema(self.model),
-                'action': 'models_config_reloaded'
-            }
-        )
-        print(f"✅ Configuração recarregada: {len(MODELS_CONFIG)} modelos carregados")
