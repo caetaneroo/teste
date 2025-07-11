@@ -4,6 +4,7 @@ import logging
 import pandas as pd
 import awswrangler as wr
 import re
+import json
 from typing import Optional, Dict, Any, Union
 
 logger = logging.getLogger(__name__)
@@ -207,6 +208,44 @@ class InputManager:
         except Exception as e:
             logger.error(
                 f"LOAD-SQL | source=Local (sql) | success=False | error={str(e)} | filepath={filepath}"
+            )
+            return None
+
+    def from_json(self, filepath: str, **kwargs) -> Optional[Union[Dict, list]]:
+        """
+        Lê um arquivo .json e retorna o objeto JSON (dict ou list) para uso direto.
+        Ideal para schemas, configurações, etc.
+        """
+        try:
+            with open(filepath, "r", encoding=kwargs.get("encoding", "utf-8")) as f:
+                content = json.load(f)
+            
+            # Determina o tipo do objeto JSON
+            json_type = type(content).__name__
+            if isinstance(content, dict):
+                n_keys = len(content.keys())
+                logger.info(
+                    f"LOAD-JSON | source=Local (json) | success=True | type=dict | n_keys={n_keys} | keys={list(content.keys())} | filepath={filepath}"
+                )
+            elif isinstance(content, list):
+                n_items = len(content)
+                logger.info(
+                    f"LOAD-JSON | source=Local (json) | success=True | type=list | n_items={n_items} | filepath={filepath}"
+                )
+            else:
+                logger.info(
+                    f"LOAD-JSON | source=Local (json) | success=True | type={json_type} | filepath={filepath}"
+                )
+            
+            return content
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"LOAD-JSON | source=Local (json) | success=False | error=JSON inválido: {str(e)} | filepath={filepath}"
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                f"LOAD-JSON | source=Local (json) | success=False | error={str(e)} | filepath={filepath}"
             )
             return None
 
