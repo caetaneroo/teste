@@ -17,9 +17,8 @@ class TokenUsageRecord:
 
 class AdaptiveRateLimiter:
     """
-    Rate limiter com calibração adaptativa e logs organizados por responsabilidade
+    Rate limiter com calibração adaptativa, logs organizados e coordenação inteligente.
     """
-
     def __init__(self, max_tokens_per_minute: int = 180000, calibration_enabled: bool = True):
         self.max_tpm = max_tokens_per_minute
         self.tokens_used_this_minute = 0
@@ -51,6 +50,10 @@ class AdaptiveRateLimiter:
         self.prevented_rate_limits = 0
         self.api_rate_limits_detected = 0
         
+        # NOVO: Track de tokens/minuto para inteligência de prevenção
+        self._last_minute_token_records = deque(maxlen=5)
+        self._dynamic_tpm_limit = max_tokens_per_minute
+
         logger.info(
             "AdaptiveRateLimiter inicializado",
             extra={
@@ -67,7 +70,9 @@ class AdaptiveRateLimiter:
         self._rate_limit_events = 0
         self._rate_limit_event_active = False
         self.api_rate_limits_detected = 0
-        
+        self._last_minute_token_records.clear()
+        self._dynamic_tpm_limit = self.max_tpm
+
         logger.debug(
             f"Rate limiter preparado para batch {batch_id}",
             extra={
@@ -79,7 +84,6 @@ class AdaptiveRateLimiter:
     def record_token_usage(self, estimated_tokens: int, actual_tokens: int) -> None:
         if not self.calibration_enabled or actual_tokens <= 0 or estimated_tokens <= 0:
             return
-        
         accuracy_ratio = actual_tokens / estimated_tokens
         usage_record = TokenUsageRecord(
             estimated_tokens=estimated_tokens,
@@ -144,15 +148,16 @@ class AdaptiveRateLimiter:
     async def wait_for_tokens(self, estimated_tokens: int) -> int:
         async with self._rate_limit_lock:
             current_time = time.time()
+            # Rate limit global ativo
             if self._global_rate_limit_active and current_time < self._global_wait_until:
                 remaining_wait = self._global_wait_until - current_time
                 if not self._rate_limit_logged:
                     logger.warning(
-                        f"🚨 Evento de rate limit #{self._rate_limit_events + 1}: "
-                        f"Status: aguardando {remaining_wait:.1f}s para coordenação global.",
+                        f"🚨 Evento de rate limit #{self._rate_limit_events}: "
+                        f"Iniciando pausa global de {remaining_wait:.1f}s",
                         extra={
                             'batch_id': self._current_batch_id,
-                            'rate_limit_event_number': self._rate_limit_events + 1,
+                            'rate_limit_event_number': self._rate_limit_events,
                             'global_wait_time': round(remaining_wait, 1),
                             'wait_until_timestamp': self._global_wait_until,
                             'api_rate_limits_detected': self.api_rate_limits_detected,
@@ -163,34 +168,68 @@ class AdaptiveRateLimiter:
                 await asyncio.sleep(remaining_wait)
                 self._global_rate_limit_active = False
                 logger.info(
-                    "✅ Fim da pausa de rate limit - processamento normal retomado.",
+                    "✅ Pausa de rate limit finalizada - processamento normal retomado",
                     extra={
                         'batch_id': self._current_batch_id,
                         'action': 'rate_limit_pause_end_and_resolved'
                     }
                 )
 
+        # Inteligência: ajustar tpm dinâmico se rate limit recente
+        self._adjust_dynamic_tpm_limit()
+
         calibrated_tokens = self.get_calibrated_estimate(estimated_tokens)
         async with self._lock:
             current_time = time.time()
+            # Reset contador a cada minuto
             if current_time - self.minute_start >= 60:
+                if self.tokens_used_this_minute > 0:
+                    utilization = (self.tokens_used_this_minute / self._dynamic_tpm_limit) * 100
+                    logger.debug(
+                        "Reset de minuto - utilização",
+                        extra={
+                            'tokens_used': self.tokens_used_this_minute,
+                            'max_tpm': self._dynamic_tpm_limit,
+                            'utilization_percent': round(utilization, 1),
+                            'action': 'minute_reset'
+                        }
+                    )
+                # Track histórico para inteligência
+                self._last_minute_token_records.append((self.tokens_used_this_minute, current_time - self.minute_start))
                 self.tokens_used_this_minute = 0
                 self.minute_start = current_time
-            if self.tokens_used_this_minute + calibrated_tokens > self.max_tpm:
+
+            # Proativo: usar o limite dinâmico ajustado
+            if self.tokens_used_this_minute + calibrated_tokens > self._dynamic_tpm_limit:
                 wait_time = 60 - (current_time - self.minute_start)
                 if wait_time > 0:
-                    logger.warning(
-                        f"⏳ Pausa proativa de {wait_time:.1f}s para não exceder max_tpm ({self.max_tpm})",
+                    logger.debug(
+                        f"Rate limiting proativo - aguardando {wait_time:.1f}s",
                         extra={
                             'wait_time': wait_time,
-                            'max_tpm': self.max_tpm,
-                            'action': 'proactive_rate_limit_pause'
+                            'max_tpm': self._dynamic_tpm_limit,
+                            'action': 'proactive_rate_limit'
                         }
                     )
                     await asyncio.sleep(wait_time)
                     self.tokens_used_this_minute = 0
                     self.minute_start = time.time()
         return calibrated_tokens
+
+    def _adjust_dynamic_tpm_limit(self):
+        """
+        Ajusta o limite de tokens por minuto dinamicamente para evitar rate limits,
+        baseado no histórico dos últimos minutos e eventos de rate limit detectados.
+        """
+        if not self._last_minute_token_records:
+            return
+        # Se houve rate limit recentemente, reduz tpm em 10% (mas nunca abaixo de 50% do original)
+        if self._global_rate_limit_active:
+            self._dynamic_tpm_limit = max(int(self._dynamic_tpm_limit * 0.9), int(self.max_tpm * 0.5))
+        else:
+            # Se não houve rate limit nos últimos 3 minutos, pode tentar aumentar 5%
+            if len(self._last_minute_token_records) >= 3:
+                self._dynamic_tpm_limit = min(int(self._dynamic_tpm_limit * 1.05), self.max_tpm)
 
     async def _activate_global_rate_limit(self, wait_time: float, source: str = 'api'):
         async with self._rate_limit_lock:
@@ -214,16 +253,21 @@ class AdaptiveRateLimiter:
                 )
 
     def record_api_rate_limit_with_context(self, wait_time: float, completed: int, total: int, successful: int, failed: int):
-        # Só logar evento se não estiver ativo
+        """
+        Log único de rate limit: status + pausa, sem duplicidade.
+        """
         if not self._rate_limit_event_active:
             self._rate_limit_event_active = True
             self._rate_limit_events += 1
+
             remaining = total - successful
+
             logger.warning(
                 f"🚨 Evento de rate limit #{self._rate_limit_events}: "
                 f"Status: {successful}/{total} processados | "
-                f"✅{successful} ❌{failed} | 🔄{remaining} restantes. "
-                f"Iniciando pausa de {wait_time:.1f}s para coordenação global.",
+                f"✅{successful} ❌{failed} | "
+                f"🔄{remaining} restantes. "
+                f"Iniciando pausa de {wait_time:.1f}s.",
                 extra={
                     'batch_id': self._current_batch_id,
                     'rate_limit_event_number': self._rate_limit_events,
@@ -236,7 +280,9 @@ class AdaptiveRateLimiter:
                     'action': 'rate_limit_event_and_pause_start'
                 }
             )
+
         self.api_rate_limits_detected += 1
+
         async def _set_global_limit():
             await self._activate_global_rate_limit(wait_time, 'api_detected')
         asyncio.create_task(_set_global_limit())
@@ -247,16 +293,26 @@ class AdaptiveRateLimiter:
 
     def record_tokens(self, tokens_used: int) -> None:
         self.tokens_used_this_minute += tokens_used
+        if self.tokens_used_this_minute > self._dynamic_tpm_limit * 0.9:
+            logger.warning(
+                "Alta utilização de tokens detectada",
+                extra={
+                    'tokens_used': self.tokens_used_this_minute,
+                    'max_tpm': self._dynamic_tpm_limit,
+                    'utilization_percent': round((self.tokens_used_this_minute / self._dynamic_tpm_limit) * 100, 1),
+                    'action': 'high_utilization'
+                }
+            )
 
     def get_status(self) -> Dict[str, Any]:
         current_time = time.time()
         time_in_minute = current_time - self.minute_start
-        tokens_remaining = max(0, self.max_tpm - self.tokens_used_this_minute)
-        utilization = (self.tokens_used_this_minute / self.max_tpm) * 100
+        tokens_remaining = max(0, self._dynamic_tpm_limit - self.tokens_used_this_minute)
+        utilization = (self.tokens_used_this_minute / self._dynamic_tpm_limit) * 100
         accuracy_percentage = (self.accurate_estimates / self.total_calibrations * 100) if self.total_calibrations > 0 else 0
         return {
             'tokens_used': self.tokens_used_this_minute,
-            'tokens_limit': self.max_tpm,
+            'tokens_limit': self._dynamic_tpm_limit,
             'tokens_remaining': tokens_remaining,
             'utilization_percent': round(utilization, 2),
             'time_in_minute': round(time_in_minute, 2),
