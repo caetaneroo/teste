@@ -1,0 +1,512 @@
+# core/adaptive_throughput_controller.py
+
+import asyncio
+import time
+import logging
+from typing import Dict, Any, Optional, List, Tuple
+from collections import deque
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class PerformanceMetric:
+    """Métrica de performance para calibração"""
+    timestamp: float
+    estimated_tokens: int
+    actual_tokens: int
+    response_time: float
+    was_rate_limited: bool
+    concurrent_requests: int
+
+class AdaptiveThroughputController:
+    """
+    Controlador inteligente de throughput que se adapta automaticamente
+    aos limites reais da API, maximizando performance sem atingir rate limits.
+    
+    Características principais:
+    - Auto-ajuste de concorrência baseado em performance real
+    - Prevenção preditiva de rate limits
+    - Calibração contínua de estimativas de tokens
+    - Logs contextuais e não-invasivos
+    """
+    
+    def __init__(self, initial_max_tpm: int = 125000, initial_concurrency: int = 10, model: str = "gpt-4o-mini"):
+        # Configuração inicial
+        self.model = model
+        self.target_max_tpm = initial_max_tpm
+        self.current_max_tpm = initial_max_tpm
+        
+        # Controle de concorrência adaptativo
+        self.min_concurrency = 1
+        self.max_concurrency = min(initial_concurrency, 50)  # Limite superior sensato
+        self.current_concurrency = initial_concurrency
+        
+        # Controle de tokens por minuto
+        self.tokens_used_this_minute = 0
+        self.minute_start_time = time.time()
+        self._token_lock = asyncio.Lock()
+        
+        # Semáforo dinâmico para controle de concorrência
+        self.semaphore = asyncio.Semaphore(self.current_concurrency)
+        self._concurrency_lock = asyncio.Lock()
+        
+        # Histórico de performance para calibração
+        self.performance_history = deque(maxlen=1000)
+        self.estimation_accuracy_history = deque(maxlen=100)
+        
+        # Métricas de calibração
+        self.calibration_factor = 1.0
+        self.min_calibration_factor = 0.5
+        self.max_calibration_factor = 2.0
+        
+        # Controle de rate limits
+        self.rate_limit_cooldown_until = 0.0
+        self.consecutive_rate_limits = 0
+        self.last_rate_limit_time = 0.0
+        
+        # Estatísticas
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.rate_limited_requests = 0
+        self.total_wait_time = 0.0
+        self.adaptations_made = 0
+        
+        # Controle de batch
+        self.current_batch_id = None
+        self.batch_start_time = 0.0
+        
+        # Otimizações de performance
+        self.last_adaptation_time = time.time()
+        self.adaptation_interval = 10.0  # segundos
+        self.performance_window = 60.0  # janela de análise em segundos
+        
+        logger.info(
+            f"Controlador Adaptativo inicializado - TPM: {initial_max_tpm:,} | "
+            f"Concorrência: {initial_concurrency} | Modelo: {model}",
+            extra={
+                'initial_max_tpm': initial_max_tpm,
+                'initial_concurrency': initial_concurrency,
+                'model': model,
+                'action': 'controller_init'
+            }
+        )
+    
+    async def acquire_permission(self, estimated_tokens: int) -> None:
+        """
+        Adquire permissão para fazer requisição, aplicando controle adaptativo.
+        
+        Este método:
+        1. Verifica se estamos em cooldown de rate limit
+        2. Calibra a estimativa de tokens
+        3. Verifica se não excederemos o limite TPM
+        4. Aplica controle de concorrência
+        5. Faz adaptações se necessário
+        """
+        # 1. Verificar cooldown de rate limit
+        current_time = time.time()
+        if current_time < self.rate_limit_cooldown_until:
+            wait_time = self.rate_limit_cooldown_until - current_time
+            if wait_time > 0:
+                logger.warning(
+                    f"⏳ Aguardando cooldown de rate limit: {wait_time:.1f}s",
+                    extra={
+                        'wait_time': wait_time,
+                        'batch_id': self.current_batch_id,
+                        'action': 'rate_limit_cooldown'
+                    }
+                )
+                await asyncio.sleep(wait_time)
+        
+        # 2. Calibrar estimativa de tokens
+        calibrated_tokens = self._calibrate_token_estimate(estimated_tokens)
+        
+        # 3. Controle de TPM
+        await self._ensure_tpm_limit(calibrated_tokens)
+        
+        # 4. Controle de concorrência
+        await self.semaphore.acquire()
+        
+        # 5. Atualizar métricas
+        self.total_requests += 1
+        
+        # 6. Fazer adaptações se necessário
+        await self._maybe_adapt_settings()
+    
+    def _calibrate_token_estimate(self, estimated_tokens: int) -> int:
+        """Calibra estimativa de tokens baseada no histórico"""
+        return max(1, int(estimated_tokens * self.calibration_factor))
+    
+    async def _ensure_tpm_limit(self, tokens: int) -> None:
+        """Garante que não excederemos o limite TPM"""
+        async with self._token_lock:
+            current_time = time.time()
+            
+            # Reset contador se passou um minuto
+            if current_time - self.minute_start_time >= 60:
+                self.tokens_used_this_minute = 0
+                self.minute_start_time = current_time
+            
+            # Verificar se excederemos o limite
+            if self.tokens_used_this_minute + tokens > self.current_max_tpm:
+                # Calcular quanto tempo falta para o próximo minuto
+                time_until_reset = 60 - (current_time - self.minute_start_time)
+                
+                if time_until_reset > 0:
+                    logger.warning(
+                        f"⏳ Limite TPM atingido ({self.tokens_used_this_minute + tokens:,} > {self.current_max_tpm:,}). "
+                        f"Aguardando {time_until_reset:.1f}s para próximo minuto",
+                        extra={
+                            'tokens_would_use': self.tokens_used_this_minute + tokens,
+                            'current_max_tpm': self.current_max_tpm,
+                            'wait_time': time_until_reset,
+                            'batch_id': self.current_batch_id,
+                            'action': 'tpm_limit_wait'
+                        }
+                    )
+                    
+                    self.total_wait_time += time_until_reset
+                    await asyncio.sleep(time_until_reset)
+                    
+                    # Reset após espera
+                    self.tokens_used_this_minute = 0
+                    self.minute_start_time = time.time()
+            
+            # Reservar tokens
+            self.tokens_used_this_minute += tokens
+    
+    async def _maybe_adapt_settings(self) -> None:
+        """Adapta configurações se necessário"""
+        current_time = time.time()
+        
+        # Só adaptar se passou tempo suficiente
+        if current_time - self.last_adaptation_time < self.adaptation_interval:
+            return
+        
+        # Só adaptar se temos dados suficientes
+        if len(self.performance_history) < 10:
+            return
+        
+        await self._adapt_based_on_performance()
+        self.last_adaptation_time = current_time
+    
+    async def _adapt_based_on_performance(self) -> None:
+        """Adapta configurações baseado na performance recente"""
+        recent_metrics = self._get_recent_metrics()
+        
+        if not recent_metrics:
+            return
+        
+        # Calcular métricas de performance
+        recent_rate_limits = sum(1 for m in recent_metrics if m.was_rate_limited)
+        total_recent = len(recent_metrics)
+        rate_limit_ratio = recent_rate_limits / total_recent
+        
+        avg_response_time = sum(m.response_time for m in recent_metrics) / total_recent
+        avg_concurrency = sum(m.concurrent_requests for m in recent_metrics) / total_recent
+        
+        # Decidir adaptações
+        should_increase_concurrency = (
+            rate_limit_ratio < 0.05 and  # Poucos rate limits
+            avg_response_time < 2.0 and  # Resposta rápida
+            avg_concurrency >= self.current_concurrency * 0.8  # Alta utilização
+        )
+        
+        should_decrease_concurrency = (
+            rate_limit_ratio > 0.1 or  # Muitos rate limits
+            avg_response_time > 5.0  # Resposta lenta
+        )
+        
+        # Aplicar adaptações
+        if should_increase_concurrency and self.current_concurrency < self.max_concurrency:
+            await self._increase_concurrency()
+        elif should_decrease_concurrency and self.current_concurrency > self.min_concurrency:
+            await self._decrease_concurrency()
+        
+        # Adaptar TPM se necessário
+        if rate_limit_ratio > 0.15:  # Muitos rate limits
+            self._decrease_tpm_limit()
+        elif rate_limit_ratio < 0.02 and avg_response_time < 1.5:  # Performance excelente
+            self._increase_tpm_limit()
+    
+    def _get_recent_metrics(self) -> List[PerformanceMetric]:
+        """Retorna métricas recentes dentro da janela de análise"""
+        cutoff_time = time.time() - self.performance_window
+        return [m for m in self.performance_history if m.timestamp >= cutoff_time]
+    
+    async def _increase_concurrency(self) -> None:
+        """Aumenta concorrência de forma segura"""
+        async with self._concurrency_lock:
+            old_concurrency = self.current_concurrency
+            self.current_concurrency = min(self.current_concurrency + 2, self.max_concurrency)
+            
+            # Criar novo semáforo com maior capacidade
+            self.semaphore = asyncio.Semaphore(self.current_concurrency)
+            
+            self.adaptations_made += 1
+            
+            logger.info(
+                f"📈 Concorrência aumentada: {old_concurrency} → {self.current_concurrency}",
+                extra={
+                    'old_concurrency': old_concurrency,
+                    'new_concurrency': self.current_concurrency,
+                    'batch_id': self.current_batch_id,
+                    'action': 'concurrency_increase'
+                }
+            )
+    
+    async def _decrease_concurrency(self) -> None:
+        """Diminui concorrência de forma segura"""
+        async with self._concurrency_lock:
+            old_concurrency = self.current_concurrency
+            self.current_concurrency = max(self.current_concurrency - 1, self.min_concurrency)
+            
+            # Criar novo semáforo com menor capacidade
+            self.semaphore = asyncio.Semaphore(self.current_concurrency)
+            
+            self.adaptations_made += 1
+            
+            logger.info(
+                f"📉 Concorrência reduzida: {old_concurrency} → {self.current_concurrency}",
+                extra={
+                    'old_concurrency': old_concurrency,
+                    'new_concurrency': self.current_concurrency,
+                    'batch_id': self.current_batch_id,
+                    'action': 'concurrency_decrease'
+                }
+            )
+    
+    def _increase_tpm_limit(self) -> None:
+        """Aumenta limite TPM de forma conservadora"""
+        old_tpm = self.current_max_tpm
+        self.current_max_tpm = min(
+            int(self.current_max_tpm * 1.1),  # Aumento de 10%
+            self.target_max_tpm  # Não exceder limite original
+        )
+        
+        if self.current_max_tpm != old_tpm:
+            logger.info(
+                f"📈 Limite TPM aumentado: {old_tpm:,} → {self.current_max_tpm:,}",
+                extra={
+                    'old_tpm': old_tpm,
+                    'new_tpm': self.current_max_tpm,
+                    'batch_id': self.current_batch_id,
+                    'action': 'tpm_increase'
+                }
+            )
+    
+    def _decrease_tpm_limit(self) -> None:
+        """Diminui limite TPM para evitar rate limits"""
+        old_tpm = self.current_max_tpm
+        self.current_max_tpm = max(
+            int(self.current_max_tpm * 0.8),  # Redução de 20%
+            10000  # Limite mínimo sensato
+        )
+        
+        logger.warning(
+            f"📉 Limite TPM reduzido devido a rate limits: {old_tpm:,} → {self.current_max_tpm:,}",
+            extra={
+                'old_tpm': old_tpm,
+                'new_tpm': self.current_max_tpm,
+                'batch_id': self.current_batch_id,
+                'action': 'tpm_decrease'
+            }
+        )
+    
+    def record_success(self, estimated_tokens: int, actual_tokens: int, response_time: float) -> None:
+        """Registra sucesso e atualiza calibração"""
+        self.successful_requests += 1
+        
+        # Liberar semáforo
+        self.semaphore.release()
+        
+        # Registrar métrica de performance
+        metric = PerformanceMetric(
+            timestamp=time.time(),
+            estimated_tokens=estimated_tokens,
+            actual_tokens=actual_tokens,
+            response_time=response_time,
+            was_rate_limited=False,
+            concurrent_requests=self.current_concurrency
+        )
+        self.performance_history.append(metric)
+        
+        # Atualizar calibração de tokens
+        self._update_token_calibration(estimated_tokens, actual_tokens)
+    
+    def record_rate_limit(self, suggested_wait_time: float) -> None:
+        """Registra rate limit e ajusta configurações"""
+        self.rate_limited_requests += 1
+        self.consecutive_rate_limits += 1
+        self.last_rate_limit_time = time.time()
+        
+        # Liberar semáforo
+        self.semaphore.release()
+        
+        # Registrar métrica
+        metric = PerformanceMetric(
+            timestamp=time.time(),
+            estimated_tokens=0,
+            actual_tokens=0,
+            response_time=0.0,
+            was_rate_limited=True,
+            concurrent_requests=self.current_concurrency
+        )
+        self.performance_history.append(metric)
+        
+        # Aplicar cooldown mais agressivo se rate limits consecutivos
+        cooldown_multiplier = min(self.consecutive_rate_limits, 5)
+        cooldown_time = suggested_wait_time * cooldown_multiplier
+        
+        self.rate_limit_cooldown_until = time.time() + cooldown_time
+        
+        logger.warning(
+            f"🚨 Rate limit detectado! Cooldown: {cooldown_time:.1f}s "
+            f"(consecutivos: {self.consecutive_rate_limits})",
+            extra={
+                'suggested_wait_time': suggested_wait_time,
+                'cooldown_time': cooldown_time,
+                'consecutive_rate_limits': self.consecutive_rate_limits,
+                'batch_id': self.current_batch_id,
+                'action': 'rate_limit_detected'
+            }
+        )
+        
+        # Reduzir concorrência imediatamente
+        if self.consecutive_rate_limits >= 2:
+            asyncio.create_task(self._decrease_concurrency())
+    
+    def _update_token_calibration(self, estimated: int, actual: int) -> None:
+        """Atualiza fator de calibração de tokens"""
+        if estimated <= 0 or actual <= 0:
+            return
+        
+        accuracy_ratio = actual / estimated
+        self.estimation_accuracy_history.append(accuracy_ratio)
+        
+        # Calcular novo fator baseado no histórico recente
+        if len(self.estimation_accuracy_history) >= 10:
+            recent_ratios = list(self.estimation_accuracy_history)[-50:]  # Últimos 50
+            avg_ratio = sum(recent_ratios) / len(recent_ratios)
+            
+            # Ajustar fator de calibração gradualmente
+            target_factor = avg_ratio * 0.95  # Margem de segurança
+            self.calibration_factor = (
+                self.calibration_factor * 0.9 + target_factor * 0.1
+            )
+            
+            # Manter dentro dos limites
+            self.calibration_factor = max(
+                self.min_calibration_factor,
+                min(self.calibration_factor, self.max_calibration_factor)
+            )
+    
+    def start_batch(self, batch_id: str) -> None:
+        """Inicia novo batch"""
+        self.current_batch_id = batch_id
+        self.batch_start_time = time.time()
+        self.consecutive_rate_limits = 0  # Reset contador
+        
+        logger.debug(
+            f"Controlador preparado para batch {batch_id}",
+            extra={
+                'batch_id': batch_id,
+                'current_concurrency': self.current_concurrency,
+                'current_max_tpm': self.current_max_tpm,
+                'action': 'batch_start'
+            }
+        )
+    
+    def end_batch(self, batch_id: str) -> Dict[str, Any]:
+        """Finaliza batch e retorna estatísticas"""
+        end_time = time.time()
+        batch_duration = end_time - self.batch_start_time
+        
+        # Calcular estatísticas do batch
+        batch_metrics = [
+            m for m in self.performance_history 
+            if m.timestamp >= self.batch_start_time
+        ]
+        
+        stats = {
+            'batch_id': batch_id,
+            'duration': batch_duration,
+            'total_requests': len(batch_metrics),
+            'rate_limited_requests': sum(1 for m in batch_metrics if m.was_rate_limited),
+            'avg_response_time': sum(m.response_time for m in batch_metrics) / len(batch_metrics) if batch_metrics else 0,
+            'max_concurrency_used': max((m.concurrent_requests for m in batch_metrics), default=0),
+            'adaptations_made': self.adaptations_made,
+            'final_concurrency': self.current_concurrency,
+            'final_max_tpm': self.current_max_tpm,
+            'estimation_accuracy': self._calculate_estimation_accuracy()
+        }
+        
+        logger.debug(
+            f"Batch {batch_id} finalizado - {len(batch_metrics)} requests | "
+            f"Concorrência final: {self.current_concurrency} | "
+            f"TPM final: {self.current_max_tpm:,}",
+            extra={
+                'batch_id': batch_id,
+                'batch_stats': stats,
+                'action': 'batch_end'
+            }
+        )
+        
+        return stats
+    
+    def _calculate_estimation_accuracy(self) -> float:
+        """Calcula precisão das estimativas de tokens"""
+        if not self.estimation_accuracy_history:
+            return 0.0
+        
+        # Calcular quantas estimativas estão dentro de 20% do real
+        accurate_count = sum(
+            1 for ratio in self.estimation_accuracy_history
+            if 0.8 <= ratio <= 1.2
+        )
+        
+        return (accurate_count / len(self.estimation_accuracy_history)) * 100
+    
+    def get_max_concurrency(self) -> int:
+        """Retorna concorrência máxima atual"""
+        return self.current_concurrency
+    
+    def get_current_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas atuais"""
+        return {
+            'current_concurrency': self.current_concurrency,
+            'current_tpm': self.current_max_tpm,
+            'tokens_used_this_minute': self.tokens_used_this_minute,
+            'utilization_percent': (self.tokens_used_this_minute / self.current_max_tpm) * 100,
+            'total_requests': self.total_requests,
+            'successful_requests': self.successful_requests,
+            'rate_limited_requests': self.rate_limited_requests,
+            'adaptations_made': self.adaptations_made,
+            'calibration_factor': self.calibration_factor,
+            'estimation_accuracy': self._calculate_estimation_accuracy(),
+            'consecutive_rate_limits': self.consecutive_rate_limits,
+            'in_cooldown': time.time() < self.rate_limit_cooldown_until
+        }
+    
+    def get_global_stats(self) -> Dict[str, Any]:
+        """Retorna estatísticas globais completas"""
+        return {
+            'model': self.model,
+            'initial_max_tpm': self.target_max_tpm,
+            'final_max_tpm': self.current_max_tpm,
+            'max_concurrency': self.max_concurrency,
+            'final_concurrency': self.current_concurrency,
+            'total_requests': self.total_requests,
+            'successful_requests': self.successful_requests,
+            'rate_limited_requests': self.rate_limited_requests,
+            'success_rate': (self.successful_requests / self.total_requests * 100) if self.total_requests > 0 else 0,
+            'adaptations_made': self.adaptations_made,
+            'total_wait_time': self.total_wait_time,
+            'calibration_factor': self.calibration_factor,
+            'estimation_accuracy': self._calculate_estimation_accuracy(),
+            'performance_metrics': {
+                'avg_response_time': sum(m.response_time for m in self.performance_history) / len(self.performance_history) if self.performance_history else 0,
+                'max_tpm_reached': max((m.actual_tokens for m in self.performance_history), default=0) if self.performance_history else 0,
+                'rate_limit_ratio': (self.rate_limited_requests / self.total_requests) if self.total_requests > 0 else 0
+            }
+        }
