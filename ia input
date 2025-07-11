@@ -3,9 +3,13 @@
 import logging
 import pandas as pd
 import awswrangler as wr
-from typing import Optional, Dict, Any
+import re
+from typing import Optional, Dict, Any, Union
 
 logger = logging.getLogger(__name__)
+
+# Suprimir logs do awswrangler.athena._utils
+logging.getLogger("awswrangler.athena._utils").setLevel(logging.WARNING)
 
 DEFAULT_ATHENA_DATABASE = "workspace_db"
 DEFAULT_ATHENA_WORKGROUP = "analytics-workgroup-v3"
@@ -21,40 +25,35 @@ class InputManager:
         self.athena_workgroup = athena_workgroup
         self.boto3_session = boto3_session
         logger.info(
-            "InputManager inicializado",
-            extra={
-                "athena_database": self.athena_database,
-                "athena_workgroup": self.athena_workgroup,
-                "action": "input_manager_init"
-            }
+            f"InputManager inicializado | athena_database={self.athena_database} | athena_workgroup={self.athena_workgroup} | action=input_manager_init"
         )
+
+    def _infer_filetype(self, path: str, filetype: Optional[str] = None) -> str:
+        """
+        Infere o tipo de arquivo a partir do sufixo, se filetype não for explicitamente informado.
+        """
+        if filetype:
+            return filetype.lower()
+        lowered = path.lower()
+        if lowered.endswith(".parquet"):
+            return "parquet"
+        elif lowered.endswith(".csv"):
+            return "csv"
+        elif lowered.endswith(".json"):
+            return "json"
+        elif lowered.endswith(".xls") or lowered.endswith(".xlsx"):
+            return "excel"
+        else:
+            raise ValueError("Não foi possível inferir o tipo do arquivo pelo sufixo. Informe o parâmetro 'filetype'.")
 
     def _log_dataframe_info(self, df: Optional[pd.DataFrame], source: str, error: Optional[str] = None):
         if df is not None and error is None:
             logger.info(
-                f"✅ DataFrame carregado com sucesso de {source}.\n"
-                f"Registros: {len(df)}\n"
-                f"Colunas: {len(df.columns)}\n"
-                f"Nomes das colunas: {list(df.columns)}",
-                extra={
-                    "source": source,
-                    "n_rows": len(df),
-                    "n_cols": len(df.columns),
-                    "columns": list(df.columns),
-                    "success": True,
-                    "action": "load_dataframe"
-                }
+                f"LOAD-DATAFRAME | source={source} | success=True | n_rows={len(df)} | n_cols={len(df.columns)} | columns={list(df.columns)}"
             )
         else:
             logger.error(
-                f"❌ Falha ao carregar DataFrame de {source}.\n"
-                f"Motivo: {error}",
-                extra={
-                    "source": source,
-                    "error": error,
-                    "success": False,
-                    "action": "load_dataframe"
-                }
+                f"LOAD-DATAFRAME | source={source} | success=False | error={error}"
             )
 
     def from_athena(
@@ -97,28 +96,18 @@ class InputManager:
         Suporta filetype: 'csv', 'parquet', 'json', 'excel'.
         """
         try:
-            if not filetype:
-                if s3_path.endswith(".parquet"):
-                    filetype = "parquet"
-                elif s3_path.endswith(".csv"):
-                    filetype = "csv"
-                elif s3_path.endswith(".json"):
-                    filetype = "json"
-                elif s3_path.endswith(".xls") or s3_path.endswith(".xlsx"):
-                    filetype = "excel"
-                else:
-                    raise ValueError("Não foi possível inferir o tipo do arquivo pelo sufixo. Informe o parâmetro 'filetype'.")
-            if filetype == "parquet":
+            ftype = self._infer_filetype(s3_path, filetype)
+            if ftype == "parquet":
                 df = wr.s3.read_parquet(path=s3_path, boto3_session=self.boto3_session, **kwargs)
-            elif filetype == "csv":
+            elif ftype == "csv":
                 df = wr.s3.read_csv(path=s3_path, boto3_session=self.boto3_session, **kwargs)
-            elif filetype == "json":
+            elif ftype == "json":
                 df = wr.s3.read_json(path=s3_path, boto3_session=self.boto3_session, **kwargs)
-            elif filetype == "excel":
+            elif ftype == "excel":
                 df = wr.s3.read_excel(path=s3_path, boto3_session=self.boto3_session, **kwargs)
             else:
-                raise ValueError(f"Tipo de arquivo não suportado: {filetype}")
-            self._log_dataframe_info(df, source=f"S3 ({filetype})")
+                raise ValueError(f"Tipo de arquivo não suportado para S3: {ftype}")
+            self._log_dataframe_info(df, source=f"S3 ({ftype})")
             return df
         except Exception as e:
             self._log_dataframe_info(None, source=f"S3 ({filetype})", error=str(e))
@@ -135,29 +124,64 @@ class InputManager:
         Suporta filetype: 'csv', 'parquet', 'json', 'excel'.
         """
         try:
-            if not filetype:
-                if filepath.endswith(".parquet"):
-                    filetype = "parquet"
-                elif filepath.endswith(".csv"):
-                    filetype = "csv"
-                elif filepath.endswith(".json"):
-                    filetype = "json"
-                elif filepath.endswith(".xls") or filepath.endswith(".xlsx"):
-                    filetype = "excel"
-                else:
-                    raise ValueError("Não foi possível inferir o tipo do arquivo pelo sufixo. Informe o parâmetro 'filetype'.")
-            if filetype == "parquet":
+            ftype = self._infer_filetype(filepath, filetype)
+            if ftype == "parquet":
                 df = pd.read_parquet(filepath, **kwargs)
-            elif filetype == "csv":
+            elif ftype == "csv":
                 df = pd.read_csv(filepath, **kwargs)
-            elif filetype == "json":
+            elif ftype == "json":
                 df = pd.read_json(filepath, **kwargs)
-            elif filetype == "excel":
+            elif ftype == "excel":
                 df = pd.read_excel(filepath, **kwargs)
             else:
-                raise ValueError(f"Tipo de arquivo não suportado: {filetype}")
-            self._log_dataframe_info(df, source=f"Local ({filetype})")
+                raise ValueError(f"Tipo de arquivo não suportado para local: {ftype}")
+            self._log_dataframe_info(df, source=f"Local ({ftype})")
             return df
         except Exception as e:
             self._log_dataframe_info(None, source=f"Local ({filetype})", error=str(e))
+            return None
+
+    def from_txt_prompt(self, filepath: str, **kwargs) -> Optional[pd.DataFrame]:
+        """
+        Lê um arquivo .txt de prompt, valida a presença de {text} e retorna DataFrame com coluna 'prompt'.
+        """
+        try:
+            with open(filepath, "r", encoding=kwargs.get("encoding", "utf-8")) as f:
+                content = f.read()
+            
+            # Validação obrigatória: prompt deve conter {text}
+            if "{text}" not in content:
+                raise ValueError("O arquivo .txt de prompt deve conter obrigatoriamente o placeholder '{text}'.")
+            
+            # Checagem de placeholders extras
+            other_placeholders = re.findall(r"\{([a-zA-Z0-9_]+)\}", content)
+            if any(ph != "text" for ph in other_placeholders):
+                logger.warning(
+                    f"LOAD-TXT-PROMPT | filepath={filepath} | warning=Prompt contém placeholders além de '{{text}}': {set(other_placeholders) - {'text'}}. "
+                    "Isso pode causar erro no ai_processor.py, pois ele só substitui {text}."
+                )
+            
+            # Retorna DataFrame com uma coluna 'prompt'
+            df = pd.DataFrame({"prompt": [content]})
+            self._log_dataframe_info(df, source="Local (txt-prompt)")
+            return df
+        except Exception as e:
+            self._log_dataframe_info(None, source="Local (txt-prompt)", error=str(e))
+            return None
+
+    def from_txt(self, filepath: str, **kwargs) -> Optional[str]:
+        """
+        Lê um arquivo .txt comum e retorna seu conteúdo como string.
+        """
+        try:
+            with open(filepath, "r", encoding=kwargs.get("encoding", "utf-8")) as f:
+                content = f.read()
+            logger.info(
+                f"LOAD-TXT | source=Local (txt) | success=True | n_chars={len(content)} | filepath={filepath}"
+            )
+            return content
+        except Exception as e:
+            logger.error(
+                f"LOAD-TXT | source=Local (txt) | success=False | error={str(e)} | filepath={filepath}"
+            )
             return None
