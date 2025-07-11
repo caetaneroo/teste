@@ -9,56 +9,27 @@ from typing import List, Dict, Any, Optional
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
 from iaragenai import AsyncIaraGenAI
 
-# Importar módulos locais
 from rate_limiter import AdaptiveRateLimiter
 from stats_manager import StatsManager
 
-# Logger específico do módulo
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# Constantes de configuração                                                  #
-# --------------------------------------------------------------------------- #
-MAX_TPM = 180000  # Máximo de tokens por minuto
-MAX_RETRY = 2     # Máximo de tentativas de retry
-
-# --------------------------------------------------------------------------- #
-# Função global para detecção de rate limit                                  #
-# --------------------------------------------------------------------------- #
+MAX_TPM = 180000
+MAX_RETRY = 2
 
 def is_rate_limit_error(result: Dict[str, Any]) -> bool:
-    """
-    Verifica se o resultado indica rate limit
-    
-    Args:
-        result: Dicionário de resultado da API
-        
-    Returns:
-        True se for rate limit, False caso contrário
-    """
     if not isinstance(result, dict):
         return False
-    
     error_msg = result.get('error', '').lower()
     return 'token rate limit' in error_msg
 
-
 class AIProcessor:
-    """
-    Processador de IA com AsyncIaraGenAI, rate limiting adaptativo e logs organizados
-    """
-    
     def __init__(self, config: Dict[str, Any]):
-        # Configurações de autenticação
         self.client_id = config['client_id']
         self.client_secret = config['client_secret']
-        
-        # Configurações do modelo
         self.model = config.get('model', 'gpt-35-turbo-16k')
         self.temperature = config.get('temperature', 0.1)
         self.max_tokens = config.get('max_tokens')
-        
-        # Cliente AsyncIaraGenAI com parâmetros diretos
         self.client = AsyncIaraGenAI(
             client_id=self.client_id,
             client_secret=self.client_secret,
@@ -66,27 +37,17 @@ class AIProcessor:
             provider=config.get('provider', 'azure_openai'),
             correlation_id=config.get('correlation_id', 'teste-ia-biatendimento')
         )
-        
-        # Controle de concorrência
         self.max_concurrent = config.get('max_concurrent', 10)
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
-        
-        # Rate limiting adaptativo
         max_tpm = config.get('max_tpm', MAX_TPM)
         calibration_enabled = config.get('adaptive_calibration', True)
         self.rate_limiter = AdaptiveRateLimiter(max_tpm, calibration_enabled)
-        
-        # Gerenciador de estatísticas
         self.stats_manager = StatsManager()
         self.stats_manager.set_max_concurrent(self.max_concurrent)
-        
-        # Encoder para estimativa de tokens
         try:
             self.encoder = tiktoken.encoding_for_model(self.model)
         except KeyError:
-            # Fallback para modelos não reconhecidos
             self.encoder = tiktoken.get_encoding("cl100k_base")
-        
         logger.info(
             "AIProcessor inicializado com AsyncIaraGenAI",
             extra={
@@ -99,57 +60,37 @@ class AIProcessor:
                 'action': 'ai_processor_init'
             }
         )
-    
+
     def _generate_request_id(self) -> str:
-        """Gera ID único para requisição"""
         return f"req_{int(time.time() * 1000)}_{id(self)}"
-    
+
     def estimate_tokens(self, messages: List[Dict[str, str]]) -> int:
-        """
-        Estima tokens necessários para as mensagens usando tiktoken
-        """
         try:
             total_tokens = 0
             for message in messages:
-                # Formato: role + content + overhead
                 role_tokens = len(self.encoder.encode(message.get('role', '')))
                 content_tokens = len(self.encoder.encode(message.get('content', '')))
-                total_tokens += role_tokens + content_tokens + 4  # Overhead por mensagem
-            
-            # Overhead adicional para resposta
+                total_tokens += role_tokens + content_tokens + 4
             total_tokens += 50
-            
             return total_tokens
-            
         except Exception as e:
             logger.warning(
                 f"Erro na estimativa de tokens: {e}. Usando estimativa conservadora.",
                 extra={'action': 'token_estimation_error'}
             )
-            # Estimativa conservadora baseada em caracteres
             total_chars = sum(len(str(msg.get('content', ''))) for msg in messages)
-            return int(total_chars * 0.3)  # ~3.3 chars por token
-    
+            return int(total_chars * 0.3)
+
     def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
-        """
-        Calcula custo estimado baseado nos tokens (fallback)
-        """
-        # Preços estimados para GPT-3.5 Turbo (USD por 1K tokens)
         input_cost_per_1k = 0.0015
         output_cost_per_1k = 0.002
-        
         input_cost = (input_tokens / 1000) * input_cost_per_1k
         output_cost = (output_tokens / 1000) * output_cost_per_1k
-        
         return input_cost + output_cost
-    
+
     def _prepare_json_schema(self, json_schema: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Prepara JSON schema para AsyncIaraGenAI
-        """
         if not isinstance(json_schema, dict):
             return None
-        
         return {
             "type": "json_schema",
             "json_schema": {
@@ -159,31 +100,22 @@ class AIProcessor:
                 "strict": json_schema.get("strict", True)
             }
         }
-    
+
     def _extract_wait_time_from_error_result(self, result: Dict[str, Any]) -> float:
-        """
-        Extrai wait time do resultado de erro
-        """
-        # Verificar se há informações de retry no resultado
         if 'retry_after' in result:
             try:
                 return float(result['retry_after'])
             except (ValueError, TypeError):
                 pass
-        
-        # Extrair da mensagem de erro
         error_msg = result.get('error', '')
-        
-        # Padrões específicos do Azure OpenAI
         patterns = [
             r'retry after (\d+) seconds',
-            r'wait (\d+) seconds', 
+            r'wait (\d+) seconds',
             r'retry.*?(\d+)\s*seconds?',
             r'(\d+)s',
             r'retry.*?(\d+)',
             r'wait.*?(\d+)'
         ]
-        
         for pattern in patterns:
             match = re.search(pattern, error_msg, re.IGNORECASE)
             if match:
@@ -191,8 +123,6 @@ class AIProcessor:
                     return float(match.group(1))
                 except (ValueError, IndexError):
                     continue
-        
-        # Headers de resposta (se disponíveis no resultado)
         if 'response_headers' in result:
             headers = result['response_headers']
             if 'retry-after' in headers:
@@ -200,24 +130,16 @@ class AIProcessor:
                     return float(headers['retry-after'])
                 except (ValueError, TypeError):
                     pass
-        
-        # Default para Azure OpenAI
         return 60.0
-    
+
     async def _make_api_call(
         self,
         messages: List[Dict[str, str]],
         json_schema: Optional[Dict[str, Any]] = None,
         request_id: str = None
     ) -> Dict[str, Any]:
-        """
-        Faz chamada à API com AsyncIaraGenAI e rate limiting coordenado
-        """
-        
         if not request_id:
             request_id = self._generate_request_id()
-        
-        # Validar entrada
         if not messages or not isinstance(messages, list):
             return {
                 'content': None,
@@ -227,129 +149,49 @@ class AIProcessor:
                 'error_type': 'ValidationError',
                 'request_id': request_id
             }
-        
-        # Estimar tokens necessários
         base_estimate = self.estimate_tokens(messages)
-        
-        # Rate limiting coordenado inicial
         calibrated_estimate = await self.rate_limiter.wait_for_tokens(base_estimate)
-        
-        # Registrar início de requisição concorrente
         self.stats_manager.record_concurrent_start()
-        
         try:
             async with self.semaphore:
-                # AsyncRetrying com retry apenas para rate limits
                 async for attempt in AsyncRetrying(
                     stop=stop_after_attempt(MAX_RETRY),
                     wait=wait_fixed(0.1),
                     reraise=True
                 ):
                     with attempt:
-                        # Aguardar rate limiting em todas as tentativas
                         if attempt.retry_state.attempt_number > 1:
                             await self.rate_limiter.wait_for_tokens(base_estimate)
-                        
                         start_time = time.time()
-                        
                         try:
-                            # Preparar parâmetros da API
                             api_params = {
                                 "model": self.model,
                                 "messages": messages,
                                 "temperature": self.temperature
                             }
-                            
                             if self.max_tokens is not None:
                                 api_params["max_tokens"] = self.max_tokens
-                            
                             if json_schema and isinstance(json_schema, dict):
                                 api_params["response_format"] = self._prepare_json_schema(json_schema)
-                            
-                            # Log da tentativa
-                            logger.debug(
-                                f"Tentativa {attempt.retry_state.attempt_number}/{MAX_RETRY} - Chamada à API",
-                                extra={
-                                    'request_id': request_id,
-                                    'attempt_number': attempt.retry_state.attempt_number,
-                                    'base_estimate': base_estimate,
-                                    'calibrated_estimate': calibrated_estimate,
-                                    'action': 'api_call_attempt'
-                                }
-                            )
-                            
-                            # Fazer chamada à API com AsyncIaraGenAI
                             response = await self.client.chat.completions.create(**api_params)
-                            
                             end_time = time.time()
                             api_response_time = end_time - start_time
-                            
-                            # Extrair tokens usados
                             tokens_used = response.usage.total_tokens
                             input_tokens = response.usage.prompt_tokens
                             output_tokens = response.usage.completion_tokens
-                            
-                            # Extrair cached tokens se disponível
                             cached_tokens = 0
                             if hasattr(response.usage, 'prompt_tokens_details'):
                                 cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0)
-                            
-                            # Registrar tokens no rate limiter
                             self.rate_limiter.record_tokens(tokens_used)
                             self.rate_limiter.record_token_usage(base_estimate, tokens_used)
-                            
-                            # Calcular custo (fallback)
                             cost = self.calculate_cost(input_tokens, output_tokens)
-                            
-                            # Processar resposta
                             content = response.choices[0].message.content
                             parsed_content = content
-                            
-                            # Se JSON schema foi usado, tentar parsear
                             if json_schema and isinstance(json_schema, dict) and content:
                                 try:
                                     parsed_content = json.loads(content)
-                                    logger.debug(
-                                        "JSON Schema parseado com sucesso",
-                                        extra={
-                                            'request_id': request_id,
-                                            'action': 'json_parse_success'
-                                        }
-                                    )
-                                except json.JSONDecodeError as e:
-                                    logger.warning(
-                                        "Erro ao parsear JSON Schema",
-                                        extra={
-                                            'request_id': request_id,
-                                            'error': str(e),
-                                            'raw_content': content[:200],
-                                            'action': 'json_parse_error'
-                                        }
-                                    )
+                                except json.JSONDecodeError:
                                     parsed_content = content
-                            
-                            # Log de sucesso
-                            estimation_accuracy = abs(calibrated_estimate - tokens_used) / tokens_used * 100 if tokens_used > 0 else 0
-                            
-                            logger.debug(
-                                "Chamada à API bem-sucedida",
-                                extra={
-                                    'request_id': request_id,
-                                    'attempt_number': attempt.retry_state.attempt_number,
-                                    'tokens_used': tokens_used,
-                                    'input_tokens': input_tokens,
-                                    'output_tokens': output_tokens,
-                                    'cached_tokens': cached_tokens,
-                                    'base_estimate': base_estimate,
-                                    'calibrated_estimate': calibrated_estimate,
-                                    'estimation_accuracy': round(estimation_accuracy, 1),
-                                    'api_response_time': round(api_response_time, 3),
-                                    'cost': round(cost, 6),
-                                    'action': 'api_call_success'
-                                }
-                            )
-                            
-                            # Retorno de sucesso
                             return {
                                 'content': parsed_content,
                                 'raw_content': content,
@@ -364,17 +206,12 @@ class AIProcessor:
                                 'attempts': attempt.retry_state.attempt_number,
                                 'request_id': request_id
                             }
-                            
                         except Exception as e:
                             end_time = time.time()
                             api_response_time = end_time - start_time
-                            
-                            # Capturar headers se disponíveis
                             response_headers = {}
                             if hasattr(e, 'response') and hasattr(e.response, 'headers'):
                                 response_headers = dict(e.response.headers)
-                            
-                            # Criar resultado de erro
                             error_result = {
                                 'content': None,
                                 'raw_content': None,
@@ -392,52 +229,12 @@ class AIProcessor:
                                 'attempts': attempt.retry_state.attempt_number,
                                 'request_id': request_id
                             }
-                            
-                            # Verificar se é rate limit (única condição para retry)
                             if is_rate_limit_error(error_result):
                                 wait_time = self._extract_wait_time_from_error_result(error_result)
-                                
-                                logger.debug(
-                                    f"Rate limit detectado - request {request_id}",
-                                    extra={
-                                        'request_id': request_id,
-                                        'attempt_number': attempt.retry_state.attempt_number,
-                                        'wait_time': wait_time,
-                                        'action': 'rate_limit_detected'
-                                    }
-                                )
-                                
-                                # Raise para que AsyncRetrying faça nova tentativa
                                 raise
-                            
                             else:
-                                # Qualquer outro erro - não fazer retry
-                                logger.error(
-                                    "Erro permanente - sem retry",
-                                    extra={
-                                        'request_id': request_id,
-                                        'attempt_number': attempt.retry_state.attempt_number,
-                                        'error': str(e),
-                                        'error_type': type(e).__name__,
-                                        'action': 'permanent_error'
-                                    }
-                                )
-                                
                                 return error_result
-                                
         except RetryError as retry_error:
-            # Todas as tentativas falharam
-            logger.error(
-                "Todas as tentativas de retry falharam",
-                extra={
-                    'request_id': request_id,
-                    'total_attempts': MAX_RETRY,
-                    'final_error': str(retry_error.last_attempt.exception()) if retry_error.last_attempt else 'Desconhecido',
-                    'action': 'retry_exhausted'
-                }
-            )
-            
-            # Retornar resultado final de falha
             return {
                 'content': None,
                 'raw_content': None,
@@ -454,11 +251,9 @@ class AIProcessor:
                 'attempts': MAX_RETRY,
                 'request_id': request_id
             }
-            
         finally:
-            # Registrar fim de requisição concorrente
             self.stats_manager.record_concurrent_end()
-    
+
     async def process_single(
         self, 
         text: str, 
@@ -467,32 +262,17 @@ class AIProcessor:
         custom_id: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        """
-        Processa um único texto com template de prompt
-        """
-        
         request_id = custom_id if custom_id else self._generate_request_id()
-        
         start_time = time.time()
-        
         try:
-            # Preparar prompt com template
             prompt = prompt_template.format(text=text, **kwargs)
             messages = [{"role": "user", "content": prompt}]
-            
-            # Fazer chamada à API
             result = await self._make_api_call(messages, json_schema, request_id)
-            
             end_time = time.time()
             processing_time = end_time - start_time
-            
-            # Adicionar informações de processamento
             result['processing_time'] = processing_time
             result['custom_id'] = custom_id
-            
-            # Registrar no StatsManager com modelo
             api_rate_limit_detected = is_rate_limit_error(result)
-            
             if not api_rate_limit_detected:
                 self.stats_manager.record_request(
                     success=result.get('success', False),
@@ -507,50 +287,10 @@ class AIProcessor:
                     coordinated_wait_time=0.0,
                     model=self.model
                 )
-            
-            # Log baseado no resultado - não logar rate limits como erro individual
-            if result.get('success'):
-                logger.debug(
-                    "Processamento individual concluído",
-                    extra={
-                        'request_id': request_id,
-                        'processing_time': round(processing_time, 3),
-                        'action': 'single_process_success'
-                    }
-                )
-            else:
-                # Verificar se é rate limit antes de logar como falha
-                if not api_rate_limit_detected:
-                    logger.warning(
-                        "Processamento individual falhou",
-                        extra={
-                            'request_id': request_id,
-                            'processing_time': round(processing_time, 3),
-                            'error_type': result.get('error_type'),
-                            'action': 'single_process_failed'
-                        }
-                    )
-                # Rate limits não são logados como erro individual - serão tratados no batch
-            
             return result
-            
         except Exception as e:
             end_time = time.time()
             processing_time = end_time - start_time
-            
-            # Verificar se é rate limit antes de logar como erro inesperado
-            error_str = str(e).lower()
-            if 'token rate limit' not in error_str:
-                logger.error(
-                    f"Erro inesperado no processamento individual: {e}",
-                    extra={
-                        'request_id': request_id,
-                        'processing_time': round(processing_time, 3),
-                        'error': str(e),
-                        'action': 'single_process_unexpected_error'
-                    }
-                )
-            
             return {
                 'content': None,
                 'success': False,
@@ -560,28 +300,17 @@ class AIProcessor:
                 'custom_id': custom_id,
                 'request_id': request_id
             }
-    
+
     def _calculate_progress_intervals(self, total: int) -> List[int]:
-        """
-        Calcula intervalos de progresso a cada 5 itens, independente do tamanho do lote
-        """
         if total <= 5:
-            # Lotes muito pequenos: log cada item
             return list(range(1, total + 1))
-        
-        # Sempre a cada 5, independente do tamanho
         intervals = list(range(5, total + 1, 5))
-        
-        # Garantir que o total sempre está incluído
         if total not in intervals:
             intervals.append(total)
-        
-        # Sempre incluir o primeiro item para feedback inicial
         if 1 not in intervals:
             intervals.insert(0, 1)
-        
         return sorted(intervals)
-    
+
     async def process_batch(
         self, 
         texts: List[str], 
@@ -591,29 +320,22 @@ class AIProcessor:
         custom_ids: Optional[List[str]] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        """
-        Processamento com asyncio.wait() para controle correto de tasks
-        """
-        
-        # Usar batch_id customizado ou gerar automaticamente
         batch_id = batch_id if batch_id else f"batch_{int(time.time())}"
-        
-        # Validar custom_ids se fornecido
-        if custom_ids and len(custom_ids) != len(texts):
-            raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
-        
-        # Controle de estado simplificado
+        if custom_ids is not None:
+            if hasattr(custom_ids, 'tolist'):
+                custom_ids = custom_ids.tolist()
+            elif hasattr(custom_ids, 'values'):
+                custom_ids = list(custom_ids.values)
+            elif not isinstance(custom_ids, list):
+                custom_ids = list(custom_ids)
+            if len(custom_ids) != len(texts):
+                raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(custom_ids)} != {len(texts)}")
+            custom_ids = [str(cid) if cid is not None else None for cid in custom_ids]
         total_successful = 0
         logged_progress = set()
         progress_lock = asyncio.Lock()
-        
-        # Inicializar rate limiter para o batch
         self.rate_limiter.start_batch(batch_id)
-        
-        # Iniciar tracking do batch no StatsManager
         self.stats_manager.start_batch(batch_id)
-        
-        # Log de início
         logger.info(
             f"🚀 Iniciando processamento em lote - {len(texts)} textos",
             extra={
@@ -625,19 +347,14 @@ class AIProcessor:
                 'action': 'batch_start'
             }
         )
-        
-        # Função para log de progresso
         async def log_progress(current_successful: int):
             async with progress_lock:
                 progress_intervals = self._calculate_progress_intervals(len(texts))
-                
                 if current_successful in progress_intervals and current_successful not in logged_progress:
                     logged_progress.add(current_successful)
-                    
                     elapsed = time.time() - start_time
                     rate = current_successful / elapsed if elapsed > 0 else 0
                     eta = (len(texts) - current_successful) / rate if rate > 0 else 0
-                    
                     logger.info(
                         f"📊 Progresso: {current_successful}/{len(texts)} ({current_successful/len(texts)*100:.1f}%) | "
                         f"✅{current_successful} ❌0 | "
@@ -654,71 +371,51 @@ class AIProcessor:
                             'action': 'batch_progress'
                         }
                     )
-        
-        # Usar asyncio.wait() com FIRST_COMPLETED para controle correto
         all_results = [None] * len(texts)
         pending_items = list(enumerate(texts))
         start_time = time.time()
-        
+        pause_due_to_rate_limit = False
         while pending_items:
-            # Criar tasks com mapeamento correto
             task_to_index = {}
             current_tasks = []
-            
             for i, text in pending_items:
-                custom_id = custom_ids[i] if custom_ids else None
+                custom_id = None
+                if custom_ids is not None and i < len(custom_ids):
+                    custom_id = custom_ids[i]
                 task = asyncio.create_task(
                     self.process_single(text, prompt_template, json_schema, custom_id, **kwargs)
                 )
                 current_tasks.append(task)
                 task_to_index[task] = i
-            
-            # Usar asyncio.wait() com FIRST_COMPLETED para logs incrementais
             rate_limit_indices = []
             rate_limit_detected = False
-            
             while current_tasks:
-                # Aguardar pelo menos uma task completar
                 done, pending = await asyncio.wait(
-                    current_tasks, 
+                    current_tasks,
                     return_when=asyncio.FIRST_COMPLETED
                 )
-                
-                # Processar tasks completadas
                 for completed_task in done:
                     try:
                         result = await completed_task
                         original_index = task_to_index[completed_task]
-                        
-                        # Verificar rate limit
                         if not result.get('success', False) and is_rate_limit_error(result):
                             rate_limit_indices.append(original_index)
-                            
-                            # Registrar rate limit apenas uma vez
                             if not rate_limit_detected:
                                 rate_limit_detected = True
                                 wait_time = self._extract_wait_time_from_error_result(result)
-                                
-                                # Registrar rate limit no stats_manager
                                 self.stats_manager.record_global_rate_limit_activation(wait_time, len(rate_limit_indices))
-                                
-                                # Delegar para rate limiter
                                 self.rate_limiter.record_api_rate_limit_with_context(
                                     wait_time, total_successful, len(texts), total_successful, 0
                                 )
+                                pause_due_to_rate_limit = True
                         else:
-                            # Resultado definitivo
                             all_results[original_index] = result
                             if result.get('success', False):
                                 total_successful += 1
-                                
-                                # Log de progresso incremental
-                                await log_progress(total_successful)
-                            
-                            # Notificar rate limiter sobre sucesso
+                                if not pause_due_to_rate_limit:
+                                    await log_progress(total_successful)
                             if result.get('success', False):
                                 self.rate_limiter.record_successful_request()
-                        
                     except Exception as e:
                         logger.error(
                             f"Erro em task do lote: {e}",
@@ -736,28 +433,15 @@ class AIProcessor:
                             'error': str(e),
                             'error_type': type(e).__name__
                         }
-                
-                # Atualizar lista de tasks pendentes
                 current_tasks = list(pending)
-            
-            # Preparar próxima rodada
             if rate_limit_indices:
-                # Filtrar apenas rate limits para reprocessamento
                 pending_items = [(i, texts[i]) for i in rate_limit_indices]
-                
-                # Aguardar brevemente
                 await asyncio.sleep(0.1)
+                pause_due_to_rate_limit = False
             else:
-                # Não há mais rate limits, finalizar
                 pending_items = []
-        
-        # Filtrar resultados válidos
         final_results = [r for r in all_results if r is not None]
-        
-        # Finalizar batch
         batch_stats = self.stats_manager.end_batch(batch_id)
-        
-        # Log de fim
         logger.info(
             f"✅ Batch concluído - {batch_stats.successful_requests} sucessos, "
             f"{batch_stats.failed_requests} falhas em {batch_stats.processing_time:.1f}s",
@@ -774,33 +458,18 @@ class AIProcessor:
                 'action': 'batch_complete'
             }
         )
-        
         return {
             'results': final_results,
             'batch_stats': batch_stats,
             'batch_id': batch_id
         }
-    
-    # ✅ NOVA: Função única de stats consolidada (SEM resumo executivo)
+
     def get_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True) -> Dict[str, Any]:
-        """
-        🎯 FUNÇÃO ÚNICA DE STATS - Consolida todas as métricas (global primeiro, depois batch)
-        
-        Args:
-            batch_result: Resultado de um batch específico (opcional)
-            include_global: Se deve incluir stats globais
-            
-        Returns:
-            Dicionário com todas as métricas organizadas por categoria
-        """
         complete_stats = {}
-        
-        # 1. STATS GLOBAIS PRIMEIRO (se solicitado)
         if include_global:
             global_stats = self.stats_manager.get_global_stats()
             rate_limiter_status = self.rate_limiter.get_status()
             calibration_stats = self.rate_limiter.get_calibration_stats()
-            
             complete_stats['global'] = {
                 'summary': self.stats_manager.format_stats(global_stats, "ESTATÍSTICAS GLOBAIS"),
                 'metrics': self.stats_manager.export_stats_json(global_stats),
@@ -824,12 +493,9 @@ class AIProcessor:
    🚨 Rate limits detectados: {calibration_stats['api_rate_limits_detected']}"""
                 }
             }
-        
-        # 2. STATS DO BATCH (se fornecido)
         if batch_result and 'batch_stats' in batch_result:
             batch_stats = batch_result['batch_stats']
             batch_id = batch_result.get('batch_id', 'unknown')
-            
             complete_stats['batch'] = {
                 'id': batch_id,
                 'summary': self.stats_manager.format_stats(batch_stats, f"BATCH {batch_id}"),
@@ -851,69 +517,50 @@ class AIProcessor:
    🔗 Pico concorrente: {batch_stats.concurrent_peak} requisições"""
                 }
             }
-        
         return complete_stats
-    
-    # Métodos de utilidade mantidos para compatibilidade
+
     def get_global_stats(self):
-        """Retorna stats globais atualizadas"""
         return self.stats_manager.get_global_stats()
-    
+
     def show_stats(self, result_or_stats, title: str = "Stats"):
-        """Mostra estatísticas formatadas"""
         if isinstance(result_or_stats, dict) and 'batch_stats' in result_or_stats:
             stats = result_or_stats['batch_stats']
         else:
             stats = result_or_stats
-        
         formatted_stats = self.stats_manager.format_stats(stats, title)
         print(formatted_stats)
-    
+
     def show_calibration_stats(self):
-        """Mostra estatísticas de calibração do rate limiter"""
         calibration_stats = self.rate_limiter.get_calibration_stats()
-        
         print("🎯 ESTATÍSTICAS DE CALIBRAÇÃO:")
         print(f"   📊 Precisão das estimativas: {calibration_stats['accuracy_percentage']:.1f}%")
         print(f"   🔧 Fator de calibração atual: {calibration_stats['current_calibration_factor']:.3f}")
         print(f"   📈 Total de calibrações: {calibration_stats['total_calibrations']}")
         print(f"   🛡️ Rate limits prevenidos: {calibration_stats['prevented_rate_limits']}")
         print(f"   🚨 Rate limits detectados: {calibration_stats['api_rate_limits_detected']}")
-    
+
     def show_rate_limiter_status(self):
-        """Mostra status atual do rate limiter"""
         status = self.rate_limiter.get_status()
-        
         print("⚡ STATUS DO RATE LIMITER:")
         print(f"   🔢 Tokens usados: {status['tokens_used']:,}")
         print(f"   📊 Utilização: {status['utilization_percent']:.1f}%")
         print(f"   ⏱️ Tempo no minuto: {status['time_in_minute']:.1f}s")
         print(f"   🔄 Total de esperas: {status['total_waits']}")
         print(f"   ⏳ Tempo total de espera: {status['total_wait_time']:.1f}s")
-    
-    # ✅ ATUALIZADA: Método de conveniência para mostrar stats completas (SEM resumo executivo)
+
     def show_complete_stats(self, batch_result: Optional[Dict] = None, include_global: bool = True):
-        """
-        🎯 Mostra todas as estatísticas de forma organizada (global primeiro, depois batch)
-        """
         complete_stats = self.get_complete_stats(batch_result, include_global)
-        
         print("=" * 80)
         print("🎯 RELATÓRIO COMPLETO DE ESTATÍSTICAS")
         print("=" * 80)
-        
-        # 1. STATS GLOBAIS PRIMEIRO
         if 'global' in complete_stats:
             print(complete_stats['global']['summary'])
             print()
             print(complete_stats['global']['rate_limiter']['summary'])
             print()
-        
-        # 2. STATS DO BATCH
         if 'batch' in complete_stats:
             print(complete_stats['batch']['summary'])
             print()
             print(complete_stats['batch']['rate_limiter']['summary'])
             print()
-        
         print("=" * 80)
